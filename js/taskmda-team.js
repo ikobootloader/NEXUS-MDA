@@ -5476,6 +5476,94 @@
       showToast('Exports Excel (CSV) générés');
     }
 
+    async function exportCompletedTasksByYearXlsx() {
+      if (!window.XLSX) {
+        showToast('Export Excel indisponible (XLSX non charge)');
+        return;
+      }
+
+      const currentYear = new Date().getFullYear();
+      const rawYear = window.prompt('Exporter les taches accomplies de quelle annee ? (YYYY)', String(currentYear));
+      if (rawYear === null) return;
+      const selectedYear = Number.parseInt(String(rawYear || '').trim(), 10);
+      if (!Number.isFinite(selectedYear) || selectedYear < 2000 || selectedYear > 2100) {
+        showToast('Annee invalide (format YYYY attendu)');
+        return;
+      }
+
+      const rows = [];
+      const projectStates = await getAllProjectStates();
+      for (const state of (projectStates || [])) {
+        const projectName = String(state?.project?.name || '').trim();
+        const visibility = normalizeSharingMode(state?.project?.sharingMode, 'private') === 'shared' ? 'Collaborative' : 'Privee';
+        for (const task of (state?.tasks || [])) {
+          if (normalizeTaskStatusValue(task?.status) !== 'termine') continue;
+          const completedTs = getTaskCompletionTimestamp(task);
+          if (!(completedTs > 0)) continue;
+          const completedDate = new Date(completedTs);
+          if (Number.isNaN(completedDate.getTime()) || completedDate.getFullYear() !== selectedYear) continue;
+          rows.push({
+            source: 'Projet',
+            projectName: projectName || '-',
+            taskId: String(task?.taskId || ''),
+            title: String(task?.title || ''),
+            status: String(task?.status || ''),
+            urgency: String(task?.urgency || ''),
+            assignee: getTaskAssigneeName(task, state) || '',
+            groupName: getTaskGroupName(task, state) || '',
+            theme: String(task?.theme || ''),
+            requestDate: task?.requestDate ? formatDate(task.requestDate) : '',
+            dueDate: task?.dueDate ? formatTaskDeadline(task) : '',
+            completedAt: formatDate(completedTs),
+            archived: task?.archivedAt ? 'Oui' : 'Non',
+            visibility,
+            description: String(task?.description || '')
+          });
+        }
+      }
+
+      const standaloneTasks = await getAllDecrypted('globalTasks', 'id');
+      for (const task of (standaloneTasks || [])) {
+        if (normalizeTaskStatusValue(task?.status) !== 'termine') continue;
+        const completedTs = getTaskCompletionTimestamp(task);
+        if (!(completedTs > 0)) continue;
+        const completedDate = new Date(completedTs);
+        if (Number.isNaN(completedDate.getTime()) || completedDate.getFullYear() !== selectedYear) continue;
+        rows.push({
+          source: 'Hors projet',
+          projectName: 'Hors projet',
+          taskId: String(task?.id || ''),
+          title: String(task?.title || ''),
+          status: String(task?.status || ''),
+          urgency: String(task?.urgency || ''),
+          assignee: getTaskAssigneeName(task, null) || '',
+          groupName: String(task?.groupName || ''),
+          theme: String(task?.theme || ''),
+          requestDate: task?.requestDate ? formatDate(task.requestDate) : '',
+          dueDate: task?.dueDate ? formatTaskDeadline(task) : '',
+          completedAt: formatDate(completedTs),
+          archived: task?.archivedAt ? 'Oui' : 'Non',
+          visibility: normalizeSharingMode(task?.sharingMode, 'private') === 'shared' ? 'Collaborative' : 'Privee',
+          description: String(task?.description || '')
+        });
+      }
+
+      if (rows.length === 0) {
+        showToast(`Aucune tache accomplie trouvee pour ${selectedYear}`);
+        return;
+      }
+
+      rows.sort((a, b) => String(b.completedAt || '').localeCompare(String(a.completedAt || '')));
+      const filename = window.TaskMDATasks?.exportCompletedTasksYearXlsx
+        ? window.TaskMDATasks.exportCompletedTasksYearXlsx(rows, selectedYear, 'taskmda_taches_accomplies')
+        : '';
+      if (!filename) {
+        showToast('Erreur export Excel');
+        return;
+      }
+      showToast(`Export Excel genere (${rows.length} tache(s))`);
+    }
+
     function normalizeSearch(value) {
       return coreNormalizeSearch(value);
     }
@@ -37022,6 +37110,15 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     // Import tasks button
     document.getElementById('btn-global-import-tasks')?.addEventListener('click', () => {
       document.getElementById('global-import-tasks-file')?.click();
+    });
+
+    document.getElementById('btn-global-export-completed-year')?.addEventListener('click', async () => {
+      try {
+        await exportCompletedTasksByYearXlsx();
+      } catch (error) {
+        console.error('Error exporting completed tasks by year:', error);
+        showToast('Erreur export Excel annuel');
+      }
     });
 
     document.getElementById('global-import-tasks-file')?.addEventListener('change', async (e) => {

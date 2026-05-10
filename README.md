@@ -241,6 +241,14 @@ projects/
 
 ## 🆕 Nouveautés récentes
 
+### Mai 2026
+
+#### ✅ Export annuel des tâches accomplies (Excel)
+
+- Rubrique `Tâches` : ajout d un bouton `Export accomplies (Excel)`
+- Export `.xlsx` annuel des tâches accomplies (projets + hors projet)
+- Filtrage par année saisie (`YYYY`) et feuille tableur prête pour exploitation
+
 ### Avril 2026
 
 #### 🗂️ Surveillance de fichiers

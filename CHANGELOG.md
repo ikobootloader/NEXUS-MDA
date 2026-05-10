@@ -1,5 +1,13 @@
 # Changelog - TaskMDA Team
 
+## Mise a jour incrementale - Mai 2026 (Export annuel taches accomplies Excel)
+
+- Taches (rubrique transverse):
+  - ajout d un bouton `Export accomplies (Excel)` dans la barre d actions de la vue Taches.
+  - export annuel des taches au format `.xlsx` (projets + hors projet), avec saisie de l annee cible (`YYYY`).
+  - filtre metier sur les taches accomplies (`status = termine`) et conservation des metadonnees utiles (source, projet, responsable, thematique, dates, visibilite, archivage, description).
+  - implementation regroupee dans le module domaine `js/taskmda-tasks.js` via `exportCompletedTasksYearXlsx`.
+
 ## Mise a jour incrementale - Mai 2026 (Durcissement securite chiffrement partage)
 
 - Securite:
