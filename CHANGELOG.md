@@ -1,5 +1,41 @@
 # Changelog - TaskMDA Team
 
+## Mise a jour incrementale - Mai 2026 (Bouton general projet contextuel)
+
+- Projet / ergonomie:
+  - le bouton general `Nouvelle Tache` (`#btn-add-task`) adapte maintenant son action a l onglet projet actif.
+  - onglet `Notes` -> ouverture de la modale `Nouvelle note`.
+  - onglet `Documents` -> ouverture de la modale d ajout de document.
+  - onglet `Discussion` -> focus automatique du composeur de message.
+  - autres onglets de travail -> creation de tache (comportement historique conserve).
+  - le libelle/icone/etat desactive du bouton sont synchronises selon la vue active et les droits.
+  - correctif UX: infobulle/tooltip du bouton synchronisee avec l action contextuelle (plus de tooltip fige `Nouvelle Tache`).
+
+## Mise a jour incrementale - Mai 2026 (Fil d info: fallback titre references)
+
+- Fil d information transverse:
+  - quand un post n a pas de titre explicite, le titre affiche prend desormais en priorite la reference tache, puis la reference projet, avant le fallback `Sans titre`.
+  - correction appliquee dans le module domaine `js/taskmda-global.js` (`taskmda-global-feed`).
+
+## Mise a jour incrementale - Mai 2026 (Reference interne projets/taches)
+
+- Projets:
+  - ajout d un champ `Reference interne` dans les modales `Nouveau projet` et `Modifier le projet`.
+  - sauvegarde de la reference dans les payloads `CREATE_PROJECT` et `UPDATE_PROJECT`.
+- Taches:
+  - ajout d un champ `Reference interne` dans la modale de creation/edition de tache.
+  - sauvegarde de la reference pour les taches projet (`CREATE_TASK` / `UPDATE_TASK`) et les taches hors projet (`globalTasks`).
+
+## Mise a jour incrementale - Mai 2026 (Refactor documentaire taskmda-team.js)
+
+- Orchestrateur:
+  - ajout de commentaires de maintenance sur le bloc indicateurs UI de chargement/synchronisation (`showLoading`, `runWithLoading`, `runWithoutGlobalLoading`, `setInlineSaveIndicator`, `updateSyncStatus`, `updateBackgroundSyncStatus`).
+  - objectif: preparer l extraction modulaire progressive sans modifier le comportement fonctionnel.
+  - extraction du bloc harmonisation modales vers `js/taskmda-modal-ui-harmonizer.js` (icones labels modaux + normalisation boutons fermer).
+  - `js/taskmda-team.js` conserve des wrappers fins pour limiter l impact et garder l orchestration centrale stable.
+  - extraction du bloc harmonisation boutons d action/tooltips vers `js/taskmda-action-ui-harmonizer.js` (decor action buttons, catalogues semantiques, couche tooltip, observers DOM).
+  - `js/taskmda-team.js` conserve des wrappers de compatibilite et injecte les dependances UI (`normalizeAction*`, mode d affichage, option tooltips).
+
 ## Mise a jour incrementale - Mai 2026 (Export annuel taches accomplies Excel)
 
 - Taches (rubrique transverse):
@@ -7,6 +43,26 @@
   - export annuel des taches au format `.xlsx` (projets + hors projet), avec saisie de l annee cible (`YYYY`).
   - filtre metier sur les taches accomplies (`status = termine`) et conservation des metadonnees utiles (source, projet, responsable, thematique, dates, visibilite, archivage, description).
   - implementation regroupee dans le module domaine `js/taskmda-tasks.js` via `exportCompletedTasksYearXlsx`.
+
+## Mise a jour incrementale - Mai 2026 (Refactor ciblé taskmda-team.js)
+
+- Orchestrateur:
+  - ajout d un helper `getGlobalTasksRenderContext` pour mutualiser la collecte des taches globales et des etats projet associes.
+  - reduction des lectures IndexedDB redondantes lors du rendu de la rubrique `Taches` (base + post-traitement empty state).
+  - ajout de commentaires de maintenance sur le cycle de rendu global des taches (cache contexte + post-traitement UI).
+  - aucun changement fonctionnel attendu sur les vues/filters existants.
+  - lot 2: factorisation de la modale detail tache avec helpers `getGlobalTaskDetailModalElements` et `renderGlobalTaskDetailCommonSection` pour reduire la duplication entre `openGlobalTaskDetails` et `openProjectTaskDetails` (sans changement de comportement attendu).
+  - lot 3: factorisation du rendu des pieces jointes de la modale detail tache via `renderGlobalTaskDetailAttachments` (cas piece jointe simple + cas documents projet lies), sans changement fonctionnel attendu.
+  - lot 4: factorisation du wiring des actions footer de la modale detail tache (`convert/email/edit/archive/delete`) via `wireGlobalTaskDetailActions`, avec callbacks injectes par contexte (global/projet), sans changement fonctionnel attendu.
+  - lot 5: factorisation de l initialisation du contexte detail tache (`currentGlobalTaskDetailContext`, `currentGlobalTaskDetailResolved`, `currentGlobalTaskDetailRef`) via `buildTaskDetailContextPayload` et `setAndRenderTaskDetailContext`, sans changement fonctionnel attendu.
+  - lot 6: factorisation de la preparation commune des variables de modale (`canEdit/canArchive/canDelete`, `sourceProjectName`, `groupName`, `canToggleSubtasks`) via `buildTaskDetailModalCommonMeta`, sans changement fonctionnel attendu.
+  - lot 7: factorisation de la construction du bloc `resolved` projet via `buildProjectTaskResolved`, reutilise dans `openProjectTaskDetails` et `setAndRenderTaskDetailContext`.
+
+## Mise a jour incrementale - Mai 2026 (Correctif Mes documents: AbortError showOpenFilePicker)
+
+- Documents:
+  - correction de `pickLinkedDocuments` dans `js/taskmda-team.js` pour intercepter `AbortError` (annulation utilisateur de la boite de dialogue `showOpenFilePicker`).
+  - l annulation est maintenant traitee comme un cas normal (retour `[]`) sans erreur non capturee en console.
 
 ## Mise a jour incrementale - Mai 2026 (Durcissement securite chiffrement partage)
 

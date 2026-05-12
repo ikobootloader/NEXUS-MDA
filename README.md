@@ -243,6 +243,21 @@ projects/
 
 ### Mai 2026
 
+#### ✅ Bouton général projet contextuel
+
+- Le bouton `Nouvelle tâche` dans un projet s'adapte à l'onglet actif:
+- `Notes` ouvre `Nouvelle note`, `Documents` ouvre l'ajout de document, `Discussion` place le focus sur le composeur, sinon création de tâche.
+
+#### ✅ Fil d'info: fallback de titre intelligent
+
+- Si un post du fil n'a pas de titre, l'UI affiche en priorité le titre de la tâche référencée, sinon celui du projet référencé.
+
+#### ✅ Référence interne (projets et tâches)
+
+- Ajout du champ `Référence interne` dans les modales de création/édition des projets.
+- Ajout du champ `Référence interne` dans la modale de création/édition des tâches.
+- Persistance de la valeur dans les données projet/tâche pour index métier personnalisé.
+
 #### ✅ Export annuel des tâches accomplies (Excel)
 
 - Rubrique `Tâches` : ajout d un bouton `Export accomplies (Excel)`

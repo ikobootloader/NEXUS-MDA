@@ -251,6 +251,11 @@
       return currentUserIdAliases;
     }
 
+    /**
+     * Initialise la base IndexedDB (singleton).
+     * Cette fonction est le point d'entrée de la topologie des stores/index.
+     * Toute évolution de schéma doit rester centralisée ici.
+     */
     async function initDatabase() {
       if (!dbInstance) {
         dbInstance = await openDB(DB_NAME, DB_VERSION, {
@@ -612,6 +617,10 @@
       return dbInstance;
     }
 
+    /**
+     * Retourne l'instance DB initialisée.
+     * Lève une erreur explicite si `initDatabase()` n'a pas encore été appelé.
+     */
     function getDatabase() {
       if (!dbInstance) {
         throw new Error('Database not initialized. Call initDatabase() first.');
@@ -623,6 +632,10 @@
     // DATABASE CRYPTO WRAPPERS
     // ============================================================================
 
+    /**
+     * Valide une clé IndexedDB avant accès store.
+     * Évite les appels `db.get/delete` avec identifiants invalides.
+     */
     function isValidIdbKey(key) {
       if (key === null || key === undefined) return false;
       if (typeof key === 'number') return Number.isFinite(key);
@@ -632,7 +645,8 @@
     }
 
     /**
-     * Sauvegarde chiffrée dans IndexedDB
+     * Écrit une ligne en base avec chiffrement conditionnel.
+     * Conserve certains index en clair quand requis (ex: `events.projectId`).
      */
     async function putEncrypted(storeName, obj, idField) {
       const db = getDatabase();
@@ -691,6 +705,10 @@
       timer: null
     };
 
+    /**
+     * Agrège puis journalise les statistiques de nettoyage auto crypto
+     * pour limiter le bruit console lors de lots d'entrées illisibles.
+     */
     function scheduleCryptoCleanupSummaryLog() {
       if (cryptoCleanupSummary.timer) return;
       cryptoCleanupSummary.timer = setTimeout(() => {
@@ -712,6 +730,10 @@
       }, 1200);
     }
 
+    /**
+     * Planifie la purge asynchrone d'une ligne chiffrée illisible.
+     * Objectif: auto-réparation locale sans bloquer les parcours utilisateur.
+     */
     function queueCorruptEncryptedRowCleanup(storeName, key, error, source = 'get') {
       const safeStore = String(storeName || '').trim();
       const safeKey = String(key || '').trim();
@@ -746,6 +768,11 @@
       }, 0);
     }
 
+    /**
+     * Lit une ligne puis déchiffre si nécessaire.
+     * En cas d'échec de déchiffrement, la ligne est ignorée et marquée
+     * pour nettoyage auto (selon politique du store).
+     */
     async function getDecrypted(storeName, id, idField) {
       if (!isValidIdbKey(id)) return null;
       const db = getDatabase();
@@ -766,7 +793,8 @@
     }
 
     /**
-     * Lecture de tous les objets déchiffrés
+     * Lit toutes les lignes d'un store et déchiffre à la volée.
+     * Les lignes corrompues sont exclues du résultat.
      */
     async function getAllDecrypted(storeName, idField) {
       const db = getDatabase();
@@ -804,7 +832,8 @@
     }
 
     /**
-     * Lecture par index déchiffrée
+     * Lecture indexée + déchiffrement à la volée.
+     * Variante optimisée pour les requêtes par index IndexedDB.
      */
     async function getAllFromIndexDecrypted(storeName, indexName, query, idField) {
       const db = getDatabase();
@@ -887,6 +916,10 @@
 
     const DEFAULT_LOCK_TTL_MS = 10 * 60 * 1000;
 
+    /**
+     * Purge les verrous expirés d'une map de verrous ressources.
+     * Utilisé pour maintenir un état local cohérent sans cleanup global coûteux.
+     */
     function pruneResourceLocksMap(lockMap, now = Date.now()) {
       const source = (lockMap && typeof lockMap === 'object') ? lockMap : {};
       const next = {};
@@ -903,6 +936,9 @@
     // MODULE 3: EVENT STORE
     // ============================================================================
 
+    /**
+     * Fabrique un événement normalisé (event-sourcing) avec métadonnées runtime.
+     */
     function createEvent(type, projectId, author, payload) {
       return {
         eventId: uuidv4(),
@@ -918,6 +954,11 @@
       };
     }
 
+    /**
+     * Pipeline de publication d'événement:
+     * 1) persistance locale,
+     * 2) traitement immédiat (projection état).
+     */
     async function publishEvent(event) {
       // Sauvegarder localement (chiffré)
       await putEncrypted('events', event, 'eventId');
@@ -928,6 +969,12 @@
       debugLog('Event published:', event.type);
     }
 
+    /**
+     * Traite un événement idempotent:
+     * - ignore les replays déjà marqués,
+     * - applique l'événement à l'état projeté,
+     * - marque l'événement comme traité.
+     */
     async function processEvent(event) {
       const db = getDatabase();
 
@@ -1017,6 +1064,10 @@
       }
     }
 
+    /**
+     * Applique un événement à l'état local projeté (`localState`).
+     * Cœur du moteur event-sourcing côté client.
+     */
     async function applyEventToState(event) {
       // Charger l'état (déchiffré)
       let state = await getDecrypted('localState', event.projectId, 'projectId') || {
@@ -1398,6 +1449,10 @@
       await putEncrypted('localState', state, 'projectId');
     }
 
+    /**
+     * Évalue les droits de lecture d'un projet pour l'utilisateur courant
+     * (membres, mode privé/public, accès via clé partagée locale).
+     */
     function hasProjectAccess(state, userId = getCurrentUserId()) {
       if (!state || !state.project || state.project.deletedAt) return false;
       const members = Array.isArray(state.members) ? state.members : [];
@@ -1437,6 +1492,10 @@
       return Boolean(projectId && localSharedKeyProjectIds.has(projectId));
     }
 
+    /**
+     * Retourne l'état projeté d'un projet, avec option de bypass du contrôle
+     * d'accès pour les opérations techniques internes.
+     */
     async function getProjectState(projectId, options = {}) {
       if (!isValidIdbKey(projectId)) return null;
       const state = await getDecrypted('localState', projectId, 'projectId');
@@ -1451,6 +1510,10 @@
       return hasProjectAccess(state) ? state : null;
     }
 
+    /**
+     * Retourne l'historique d'événements d'un projet (plus récents d'abord),
+     * avec fallback compatibilité pour anciens enregistrements.
+     */
     async function getProjectEvents(projectId) {
       try {
         const normalizedProjectId = String(projectId || '').trim();
@@ -1468,6 +1531,11 @@
       }
     }
 
+    /**
+     * Liste les projets visibles pour l'utilisateur.
+     * Inclut un filet de sécurité local pour éviter une vue vide en cas
+     * d'anomalie temporaire du filtre d'accès.
+     */
     async function getAllProjects() {
       try {
         const states = await getAllDecrypted('localState', 'projectId');
@@ -1549,6 +1617,10 @@
     // MODULE 4: USERS
     // ============================================================================
 
+    /**
+     * Tente de déduire un nom lisible depuis le chemin local (best effort),
+     * utilisé uniquement comme valeur initiale d'accueil.
+     */
     function detectOsUsernameGuess() {
       try {
         const rawPath = decodeURIComponent(window.location.pathname || '');
@@ -1572,6 +1644,12 @@
       }
     }
 
+    /**
+     * Initialise l'identité utilisateur locale:
+     * - récupère/crée `userId`,
+     * - hydrate/crée le profil minimal,
+     * - alimente l'historique d'alias.
+     */
     async function initializeCurrentUser() {
       let userId = localStorage.getItem('userId');
 
@@ -1611,10 +1689,19 @@
       { roleKey: 'member', label: 'Membre', baseRole: 'member', isSystem: true }
     ]);
 
+    /**
+     * Normalise un rôle projet vers le socle RBAC minimal.
+     */
     function normalizeProjectRoleBase(role) {
       return role === 'owner' || role === 'manager' || role === 'member' ? role : 'member';
     }
 
+    /**
+     * Normalise le catalogue de rôles projet:
+     * - fusionne les rôles système par défaut,
+     * - conserve les rôles custom,
+     * - garantit un tri stable pour l'UI.
+     */
     function normalizeProjectRoleCatalog(rawCatalog = []) {
       const defaultsByKey = new Map(DEFAULT_PROJECT_ROLE_CATALOG.map(item => [item.roleKey, item]));
       const merged = new Map(DEFAULT_PROJECT_ROLE_CATALOG.map(item => [item.roleKey, { ...item }]));
@@ -1650,10 +1737,16 @@
         });
     }
 
+    /**
+     * Retourne le catalogue de rôles effectif (branding + defaults).
+     */
     function getProjectRoleCatalog() {
       return normalizeProjectRoleCatalog(appBranding?.roleCatalog || []);
     }
 
+    /**
+     * Libellé UI du rôle RBAC de base.
+     */
     function getBaseProjectRoleLabel(baseRole) {
       const normalized = normalizeProjectRoleBase(baseRole);
       if (normalized === 'owner') return 'Propriétaire';
@@ -1661,6 +1754,9 @@
       return 'Membre';
     }
 
+    /**
+     * Résout les métadonnées complètes d'un rôle (label/base/system/custom).
+     */
     function getProjectRoleMeta(role) {
       const roleKey = String(role || '').trim();
       const catalog = getProjectRoleCatalog();
@@ -1684,10 +1780,16 @@
       };
     }
 
+    /**
+     * Helper court pour obtenir le libellé d'un rôle.
+     */
     function getProjectRoleLabel(role) {
       return getProjectRoleMeta(role).label;
     }
 
+    /**
+     * Valide/nettoie une couleur CSS de branding.
+     */
     function normalizeChromeBackgroundColor(rawValue, fallback = DEFAULT_APP_BRANDING.chromeBgLight) {
       const value = String(rawValue || '').trim();
       if (!value) return fallback;
@@ -1697,6 +1799,9 @@
       return probe.style.color ? value : fallback;
     }
 
+    /**
+     * Convertit une couleur CSS (`#hex` ou `rgb[a]`) vers `#rrggbb`.
+     */
     function colorToHex(value, fallback = '#eceff8') {
       const input = String(value || '').trim();
       const hex = input.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
@@ -1714,6 +1819,9 @@
       return `#${toHex(rgb[1])}${toHex(rgb[2])}${toHex(rgb[3])}`;
     }
 
+    /**
+     * Convertit `#rrggbb` vers `rgb(r g b)` pour variables CSS runtime.
+     */
     function hexToRgbString(hexValue) {
       const hex = String(hexValue || '').trim().replace('#', '');
       if (!/^[0-9a-f]{6}$/i.test(hex)) return DEFAULT_APP_BRANDING.chromeBgLight;
@@ -1723,6 +1831,9 @@
       return `rgb(${r} ${g} ${b})`;
     }
 
+    /**
+     * Normalise la configuration de branding applicatif persistée.
+     */
     function normalizeAppBrandingConfig(raw = {}) {
       const appName = String(raw?.appName || '').trim() || DEFAULT_APP_BRANDING.appName;
       const appSubtitle = String(raw?.appSubtitle || '').trim() || DEFAULT_APP_BRANDING.appSubtitle;
@@ -1740,11 +1851,18 @@
       return { appName, appSubtitle, chromeBgLight, chromeBgDark, adminUserId, roleCatalog, updatedAt };
     }
 
+    /**
+     * Charge la configuration de branding depuis `appSettings`.
+     */
     async function getAppBrandingConfig() {
       const row = await getDecrypted('appSettings', 'branding', 'key');
       return row ? normalizeAppBrandingConfig(row) : null;
     }
 
+    /**
+     * Sauvegarde le branding, applique l'effet UI local et synchronise
+     * optionnellement la config vers l'espace partagé.
+     */
     async function saveAppBrandingConfig(config, options = {}) {
       const normalized = normalizeAppBrandingConfig(config);
       await putEncrypted('appSettings', {
@@ -1759,6 +1877,9 @@
       return normalized;
     }
 
+    /**
+     * Applique le branding effectif au header + variables CSS + titre document.
+     */
     function applyAppBrandingToHeader() {
       const effective = normalizeAppBrandingConfig(appBranding || {});
       const titleEl = document.getElementById('app-header-name');
@@ -1770,15 +1891,24 @@
       document.title = `${effective.appName} | Privée et Collaborative`;
     }
 
+    /**
+     * Vérifie si un utilisateur possède le rôle admin applicatif global.
+     */
     function isAppAdmin(userId = currentUser?.userId) {
       if (!userId) return false;
       return String(appBranding?.adminUserId || '') === String(userId);
     }
 
+    /**
+     * Retourne l'identifiant utilisateur courant persistant.
+     */
     function getCurrentUserId() {
       return localStorage.getItem('userId');
     }
 
+    /**
+     * Retourne l'identifiant client (poste/navigateur) persistant.
+     */
     function getCurrentClientId() {
       let clientId = localStorage.getItem('clientId');
       if (!clientId) {
@@ -1796,12 +1926,19 @@
       return coreStringToColor(str);
     }
 
+    /**
+     * Fallback lisible quand l'annuaire ne connaît pas encore l'identité.
+     */
     function fallbackDirectoryName(userId) {
       const raw = String(userId || '').trim();
       if (!raw) return 'Utilisateur';
       return `Utilisateur ${raw.slice(0, 8)}`;
     }
 
+    /**
+     * Upsert d'un utilisateur dans l'annuaire local consolidé.
+     * Maintient `firstSeenAt/lastSeenAt` pour le tri et la fiabilité des suggestions.
+     */
     async function upsertDirectoryUser({ userId, name, email = '', source = 'unknown', lastSeenAt = Date.now() }) {
       const id = String(userId || '').trim();
       if (!id) return;
@@ -1818,6 +1955,10 @@
       }, 'userId');
     }
 
+    /**
+     * Ingestion annuaire à partir d'un événement métier.
+     * Permet de garder une vue identitaire fraîche sans job de fond coûteux.
+     */
     async function ingestDirectoryFromEvent(event) {
       if (!event) return;
       await upsertDirectoryUser({
@@ -1836,6 +1977,10 @@
       }
     }
 
+    /**
+     * Rebuild progressif de l'annuaire local depuis les sources persistées
+     * (users + états projet/messages/membres).
+     */
     async function refreshDirectoryFromKnownSources() {
       const users = await getAllDecrypted('users', 'userId');
       for (const user of users || []) {
@@ -1869,6 +2014,10 @@
       }
     }
 
+    /**
+     * Reconstruit le cache mémoire des utilisateurs connus pour
+     * résolution rapide des identités dans l'UI.
+     */
     async function refreshKnownUsersCache() {
       const [users, directoryUsers] = await Promise.all([
         getAllDecrypted('users', 'userId'),
@@ -1903,6 +2052,9 @@
       knownUsersCache = map;
     }
 
+    /**
+     * Résout une identité affichable à partir d'un userId avec fallback robuste.
+     */
     function resolveKnownUserIdentity(userId, fallbackName = '') {
       const id = String(userId || '').trim();
       const known = id ? knownUsersCache.get(id) : null;
@@ -3024,823 +3176,177 @@
       return coreNormalizeActionToken(value);
     }
 
+    const actionUiHarmonizer = window.TaskMDAActionUiHarmonizer?.create?.({
+      normalizeActionButtonLabel,
+      normalizeActionToken,
+      getWorkflowActionButtonsMode,
+      isIconTooltipsEnabled
+    }) || null;
+
     function inferActionButtonKind(label, button) {
-      const explicitKind = normalizeActionToken(button?.getAttribute?.('data-action-kind') || '');
-      const knownKinds = new Set([
-        'open', 'edit', 'convert', 'archive', 'danger', 'notify', 'save', 'create',
-        'close', 'export', 'preview', 'sync', 'manage', 'submit', 'publish',
-        'unarchive', 'template', 'registry', 'link', 'success', 'progress',
-        'default', 'move_up', 'move_down'
-      ]);
-      if (explicitKind && knownKinds.has(explicitKind)) return explicitKind;
-      const text = normalizeActionToken(label);
-      if (/^\+\s*/.test(text)) return 'create';
-      if (text.includes('open_in_new') || text.includes('launch')) return 'open';
-      if (text.includes('sync_alt') || text.includes('swap_horiz')) return 'convert';
-      if (text.includes('fermer') || text === 'close' || text.includes(' close')) return 'close';
-      if (text.includes('edit') || text === 'edit') return 'edit';
-      if (text.includes('dupliquer') || text.includes('duplicate') || text.includes('variante')) return 'template';
-      if (text.includes('monter') || text.includes('move up')) return 'move_up';
-      if (text.includes('descendre') || text.includes('move down')) return 'move_down';
-      if (text.includes('filtre') || text.includes('filter')) return 'manage';
-      if (text.includes('delete') || text === 'delete') return 'danger';
-      if (text.includes('supprimer') || text.includes('delete')) return 'danger';
-      if (text.includes('rejeter') || text.includes('reject')) return 'danger';
-      if (text.includes('enregistrer') || text.includes('sauver') || text.includes('save')) return 'save';
-      if (text.includes('export') || text.includes('telecharger') || text.includes('download')) return 'export';
-      if (text.includes('apercu') || text.includes('preview')) return 'preview';
-      if (text.includes('synchronis')) return 'sync';
-      if (text.includes('restaurer') || text.includes('restore')) return 'sync';
-      if (text.includes('gerer') || text.includes('manage')) return 'manage';
-      if (text.includes('soumettre') || text.includes('submit')) return 'submit';
-      if (text.includes('publier') || text.includes('publish')) return 'publish';
-      if (text.includes('inject')) return 'create';
-      if (text.includes('reactiv') || text.includes('desarchiv') || text.includes('unarchive')) return 'unarchive';
-      if (text.includes('instancier') || text.includes('variante') || text.includes('template')) return 'template';
-      if (text.includes('version') || text.includes('referentiel')) return 'registry';
-      if (text.includes('lier') || text.includes('relier') || text.includes('link')) return 'link';
-      if (text.includes('archiv')) return 'archive';
-      if (text.includes('convert')) return 'convert';
-      if (text.includes('modifier') || text.includes('edit')) return 'edit';
-      if (text.includes('ouvrir')) return 'open';
-      if (text.includes('valider') || text.includes('approuv')) return 'success';
-      if (text.includes('termin')) return 'success';
-      if (text.includes('en cours') || text.includes('statut')) return 'progress';
-      if (text.includes('email') || text.includes('mail')) return 'notify';
-      if (text.includes('checklist') || text.includes('cocher')) return 'success';
-      if (text.includes('generer')) return 'create';
-      if (text.includes('nouvelle tache') || text.includes('ajouter') || text.includes('creer')) return 'create';
-      if (button?.classList?.contains('task-action-btn-danger') || button?.classList?.contains('card-quick-btn-danger')) return 'danger';
-      if (button?.classList?.contains('task-action-btn-warn')) return 'archive';
-      if (button?.classList?.contains('workflow-card-action-btn')) {
-        if (button.classList.contains('is-danger')) return 'danger';
-        if (button.classList.contains('is-primary')) return 'open';
-      }
-      return 'default';
+      return actionUiHarmonizer?.inferActionButtonKind
+        ? actionUiHarmonizer.inferActionButtonKind(label, button)
+        : 'default';
     }
 
     function inferActionButtonIcon(label, button) {
-      const kind = inferActionButtonKind(label, button);
-      if (kind === 'danger') return 'delete';
-      if (kind === 'save') return 'save';
-      if (kind === 'close') return 'close';
-      if (kind === 'move_up') return 'arrow_upward';
-      if (kind === 'move_down') return 'arrow_downward';
-      if (kind === 'export') return 'download';
-      if (kind === 'preview') return 'visibility';
-      if (kind === 'sync') return 'sync';
-      if (kind === 'manage') return 'tune';
-      if (kind === 'submit') return 'rate_review';
-      if (kind === 'publish') return 'publish';
-      if (kind === 'unarchive') return 'unarchive';
-      if (kind === 'template') return 'content_copy';
-      if (kind === 'registry') return 'inventory_2';
-      if (kind === 'link') return 'link';
-      if (kind === 'archive') return 'archive';
-      if (kind === 'convert') return 'swap_horiz';
-      if (kind === 'edit') return 'edit';
-      if (kind === 'open') return 'visibility';
-      if (kind === 'success') return 'task_alt';
-      if (kind === 'progress') return 'play_arrow';
-      if (kind === 'notify') return 'mail';
-      if (kind === 'create') return 'add_circle';
-      return 'more_horiz';
+      return actionUiHarmonizer?.inferActionButtonIcon
+        ? actionUiHarmonizer.inferActionButtonIcon(label, button)
+        : 'more_horiz';
     }
 
     function sanitizeActionButtonLabel(rawValue) {
-      let value = normalizeActionButtonLabel(rawValue);
-      if (!value) return '';
-      const iconTokens = [
-        'open_in_new', 'swap_horiz', 'play_arrow', 'task_alt', 'add_circle',
-        'content_copy', 'inventory_2',
-        'delete', 'edit', 'visibility', 'archive', 'mail', 'download', 'save',
-        'sync', 'settings', 'publish', 'unarchive', 'link', 'bolt', 'more_horiz', 'close',
-        'restart_alt', 'filter_alt_off', 'filter_alt', 'search', 'tune', 'category',
-        'upload', 'upload_file', 'add', 'info', 'help', 'check', 'done', 'undo'
-      ];
-      const leadingIconsRegex = new RegExp(`^(?:${iconTokens.join('|')})\\s+`, 'i');
-      while (leadingIconsRegex.test(value)) {
-        value = value.replace(leadingIconsRegex, '').trim();
-      }
-      return value;
-    }
-
-    function defaultFrenchActionLabel(actionKind) {
-      if (actionKind === 'open') return 'Ouvrir';
-      if (actionKind === 'edit') return 'Modifier';
-      if (actionKind === 'convert') return 'Convertir';
-      if (actionKind === 'archive') return 'Archiver';
-      if (actionKind === 'danger') return 'Supprimer';
-      if (actionKind === 'notify') return 'Notifier';
-      if (actionKind === 'save') return 'Enregistrer';
-      if (actionKind === 'create') return 'Ajouter';
-      if (actionKind === 'close') return 'Fermer';
-      if (actionKind === 'move_up') return 'Monter';
-      if (actionKind === 'move_down') return 'Descendre';
-      return 'Action';
+      return actionUiHarmonizer?.sanitizeActionButtonLabel
+        ? actionUiHarmonizer.sanitizeActionButtonLabel(rawValue)
+        : normalizeActionButtonLabel(rawValue);
     }
 
     function deriveActionButtonLabel(button) {
-      if (!(button instanceof HTMLElement)) return '';
-      const explicit = sanitizeActionButtonLabel(
-        button.getAttribute('data-action-label')
-        || button.getAttribute('aria-label')
-        || button.getAttribute('title')
-        || ''
-      );
-      if (explicit) return explicit;
-
-      const existingLabelEl = button.querySelector('.taskmda-action-label');
-      if (existingLabelEl) {
-        const fromLabelEl = sanitizeActionButtonLabel(existingLabelEl.textContent || '');
-        if (fromLabelEl) return fromLabelEl;
-      }
-
-      const clone = button.cloneNode(true);
-      clone.querySelectorAll('.material-symbols-outlined, .taskmda-action-icon').forEach((node) => node.remove());
-      return sanitizeActionButtonLabel(clone.textContent || '');
+      return actionUiHarmonizer?.deriveActionButtonLabel
+        ? actionUiHarmonizer.deriveActionButtonLabel(button)
+        : '';
     }
 
     function ensureActionButtonDecor(button) {
-      if (!(button instanceof HTMLElement)) return;
-      if (button.dataset.actionUiDecorated === '1') return;
-      const fallbackRaw = button.textContent || '';
-      let label = deriveActionButtonLabel(button);
-      if (!label) {
-        label = sanitizeActionButtonLabel(fallbackRaw);
-      }
-      if (!label) return;
-      const actionKind = inferActionButtonKind(label, button);
-      if (!label) label = defaultFrenchActionLabel(actionKind);
-      button.setAttribute('data-action-kind', actionKind);
-      button.setAttribute('data-action-label', label);
-      button.setAttribute('data-ui-tooltip', label);
-      button.removeAttribute('title');
-      button.setAttribute('aria-label', label);
-
-      let iconEl = button.querySelector('.taskmda-action-icon, .material-symbols-outlined');
-      if (!iconEl) {
-        iconEl = document.createElement('span');
-        iconEl.className = 'material-symbols-outlined taskmda-action-icon';
-        iconEl.setAttribute('aria-hidden', 'true');
-        iconEl.textContent = inferActionButtonIcon(label, button);
-        button.insertBefore(iconEl, button.firstChild);
-      } else {
-        iconEl.classList.add('taskmda-action-icon');
-      }
-
-      let labelEl = button.querySelector('.taskmda-action-label');
-      if (!labelEl) {
-        const candidates = Array.from(button.children).filter((child) => (
-          child instanceof HTMLElement
-          && child !== iconEl
-          && !child.classList.contains('material-symbols-outlined')
-        ));
-        let candidate = null;
-        let candidateScore = -1;
-        candidates.forEach((child) => {
-          const raw = sanitizeActionButtonLabel(child.textContent || '');
-          if (!raw) return;
-          const score = normalizeActionToken(raw).length;
-          if (score > candidateScore) {
-            candidate = child;
-            candidateScore = score;
-          }
-        });
-        if (candidate) {
-          candidate.classList.add('taskmda-action-label');
-          labelEl = candidate;
-        } else {
-          labelEl = document.createElement('span');
-          labelEl.className = 'taskmda-action-label';
-          labelEl.textContent = label;
-          Array.from(button.childNodes).forEach((node) => {
-            if (node.nodeType === Node.TEXT_NODE && String(node.textContent || '').trim()) {
-              button.removeChild(node);
-            }
-          });
-          button.appendChild(labelEl);
-        }
-      }
-      if (labelEl && !normalizeActionButtonLabel(labelEl.textContent)) {
-        labelEl.textContent = label;
-      }
-      button.dataset.actionUiDecorated = '1';
+      if (!actionUiHarmonizer?.ensureActionButtonDecor) return;
+      actionUiHarmonizer.ensureActionButtonDecor(button);
     }
 
     function inferTooltipLabelFromIconToken(token = '') {
-      const key = normalizeActionToken(token);
-      if (!key) return '';
-      const map = new Map([
-        ['add', 'Ajouter'],
-        ['add_circle', 'Ajouter'],
-        ['add_task', 'Ajouter'],
-        ['link', 'Lier'],
-        ['tune', 'Filtres'],
-        ['filter_list', 'Filtres'],
-        ['close', 'Fermer'],
-        ['delete', 'Supprimer'],
-        ['edit', 'Modifier'],
-        ['visibility', 'Ouvrir'],
-        ['save', 'Enregistrer'],
-        ['mail', 'Notifier'],
-        ['archive', 'Archiver'],
-        ['unarchive', 'Restaurer'],
-        ['sync', 'Synchroniser'],
-        ['download', 'Exporter'],
-        ['publish', 'Publier'],
-        ['rate_review', 'Soumettre'],
-        ['task_alt', 'Valider'],
-        ['play_arrow', 'Mettre en cours'],
-        ['content_copy', 'Modèle'],
-        ['inventory_2', 'Référentiel'],
-        ['logout', 'Déconnexion'],
-        ['help', 'Aide'],
-        ['notifications', 'Notifications'],
-        ['dark_mode', 'Thème'],
-        ['light_mode', 'Thème'],
-        ['search', 'Recherche'],
-        ['arrow_back', 'Retour'],
-        ['menu', 'Menu']
-      ]);
-      return map.get(key) || '';
+      return actionUiHarmonizer?.inferTooltipLabelFromIconToken
+        ? actionUiHarmonizer.inferTooltipLabelFromIconToken(token)
+        : '';
     }
 
     function inferTooltipLabelFromElement(el) {
-      if (!(el instanceof HTMLElement)) return '';
-      const byAttr = sanitizeActionButtonLabel(
-        el.getAttribute('data-ui-tooltip')
-        || el.getAttribute('data-action-label')
-        || el.getAttribute('aria-label')
-        || el.getAttribute('title')
-        || ''
-      );
-      if (byAttr) return byAttr;
-
-      const textClone = el.cloneNode(true);
-      if (textClone?.querySelectorAll) {
-        textClone.querySelectorAll('.taskmda-action-icon, .material-symbols-outlined, .tab-icon, .tab-overflow-item-icon').forEach((node) => node.remove());
-      }
-      const byText = sanitizeActionButtonLabel(textClone?.textContent || '');
-      if (byText) return byText;
-
-      const iconToken = String(
-        el.querySelector('.taskmda-action-icon, .material-symbols-outlined')?.textContent
-        || ''
-      ).trim();
-      const byIcon = inferTooltipLabelFromIconToken(iconToken);
-      if (byIcon) return byIcon;
-
-      const idToken = normalizeActionToken(el.id || '');
-      if (idToken.includes('notification')) return 'Notifications';
-      if (idToken.includes('help')) return 'Aide';
-      if (idToken.includes('logout')) return 'Déconnexion';
-      if (idToken.includes('filter')) return 'Filtres';
-      if (idToken.includes('search')) return 'Recherche';
-      if (idToken.includes('add')) return 'Ajouter';
-      return '';
+      return actionUiHarmonizer?.inferTooltipLabelFromElement
+        ? actionUiHarmonizer.inferTooltipLabelFromElement(el)
+        : '';
     }
 
     function isEligibleIconTooltipElement(el) {
-      if (!(el instanceof HTMLElement)) return false;
-      if (el.closest('.sidebar')) return false;
-      if (el.closest('.workflow-quick-add-menu')) return false;
-      return el.matches(
-        'button.task-action-btn, button.card-quick-btn, button.workflow-card-action-btn, button.workflow-btn-light, button.workflow-btn-danger, button.workflow-btn-link-root, button.workspace-action-inline, a.workspace-action-inline, button[data-action-kind], button[data-action-label], a[data-action-kind], a[data-action-label], button.taskmda-modal-close-btn, button.rgpd-open-btn, button[data-rgpd-context-action], button[id^="rgpd-"][id$="-btn"], button#rgpd-filters-reset'
-      );
+      return actionUiHarmonizer?.isEligibleIconTooltipElement
+        ? actionUiHarmonizer.isEligibleIconTooltipElement(el)
+        : false;
     }
 
     function ensureGlobalIconTooltips(root = document) {
-      if (!root?.querySelectorAll) return;
-      if (getWorkflowActionButtonsMode() !== 'icon' || !isIconTooltipsEnabled()) {
-        root.querySelectorAll('[data-ui-tooltip]').forEach((node) => {
-          if (!(node instanceof HTMLElement)) return;
-          if (isEligibleIconTooltipElement(node)) node.removeAttribute('data-ui-tooltip');
-        });
-        hideIconTooltipLayer();
-        return;
-      }
-      const selectors = 'button, a, [role="button"]';
-      const candidates = [];
-      if (root.matches?.(selectors)) candidates.push(root);
-      root.querySelectorAll(selectors).forEach((node) => candidates.push(node));
-      candidates.forEach((el) => {
-        if (!(el instanceof HTMLElement)) return;
-        if (!isEligibleIconTooltipElement(el)) {
-          el.removeAttribute('data-ui-tooltip');
-          return;
-        }
-        const hasIcon = !!el.querySelector('.taskmda-action-icon, .material-symbols-outlined');
-        if (!hasIcon) return;
-        const label = inferTooltipLabelFromElement(el);
-        if (!label) return;
-        el.setAttribute('data-ui-tooltip', label);
-        if (!el.getAttribute('aria-label')) el.setAttribute('aria-label', label);
-        el.removeAttribute('title');
-        el.querySelectorAll('[title]').forEach((child) => child.removeAttribute('title'));
-      });
+      if (!actionUiHarmonizer?.ensureGlobalIconTooltips) return;
+      actionUiHarmonizer.ensureGlobalIconTooltips(root);
     }
 
-    let actionButtonsDecorateRaf = null;
-    let actionButtonsObserver = null;
-    let iconTooltipLayer = null;
-    let iconTooltipTarget = null;
-
     function getIconTooltipLayer() {
-      if (iconTooltipLayer && document.body?.contains(iconTooltipLayer)) return iconTooltipLayer;
-      if (!document?.body) return null;
-      const el = document.createElement('div');
-      el.id = 'app-icon-tooltip-layer';
-      el.className = 'app-icon-tooltip-layer hidden';
-      el.setAttribute('aria-hidden', 'true');
-      document.body.appendChild(el);
-      iconTooltipLayer = el;
-      return iconTooltipLayer;
+      return actionUiHarmonizer?.getIconTooltipLayer
+        ? actionUiHarmonizer.getIconTooltipLayer()
+        : null;
     }
 
     function hideIconTooltipLayer() {
-      const layer = getIconTooltipLayer();
-      if (!layer) return;
-      layer.classList.add('hidden');
-      iconTooltipTarget = null;
+      if (!actionUiHarmonizer?.hideIconTooltipLayer) return;
+      actionUiHarmonizer.hideIconTooltipLayer();
     }
 
     function positionIconTooltipLayer(target) {
-      const layer = getIconTooltipLayer();
-      if (!layer || !(target instanceof HTMLElement)) return;
-      const rect = target.getBoundingClientRect();
-      const layerRect = layer.getBoundingClientRect();
-      const margin = 10;
-      let left = rect.left + (rect.width / 2) - (layerRect.width / 2);
-      left = Math.max(8, Math.min(window.innerWidth - layerRect.width - 8, left));
-      let top = rect.top - layerRect.height - margin;
-      if (top < 8) {
-        top = rect.bottom + margin;
-      }
-      layer.style.left = `${Math.round(left)}px`;
-      layer.style.top = `${Math.round(top)}px`;
+      if (!actionUiHarmonizer?.positionIconTooltipLayer) return;
+      actionUiHarmonizer.positionIconTooltipLayer(target);
     }
 
     function showIconTooltipLayer(target) {
-      if (getWorkflowActionButtonsMode() !== 'icon' || !isIconTooltipsEnabled()) return;
-      if (!(target instanceof HTMLElement)) return;
-      if (!isEligibleIconTooltipElement(target)) return;
-      const label = sanitizeActionButtonLabel(target.getAttribute('data-ui-tooltip') || '');
-      if (!label) return;
-      const layer = getIconTooltipLayer();
-      if (!layer) return;
-      iconTooltipTarget = target;
-      layer.textContent = label;
-      layer.classList.remove('hidden');
-      positionIconTooltipLayer(target);
-    }
-
-    function refreshIconTooltipLayerForTarget(target) {
-      if (!(target instanceof HTMLElement)) return;
-      if (iconTooltipTarget !== target) return;
-      showIconTooltipLayer(target);
+      if (!actionUiHarmonizer?.showIconTooltipLayer) return;
+      actionUiHarmonizer.showIconTooltipLayer(target);
     }
 
     function ensureIconTooltipLayerBindings() {
-      if (document.documentElement?.dataset.iconTooltipLayerBound === '1') return;
-      if (!document?.body) return;
-      document.documentElement.dataset.iconTooltipLayerBound = '1';
-
-      const findTooltipTrigger = (node) => {
-        const el = node instanceof Element ? node : null;
-        if (!el) return null;
-        const trigger = el.closest('[data-ui-tooltip]');
-        return isEligibleIconTooltipElement(trigger) ? trigger : null;
-      };
-
-      document.addEventListener('mouseover', (event) => {
-        const trigger = findTooltipTrigger(event.target);
-        if (!trigger) return;
-        showIconTooltipLayer(trigger);
-      }, true);
-
-      document.addEventListener('mouseout', (event) => {
-        const from = findTooltipTrigger(event.target);
-        if (!from) return;
-        const to = event.relatedTarget instanceof Element ? event.relatedTarget.closest('[data-ui-tooltip]') : null;
-        if (from === to) return;
-        hideIconTooltipLayer();
-      }, true);
-
-      document.addEventListener('focusin', (event) => {
-        const trigger = findTooltipTrigger(event.target);
-        if (!trigger) return;
-        showIconTooltipLayer(trigger);
-      }, true);
-
-      document.addEventListener('focusout', (event) => {
-        const trigger = findTooltipTrigger(event.target);
-        if (!trigger) return;
-        const to = event.relatedTarget instanceof Element ? event.relatedTarget.closest('[data-ui-tooltip]') : null;
-        if (trigger === to) return;
-        hideIconTooltipLayer();
-      }, true);
-
-      window.addEventListener('scroll', () => {
-        if (!iconTooltipTarget) return;
-        positionIconTooltipLayer(iconTooltipTarget);
-      }, true);
-
-      window.addEventListener('resize', () => {
-        if (!iconTooltipTarget) return;
-        positionIconTooltipLayer(iconTooltipTarget);
-      });
+      if (!actionUiHarmonizer?.ensureIconTooltipLayerBindings) return;
+      actionUiHarmonizer.ensureIconTooltipLayerBindings();
     }
 
-    window.TaskMDARefreshIconTooltip = refreshIconTooltipLayerForTarget;
-
     function harmonizeCreateCtaButtons(root = document) {
-      if (!root?.querySelectorAll) return;
-      const createButtonCatalog = [
-        ['btn-global-doc-add', 'Ajouter doc hors projet'],
-        ['btn-global-theme-add', 'Ajouter'],
-        ['btn-global-group-add', 'Ajouter'],
-        ['btn-global-role-add', 'Ajouter'],
-        ['btn-software-add', 'Ajouter'],
-        ['btn-add-member', 'Ajouter membre'],
-        ['btn-create-user-group', 'Créer groupe utilisateurs'],
-        ['btn-create-group', 'Créer groupe'],
-        ['btn-add-theme', 'Ajouter'],
-        ['btn-add-project-documents', 'Ajouter document(s)'],
-        ['btn-task-assignee-quick-add', 'Ajouter'],
-        ['btn-open-global-calendar-item-modal', 'Ajouter info hors projet'],
-        ['rgpd-new-btn', 'Nouvelle activité'],
-        ['workflow-quick-add-toggle', 'Ajouter']
-      ];
-      createButtonCatalog.forEach(([id, fallbackLabel]) => {
-        const button = document.getElementById(id);
-        if (!(button instanceof HTMLElement)) return;
-        button.classList.add('taskmda-create-cta');
-        button.setAttribute('data-action-kind', 'create');
-        if (!button.getAttribute('data-action-label')) {
-          const textLabel = String(button.textContent || '').replace(/\s+/g, ' ').trim();
-          button.setAttribute('data-action-label', textLabel || fallbackLabel);
-        }
-        if (!button.getAttribute('aria-label')) {
-          button.setAttribute('aria-label', button.getAttribute('data-action-label') || fallbackLabel);
-        }
-      });
+      if (!actionUiHarmonizer?.harmonizeCreateCtaButtons) return;
+      actionUiHarmonizer.harmonizeCreateCtaButtons(root);
     }
 
     function harmonizeSemanticActionButtons(root = document) {
-      if (!root?.querySelectorAll) return;
-      const actionButtonCatalog = [
-        ['btn-send-invite', 'notify', 'Inviter'],
-        ['btn-send-message', 'submit', 'Envoyer'],
-        ['btn-global-send-message', 'submit', 'Envoyer'],
-        ['global-doc-reset', 'default', 'Réinitialiser'],
-        ['docs-filter-reset', 'default', 'Réinitialiser'],
-        ['btn-global-feed-post', 'submit', 'Publier'],
-        ['btn-global-feed-cancel', 'close', 'Annuler'],
-        ['btn-global-feed-digest', 'convert', 'Synthétiser un document'],
-        ['btn-project-note-digest', 'convert', 'Digérer document'],
-        ['btn-global-feed-insert-mention', 'link', 'Insérer @mention'],
-        ['btn-global-calendar-pin-theme', 'manage', 'Épingler la thématique'],
-        ['btn-project-doc-select-all', 'manage', 'Tout sélectionner'],
-        ['btn-project-doc-clear-selection', 'manage', 'Tout désélectionner'],
-        ['btn-save-doc-binding', 'save', 'Enregistrer'],
-        ['btn-save-doc-editor', 'save', 'Enregistrer'],
-        ['btn-save-app-branding', 'save', 'Enregistrer'],
-        ['btn-assign-app-admin', 'manage', 'Définir admin'],
-        ['btn-reset-app-branding', 'default', 'Valeurs par défaut'],
-        ['btn-reset-test-data', 'danger', 'Réinitialiser les données locales'],
-        ['btn-via-annuaire-ror-save', 'save', 'Enregistrer'],
-        ['btn-via-annuaire-ror-test', 'sync', 'Tester'],
-        ['btn-via-annuaire-live-search', 'open', 'Rechercher'],
-        ['btn-via-annuaire-live-prev', 'default', 'Page précédente'],
-        ['btn-via-annuaire-live-next', 'default', 'Page suivante'],
-        ['btn-remove-profile-photo', 'danger', 'Retirer'],
-        ['btn-export-user-json', 'export', 'Exporter JSON'],
-        ['btn-import-user-json', 'open', 'Importer JSON'],
-        ['btn-hard-sync-global-identities', 'sync', 'Lancer le hard sync global'],
-        ['btn-export-excel', 'export', 'Exporter projets et tâches (CSV Excel)'],
-        ['btn-change-password', 'manage', 'Changer le mot de passe'],
-        ['btn-show-recovery-key', 'open', 'Afficher la clé de récupération'],
-        ['btn-regenerate-recovery-key', 'sync', 'Régénérer la clé']
-      ];
-      actionButtonCatalog.forEach(([id, actionKind, fallbackLabel]) => {
-        const button = document.getElementById(id);
-        if (!(button instanceof HTMLElement)) return;
-        if (!button.getAttribute('data-action-kind')) button.setAttribute('data-action-kind', actionKind);
-        if (!button.getAttribute('data-action-label')) {
-          const textLabel = String(button.textContent || '').replace(/\s+/g, ' ').trim();
-          button.setAttribute('data-action-label', textLabel || fallbackLabel);
-        }
-        if (!button.getAttribute('aria-label')) {
-          button.setAttribute('aria-label', button.getAttribute('data-action-label') || fallbackLabel);
-        }
-      });
+      if (!actionUiHarmonizer?.harmonizeSemanticActionButtons) return;
+      actionUiHarmonizer.harmonizeSemanticActionButtons(root);
     }
 
     function harmonizeUtilityButtonsExclusions(root = document) {
-      if (!root?.querySelectorAll) return;
-      const utilityExclusionIds = [
-        'btn-theme-toggle',
-        'btn-notifications',
-        'btn-open-app-help',
-        'btn-sidebar-collapse',
-        'btn-project-prev',
-        'btn-project-next',
-        'btn-toggle-global-message-sidebar',
-        'btn-toggle-global-feed-composer',
-        'btn-toggle-docs-upload',
-        'btn-via-annuaire-config-toggle',
-        'btn-via-annuaire-live-audit-toggle',
-        'btn-toggle-project-description',
-        'btn-project-settings-subnav-horizontal',
-        'btn-project-settings-subnav-vertical',
-        'btn-project-settings-work-focus',
-        'btn-project-subnav-horizontal',
-        'btn-project-subnav-vertical',
-        'btn-project-work-focus'
-      ];
-      utilityExclusionIds.forEach((id) => {
-        const button = document.getElementById(id);
-        if (!(button instanceof HTMLElement)) return;
-        button.dataset.actionUtility = 'excluded';
-        button.removeAttribute('data-action-kind');
-        button.removeAttribute('data-action-label');
-        button.removeAttribute('data-ui-tooltip');
-        delete button.dataset.actionUiDecorated;
-      });
-
-      // Workflow quick-add dropdown is a menu: labels must stay visible.
-      root.querySelectorAll('.workflow-quick-add-menu .workflow-quick-add-item').forEach((button) => {
-        if (!(button instanceof HTMLElement)) return;
-        button.dataset.actionUtility = 'excluded';
-        button.removeAttribute('data-action-kind');
-        button.removeAttribute('data-action-label');
-        button.removeAttribute('data-ui-tooltip');
-        delete button.dataset.actionUiDecorated;
-      });
+      if (!actionUiHarmonizer?.harmonizeUtilityButtonsExclusions) return;
+      actionUiHarmonizer.harmonizeUtilityButtonsExclusions(root);
     }
 
     function applyActionButtonsDisplayMode(root = document) {
-      if (!root?.querySelectorAll) return;
-      harmonizeCreateCtaButtons(root);
-      harmonizeSemanticActionButtons(root);
-      harmonizeUtilityButtonsExclusions(root);
-      const selectors = [
-        'button.task-action-btn',
-        'button.card-quick-btn',
-        'button.workflow-card-action-btn',
-        'button.workflow-btn-light',
-        'button.workflow-btn-danger',
-        'button.workflow-btn-link-root',
-        'button#workflow-quick-add-toggle',
-        'button#workflow-filters-toggle',
-        'button.workspace-action-inline',
-        'a.workspace-action-inline',
-        'button[data-action-kind]',
-        'button[data-action-label]',
-        'a[data-action-kind]',
-        'a[data-action-label]',
-        'button[id^="btn-workflow-"]',
-        'button[data-wf-card-action]',
-        'button[data-wf-flow-action]',
-        'button[data-wf-flow-bulk-action]',
-        'button[data-wf-designer-action]',
-        'button[data-wf-designer-add-type]',
-        'button[data-wf-governance-action]',
-        'button[data-wf-governance-export]',
-        'button[data-wf-analytics-action]',
-        'button[data-wf-history-diff-toggle]',
-        'button[data-wf-history-restore]',
-        'button[data-wf-history-restore-fields]',
-        'button.taskmda-modal-close-btn',
-        'button.rgpd-open-btn',
-        'button[data-rgpd-context-action]',
-        'button[id^="rgpd-"][id$="-btn"]',
-        'button#rgpd-filters-reset'
-      ].join(', ');
-      root.querySelectorAll(selectors).forEach((button) => {
-        if (button instanceof HTMLElement && button.closest('.workflow-quick-add-menu')) return;
-        if (button instanceof HTMLElement && button.dataset.actionUtility === 'excluded') return;
-        ensureActionButtonDecor(button);
-        button.removeAttribute('title');
-        button.querySelectorAll('[title]').forEach((child) => child.removeAttribute('title'));
-      });
-      root.querySelectorAll('[data-ui-tooltip][title], [data-action-kind][title], [data-action-label][title]').forEach((node) => {
-        node.removeAttribute('title');
-      });
-      ensureGlobalIconTooltips(root);
-      ensureIconTooltipLayerBindings();
+      if (!actionUiHarmonizer?.applyActionButtonsDisplayMode) return;
+      actionUiHarmonizer.applyActionButtonsDisplayMode(root);
     }
 
     function scheduleActionButtonsDecorate() {
-      if (actionButtonsDecorateRaf) cancelAnimationFrame(actionButtonsDecorateRaf);
-      actionButtonsDecorateRaf = requestAnimationFrame(() => {
-        actionButtonsDecorateRaf = null;
-        applyActionButtonsDisplayMode(document);
-      });
+      if (!actionUiHarmonizer?.scheduleActionButtonsDecorate) return;
+      actionUiHarmonizer.scheduleActionButtonsDecorate();
     }
 
     function ensureActionButtonsObserver() {
-      if (actionButtonsObserver || !document?.body) return;
-      actionButtonsObserver = new MutationObserver(() => {
-        scheduleActionButtonsDecorate();
-      });
-      actionButtonsObserver.observe(document.body, { childList: true, subtree: true });
-      scheduleActionButtonsDecorate();
+      if (!actionUiHarmonizer?.ensureActionButtonsObserver) return;
+      actionUiHarmonizer.ensureActionButtonsObserver();
     }
 
-    let modalFieldIconsObserver = null;
-    let modalFieldIconsRaf = null;
-    let modalCloseButtonsObserver = null;
-    let modalCloseButtonsRaf = null;
+    const modalUiHarmonizer = window.TaskMDAModalUiHarmonizer?.create?.({
+      normalizeSearch,
+      normalizeActionButtonLabel,
+      scheduleActionButtonsDecorate
+    }) || null;
 
     function normalizeModalLabelText(value) {
-      const raw = String(value || '').replace(/\s+/g, ' ').trim();
-      if (!raw) return '';
-      if (typeof normalizeSearch === 'function') return normalizeSearch(raw);
-      return raw.toLowerCase();
+      if (!modalUiHarmonizer?.normalizeModalLabelText) return String(value || '').trim().toLowerCase();
+      return modalUiHarmonizer.normalizeModalLabelText(value);
     }
 
     function inferModalFieldIcon(labelText, fieldId = '') {
-      const text = normalizeModalLabelText(labelText);
-      const idText = normalizeModalLabelText(fieldId);
-      const blob = `${text} ${idText}`;
-      if (!blob) return '';
-      if (blob.includes('nombre') || blob.includes('occurrence')) return 'tag';
-      if (blob.includes('visibilite') || blob.includes('lecture')) return 'visibility';
-      if (blob.includes('titre') || blob.includes('nom')) return 'title';
-      if (blob.includes('description') || blob.includes('resume') || blob.includes('commentaire') || blob.includes('notes')) return 'description';
-      if (blob.includes('demande')) return 'calendar_clock';
-      if (blob.includes('echeance') || (blob.includes('date') && !blob.includes('creation'))) return 'event';
-      if (blob.includes('email')) return 'mail';
-      if (blob.includes('mot de passe') || blob.includes('password') || blob.includes('passphrase')) return 'password';
-      if (blob.includes('photo') || blob.includes('avatar') || blob.includes('image')) return 'image';
-      if (blob.includes('document') || blob.includes('fichier') || blob.includes('piece jointe') || blob.includes('piece-jointe')) return 'attach_file';
-      if (blob.includes('statut')) return 'flag';
-      if (blob.includes('urgence') || blob.includes('priorite') || blob.includes('criticite')) return 'priority_high';
-      if (blob.includes('theme') || blob.includes('thematique') || blob.includes('tag')) return 'sell';
-      if (blob.includes('jour') || blob.includes('semaine') || blob.includes('mois') || blob.includes('annuelle')) return 'calendar_month';
-      if (blob.includes('groupe')) return 'groups';
-      if (blob.includes('membre') || blob.includes('assigne') || blob.includes('responsable') || blob.includes('owner')) return 'group';
-      if (blob.includes('service')) return 'apartment';
-      if (blob.includes('communaute')) return 'public';
-      if (blob.includes('role')) return 'badge';
-      if (blob.includes('permission') || blob.includes('habilitation')) return 'admin_panel_settings';
-      if (blob.includes('competence') || blob.includes('skill')) return 'psychology';
-      if (blob.includes('processus')) return 'account_tree';
-      if (blob.includes('etape')) return 'stairs';
-      if (blob.includes('tache')) return 'task';
-      if (blob.includes('flux')) return 'compare_arrows';
-      if (blob.includes('logiciel')) return 'apps';
-      if (blob.includes('procedure')) return 'rule';
-      if (blob.includes('scope') || blob.includes('perimetre')) return 'crop_free';
-      if (blob.includes('rattachement') || blob.includes('associer')) return 'hub';
-      if (blob.includes('mode')) return 'tune';
-      if (blob.includes('validation') || blob.includes('approb')) return 'fact_check';
-      if (blob.includes('type') || blob.includes('categorie')) return 'category';
-      if (blob.includes('couleur')) return 'palette';
-      if (blob.includes('icone') || blob.includes('icone')) return 'emoji_symbols';
-      if (blob.includes('duree') || blob.includes('delai')) return 'timer';
-      if (blob.includes('ordre') || blob.includes('ordre')) return 'format_list_numbered';
-      if (blob.includes('entree') || blob.includes('input')) return 'input';
-      if (blob.includes('sortie') || blob.includes('output')) return 'output';
-      if (blob.includes('declencheur') || blob.includes('trigger')) return 'notifications_active';
-      if (blob.includes('onglet') || blob.includes('tab')) return 'tab';
-      if (blob.includes('lien') || blob.includes('url')) return 'link';
-      if (blob.includes('recurrence')) return 'event_repeat';
-      if (blob.includes('intervalle')) return 'tune';
-      return '';
+      return modalUiHarmonizer?.inferModalFieldIcon
+        ? modalUiHarmonizer.inferModalFieldIcon(labelText, fieldId)
+        : '';
     }
 
     function decorateModalFieldLabels(root = document) {
-      if (!root?.querySelectorAll) return;
-      const modalSelectors = '[id^="modal-"], #workflow-modal, #workflow-detail-modal, #workflow-modal-body';
-      const modalNodes = root.matches?.(modalSelectors)
-        ? [root]
-        : Array.from(root.querySelectorAll(modalSelectors));
-      modalNodes.forEach((modal) => {
-        const labels = modal.querySelectorAll('label, .workflow-form-label, .global-calendar-item-modal-label');
-        labels.forEach((label) => {
-          if (!(label instanceof HTMLElement)) return;
-          if (label.dataset.modalIconDecorated === '1') return;
-          const existingIcon = label.querySelector('.modal-field-icon, .material-symbols-outlined');
-          if (existingIcon) {
-            label.classList.add('modal-label-with-icon');
-            label.dataset.modalIconDecorated = '1';
-            return;
-          }
-          if (label.matches('summary')) return;
-          if (label.querySelector('input, select, textarea, button')) return;
-          const rawText = String(label.textContent || '').replace(/\s+/g, ' ').trim();
-          if (!rawText) return;
-          if (normalizeModalLabelText(rawText).includes('parametres avances')) return;
-          const forId = String(label.getAttribute('for') || '').trim();
-          const iconName = inferModalFieldIcon(rawText, forId);
-          if (!iconName) return;
-          const iconEl = document.createElement('span');
-          iconEl.className = 'material-symbols-outlined modal-field-icon modal-field-icon-auto';
-          iconEl.setAttribute('aria-hidden', 'true');
-          iconEl.textContent = iconName;
-          label.classList.add('modal-label-with-icon');
-          label.insertBefore(iconEl, label.firstChild);
-          label.dataset.modalIconDecorated = '1';
-        });
-      });
+      if (!modalUiHarmonizer?.decorateModalFieldLabels) return;
+      modalUiHarmonizer.decorateModalFieldLabels(root);
     }
 
     function scheduleModalFieldIconsDecorate() {
-      if (modalFieldIconsRaf) cancelAnimationFrame(modalFieldIconsRaf);
-      modalFieldIconsRaf = requestAnimationFrame(() => {
-        modalFieldIconsRaf = null;
-        decorateModalFieldLabels(document);
-      });
+      if (!modalUiHarmonizer?.scheduleModalFieldIconsDecorate) return;
+      modalUiHarmonizer.scheduleModalFieldIconsDecorate();
     }
 
     function ensureModalFieldIconsObserver() {
-      if (modalFieldIconsObserver || !document?.body) return;
-      modalFieldIconsObserver = new MutationObserver(() => {
-        scheduleModalFieldIconsDecorate();
-      });
-      modalFieldIconsObserver.observe(document.body, { childList: true, subtree: true });
-      scheduleModalFieldIconsDecorate();
+      if (!modalUiHarmonizer?.ensureModalFieldIconsObserver) return;
+      modalUiHarmonizer.ensureModalFieldIconsObserver();
     }
 
     function isCloseSemanticButton(button) {
-      if (!(button instanceof HTMLElement)) return false;
-      const id = String(button.id || '').trim().toLowerCase();
-      const txt = String(button.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      const aria = String(button.getAttribute('aria-label') || '').trim().toLowerCase();
-      const title = String(button.getAttribute('title') || '').trim().toLowerCase();
-      if (id.includes('close')) return true;
-      if (aria.includes('fermer') || title.includes('fermer')) return true;
-      if (txt === '×' || txt === 'x' || txt.includes('fermer')) return true;
-      const icon = String(button.querySelector('.material-symbols-outlined')?.textContent || '').trim().toLowerCase();
-      return icon === 'close';
+      return modalUiHarmonizer?.isCloseSemanticButton
+        ? modalUiHarmonizer.isCloseSemanticButton(button)
+        : false;
     }
 
     function applyUnifiedCloseStyle(button) {
-      if (!(button instanceof HTMLElement)) return;
-      button.classList.add('taskmda-modal-close-btn');
-      button.setAttribute('type', 'button');
-      if (!button.getAttribute('aria-label')) button.setAttribute('aria-label', 'Fermer');
-      const iconEl = button.querySelector('.material-symbols-outlined');
-      if (iconEl) {
-        iconEl.textContent = 'close';
-        iconEl.setAttribute('aria-hidden', 'true');
-      }
-      const label = normalizeActionButtonLabel(button.textContent || '');
-      if (!label || label === '×' || label.toLowerCase() === 'x') {
-        button.textContent = 'Fermer';
-      } else if (!/fermer/i.test(label)) {
-        button.textContent = 'Fermer';
-      }
+      if (!modalUiHarmonizer?.applyUnifiedCloseStyle) return;
+      modalUiHarmonizer.applyUnifiedCloseStyle(button);
     }
 
     function normalizeModalCloseButtons(root = document) {
-      if (!root?.querySelectorAll) return;
-      const modalSelector = '[id^="modal-"], #workflow-detail-modal';
-      const modals = root.matches?.(modalSelector) ? [root] : Array.from(root.querySelectorAll(modalSelector));
-      modals.forEach((modal) => {
-        if (!(modal instanceof HTMLElement)) return;
-        const panel = modal.firstElementChild instanceof HTMLElement ? modal.firstElementChild : modal;
-        if (panel) panel.classList.add('taskmda-modal-panel-unified');
-
-        const closeButtons = Array.from(modal.querySelectorAll('button')).filter(isCloseSemanticButton);
-        if (closeButtons.length > 0) {
-          closeButtons.forEach((btn) => applyUnifiedCloseStyle(btn));
-          return;
-        }
-
-        if (modal.dataset.modalCloseInjected === '1') return;
-        const injectedBtn = document.createElement('button');
-        injectedBtn.type = 'button';
-        injectedBtn.className = 'taskmda-modal-close-btn taskmda-modal-close-btn-injected';
-        injectedBtn.textContent = 'Fermer';
-        injectedBtn.setAttribute('aria-label', 'Fermer');
-        injectedBtn.addEventListener('click', () => {
-          modal.classList.add('hidden');
-        });
-        panel.prepend(injectedBtn);
-        modal.dataset.modalCloseInjected = '1';
-      });
-      scheduleActionButtonsDecorate();
+      if (!modalUiHarmonizer?.normalizeModalCloseButtons) return;
+      modalUiHarmonizer.normalizeModalCloseButtons(root);
     }
 
     function scheduleModalCloseButtonsNormalize() {
-      if (modalCloseButtonsRaf) cancelAnimationFrame(modalCloseButtonsRaf);
-      modalCloseButtonsRaf = requestAnimationFrame(() => {
-        modalCloseButtonsRaf = null;
-        normalizeModalCloseButtons(document);
-      });
+      if (!modalUiHarmonizer?.scheduleModalCloseButtonsNormalize) return;
+      modalUiHarmonizer.scheduleModalCloseButtonsNormalize();
     }
 
     function ensureModalCloseButtonsObserver() {
-      if (modalCloseButtonsObserver || !document?.body) return;
-      modalCloseButtonsObserver = new MutationObserver(() => {
-        scheduleModalCloseButtonsNormalize();
-      });
-      modalCloseButtonsObserver.observe(document.body, { childList: true, subtree: true });
-      scheduleModalCloseButtonsNormalize();
+      if (!modalUiHarmonizer?.ensureModalCloseButtonsObserver) return;
+      modalUiHarmonizer.ensureModalCloseButtonsObserver();
     }
 
     function deepClone(value) {
@@ -4479,6 +3985,10 @@
       }
     }
 
+    /**
+     * Écriture immédiate d'un événement dans l'espace partagé (mode chiffré E2E).
+     * Retourne `true` si le fichier est écrit, `false` sinon.
+     */
     async function writeEventToSharedFolderNow(projectId, event) {
       const folders = projectFolders.get(projectId);
       if (!folders) return false;
@@ -4520,6 +4030,13 @@
       }
     }
 
+    /**
+     * Traite la file d'écriture collaborative en arrière-plan.
+     * Invariants:
+     * - traitement séquentiel (pas de concurrence locale),
+     * - retry borné,
+     * - notification explicite en cas d'échec final.
+     */
     async function processSharedWriteQueue() {
       if (isSharedWriteProcessing || !sharedFolderHandle) return;
       isSharedWriteProcessing = true;
@@ -4552,6 +4069,10 @@
       }
     }
 
+    /**
+     * Enqueue un événement pour synchronisation collaborative asynchrone.
+     * Utilise une clé de déduplication pour éviter les doublons de file.
+     */
     async function writeEventToSharedFolder(projectId, event) {
       if (!sharedFolderHandle || !event?.eventId || !projectId) return false;
       const folders = projectFolders.get(projectId);
@@ -4570,6 +4091,12 @@
       return true;
     }
 
+    /**
+     * Synchronise le bootstrap d'un nouveau projet partagé:
+     * - enregistrement dossier projet,
+     * - persistance clé partagée locale,
+     * - copie initiale des événements.
+     */
     async function syncProjectBootstrapToSharedSpace(projectId, sharedKeyHex, events = []) {
       if (!sharedFolderHandle || !projectId) {
         return { total: 0, synced: 0, failed: 0 };
@@ -4612,6 +4139,10 @@
       }
     }
 
+    /**
+     * Synchronise un lot d'événements projet vers l'espace partagé.
+     * Garde-fou: n'écrit que pour les projets en mode collaboratif.
+     */
     async function syncProjectEventsToSharedSpace(projectId, events = [], options = {}) {
       if (!sharedFolderHandle || !projectId) return;
       const state = await getProjectState(projectId, { ignoreAccessCheck: true });
@@ -4634,6 +4165,12 @@
       }
     }
 
+    /**
+     * Lit les événements depuis l'espace partagé d'un projet.
+     * - déchiffre les payloads `v1-e2e-encrypted` si clé locale disponible,
+     * - conserve une compatibilité legacy JSON clair,
+     * - protège le polling contre les mismatch de clé.
+     */
     async function readEventsFromSharedFolder(projectId, onlyNew = true) {
       const folders = projectFolders.get(projectId);
       if (!folders) return [];
@@ -4698,6 +4235,11 @@
       return events.sort((a, b) => a.timestamp - b.timestamp);
     }
 
+    /**
+     * Démarre le polling collaboratif:
+     * - ingestion événements projet,
+     * - sync messages/feed/workflow transverses.
+     */
     async function startPolling() {
       if (isPolling) return;
       isPolling = true;
@@ -4721,6 +4263,9 @@
       debugLog('Polling started');
     }
 
+    /**
+     * Arrête proprement le polling collaboratif local.
+     */
     function stopPolling() {
       if (pollInterval) {
         clearInterval(pollInterval);
@@ -4749,6 +4294,11 @@
     const LOADING_SHOW_DELAY_MS = 120;
     const LOADING_MIN_VISIBLE_MS = 220;
 
+    /**
+     * Controle l'overlay global de chargement et ajuste les attributs ARIA.
+     * Le compteur `globalLoadingLockCount` permet d'eviter les clignotements
+     * quand plusieurs actions concurrentes demandent un etat busy.
+     */
     function showLoading(show) {
       const loader = document.getElementById('loading');
       if (!loader) return;
@@ -4789,6 +4339,10 @@
       }, waitMs);
     }
 
+    /**
+     * Execute une action asynchrone sous verrou de chargement global.
+     * Reutilise `showLoading` pour empiler/depiler proprement l'etat busy.
+     */
     async function runWithLoading(action) {
       if (loadingSuppressedDepth > 0) {
         return await action();
@@ -4803,6 +4357,10 @@
       }
     }
 
+    /**
+     * Execute une action sans activer l'overlay global.
+     * Utile pour les operations de fond qui ne doivent pas bloquer l'UI.
+     */
     async function runWithoutGlobalLoading(action) {
       loadingSuppressedDepth += 1;
       try {
@@ -4812,6 +4370,9 @@
       }
     }
 
+    /**
+     * Determine le conteneur cible de l'indicateur inline selon le scope.
+     */
     function resolveInlineSaveIndicatorHost(scope) {
       if (scope === 'task-detail') return document.querySelector('#modal-global-task-details .task-detail-modal-panel');
       if (scope === 'project-inline') return document.getElementById('project-overview-panel');
@@ -4821,6 +4382,10 @@
       return null;
     }
 
+    /**
+     * Cree (si necessaire) puis retourne l'indicateur inline de sauvegarde
+     * associe au scope fourni.
+     */
     function ensureInlineSaveIndicator(scope) {
       const host = resolveInlineSaveIndicatorHost(scope);
       if (!host) return null;
@@ -4839,6 +4404,9 @@
       return indicator;
     }
 
+    /**
+     * Applique l'etat visuel de sauvegarde inline (`saving`, `saved`, `error`, `idle`).
+     */
     function setInlineSaveIndicator(scope, state) {
       const indicator = ensureInlineSaveIndicator(scope);
       if (!indicator) return;
@@ -5039,6 +4607,9 @@
       shellUiRuntime?.toggleSidebarCollapsed?.();
     }
 
+    /**
+     * Met a jour le statut de synchronisation principal affiche dans l'interface.
+     */
     function updateSyncStatus(status) {
       const statusEl = document.getElementById('sync-status');
       const statusConfig = {
@@ -5056,6 +4627,9 @@
       updateFolderButtons();
     }
 
+    /**
+     * Met a jour l'indicateur de synchronisation de fond (etat + file d'attente).
+     */
     function updateBackgroundSyncStatus(state = 'idle', pendingCount = sharedWriteQueue.length) {
       const indicator = document.getElementById('bg-sync-indicator');
       if (!indicator) return;
@@ -9546,6 +9120,9 @@
     let globalTasksViewMode = localStorage.getItem('taskmda_global_tasks_view') || 'kanban'; // cards | list | kanban | timeline
     let globalTasksBulkSelectionMode = false;
     let selectedGlobalTaskRefsForBulkDelete = new Set();
+    // Cache du dernier contexte de rendu des tâches globales.
+    // Objectif: éviter des relectures IndexedDB immédiates dans le post-traitement UI.
+    let lastGlobalTasksRenderContext = null;
     let globalTimelineDisplayMode = localStorage.getItem('taskmda_global_timeline_mode') === 'list' ? 'list' : 'columns'; // columns | list
     let globalTimelineExpandedGroups = {
       overdue: false,
@@ -10717,6 +10294,88 @@
         && projectDetailMode === 'work'
         && currentView === 'list';
       commandbar.classList.toggle('hidden', !shouldShow);
+    }
+
+    function getProjectPrimaryActionConfig(view = activeProjectView) {
+      const currentView = String(view || '').trim();
+      if (currentView === 'notes') {
+        return {
+          label: 'Nouvelle note',
+          icon: 'note_add',
+          actionKind: 'create',
+          actionLabel: 'Nouvelle note',
+          ariaLabel: 'Créer une nouvelle note',
+          disabled: !canCreateProjectNote(currentProjectState),
+          handler: () => openProjectNoteEditor('')
+        };
+      }
+      if (currentView === 'docs') {
+        return {
+          label: 'Nouveau document',
+          icon: 'note_stack_add',
+          actionKind: 'create',
+          actionLabel: 'Nouveau document',
+          ariaLabel: 'Ajouter un document au projet',
+          disabled: !canEditProjectMeta(currentProjectState),
+          handler: () => openProjectDocUploadModal()
+        };
+      }
+      if (currentView === 'chat') {
+        return {
+          label: 'Nouveau message',
+          icon: 'chat_add_on',
+          actionKind: 'create',
+          actionLabel: 'Nouveau message',
+          ariaLabel: 'Écrire un nouveau message',
+          disabled: false,
+          handler: () => {
+            const input = document.getElementById('message-input');
+            if (input instanceof HTMLElement) {
+              input.focus();
+              input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+          }
+        };
+      }
+      return {
+        label: 'Nouvelle tâche',
+        icon: 'add_circle',
+        actionKind: 'create',
+        actionLabel: 'Nouvelle tâche',
+        ariaLabel: 'Créer une nouvelle tâche',
+        disabled: !canCreateTaskInProject(currentProjectState),
+        handler: () => openProjectTaskCreateModalWithStatus('todo')
+      };
+    }
+
+    function syncProjectPrimaryActionButton(view = activeProjectView) {
+      const btn = document.getElementById('btn-add-task');
+      if (!btn) return;
+      const textEl = document.getElementById('btn-add-task-text');
+      const iconEl = btn.querySelector('.taskmda-action-icon, .material-symbols-outlined');
+      const config = getProjectPrimaryActionConfig(view);
+      const tooltipText = String(config.actionLabel || config.label || 'Nouvelle tâche');
+      if (textEl) textEl.textContent = String(config.label || 'Nouvelle tâche');
+      if (iconEl) iconEl.textContent = String(config.icon || 'add_circle');
+      btn.setAttribute('data-action-kind', String(config.actionKind || 'create'));
+      btn.setAttribute('data-action-label', tooltipText);
+      btn.setAttribute('data-ui-tooltip', tooltipText);
+      btn.setAttribute('title', tooltipText);
+      btn.setAttribute('aria-label', String(config.ariaLabel || config.label || 'Nouvelle tâche'));
+      btn.disabled = !!config.disabled;
+      btn.classList.toggle('opacity-50', !!config.disabled);
+      btn.classList.toggle('cursor-not-allowed', !!config.disabled);
+    }
+
+    function triggerProjectPrimaryAction() {
+      const config = getProjectPrimaryActionConfig(activeProjectView);
+      if (config?.disabled) {
+        showToast('Action non autorisee');
+        return;
+      }
+      if (typeof config?.handler === 'function') {
+        config.handler();
+      }
     }
 
     function detachGlobalKanbanInfiniteScroll() {
@@ -11962,6 +11621,7 @@ async function setProjectsPage(page) {
       if (nextMode === 'work') {
         applyProjectSubnavLayout();
         syncProjectWorkFocusButton();
+        syncProjectPrimaryActionButton(activeProjectView);
       }
       if (nextMode === 'settings') {
         applyProjectSettingsLayout();
@@ -12270,6 +11930,7 @@ async function setProjectsPage(page) {
       }
       updateProjectOverviewVisibility();
       syncProjectWorkCommandbarVisibility(view);
+      syncProjectPrimaryActionButton(view);
       if (view === 'list' && workspaceMode === 'project' && currentProjectState) {
         renderTasks(currentProjectState.tasks || []);
       }
@@ -19605,6 +19266,323 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       }
     }
 
+    /**
+     * Résout les références DOM de la modale détail tâche.
+     * Point d'entrée unique pour éviter la duplication de `getElementById`
+     * dans les flux global/projet.
+     */
+    function getGlobalTaskDetailModalElements() {
+      return {
+        titleEl: document.getElementById('global-task-detail-title'),
+        subtitleEl: document.getElementById('global-task-detail-subtitle'),
+        badgesEl: document.getElementById('global-task-detail-badges'),
+        descriptionEl: document.getElementById('global-task-detail-description'),
+        requestDateEl: document.getElementById('global-task-detail-request-date'),
+        dueDateEl: document.getElementById('global-task-detail-due-date'),
+        assigneesEl: document.getElementById('global-task-detail-assignees'),
+        groupEl: document.getElementById('global-task-detail-group'),
+        recurrenceWrapEl: document.getElementById('global-task-detail-recurrence-wrap'),
+        recurrenceEl: document.getElementById('global-task-detail-recurrence'),
+        subtasksEl: document.getElementById('global-task-detail-subtasks'),
+        attachmentsEl: document.getElementById('global-task-detail-attachments'),
+        btnConvert: document.getElementById('btn-global-task-detail-convert'),
+        btnTaskEmail: document.getElementById('btn-global-task-detail-email'),
+        taskEmailTemplateSelect: document.getElementById('global-task-detail-email-template'),
+        btnEdit: document.getElementById('btn-global-task-detail-edit'),
+        btnArchive: document.getElementById('btn-global-task-detail-archive'),
+        btnDelete: document.getElementById('btn-global-task-detail-delete')
+      };
+    }
+
+    /**
+     * Rend le socle commun de la modale détail tâche:
+     * - en-tête (titre, sous-titre, badges),
+     * - méta (dates, responsables, groupe, récurrence),
+     * - sous-tâches (mode lecture/interaction selon permissions).
+     *
+     * Le rendu des pièces jointes et des actions footer est volontairement
+     * externalisé dans des helpers dédiés.
+     */
+    function renderGlobalTaskDetailCommonSection(task, state, options = {}) {
+      const refs = options.refs || getGlobalTaskDetailModalElements();
+      const sourceProjectName = String(options.sourceProjectName || (state?.project?.name || 'Projet'));
+      const sourceTheme = String(task?.theme || 'General');
+      const groupName = String(options.groupName || getTaskGroupName(task, state) || task?.groupName || 'Aucun groupe');
+      const sharingMode = String(options.sharingMode || task?.sharingMode || state?.project?.sharingMode || 'shared');
+      const taskRef = String(options.taskRef || '');
+      const canToggleSubtasks = Boolean(options.canToggleSubtasks);
+      const resolved = options.resolved || null;
+      const statusMeta = getTaskStatusMeta(task?.status || 'todo');
+      const urgencyMeta = getTaskUrgencyMeta(task?.urgency || 'medium');
+
+      if (refs.titleEl) refs.titleEl.textContent = task?.title || 'Tache';
+      if (refs.subtitleEl) {
+        refs.subtitleEl.innerHTML = `${escapeHtml(sourceProjectName)} • <span id="global-task-detail-theme">${escapeHtml(sourceTheme || 'General')}</span>`;
+      }
+      if (refs.badgesEl) {
+        refs.badgesEl.innerHTML = `
+          <span id="global-task-detail-urgency-chip" class="${urgencyMeta.chipClass}">${urgencyMeta.label}</span>
+          <span id="global-task-detail-status-chip" class="${statusMeta.chipClass}">${statusMeta.label}</span>
+          ${buildTaskAssigneeKindBadgeHtml(task, state)}
+          ${buildTaskHierarchyChipsHtml(task, state)}
+          ${sharingModeBadge(sharingMode)}
+        `;
+      }
+      renderTaskDescriptionToElement(task, refs.descriptionEl);
+      if (refs.requestDateEl) refs.requestDateEl.textContent = formatDate(task?.requestDate);
+      if (refs.dueDateEl) refs.dueDateEl.textContent = formatTaskDeadline(task);
+      if (refs.assigneesEl) refs.assigneesEl.innerHTML = `<span class="inline-flex items-center gap-1.5">${buildTaskAssigneeInlineHtml(task, state)}</span>`;
+      if (refs.groupEl) refs.groupEl.textContent = groupName;
+      if (refs.recurrenceWrapEl && refs.recurrenceEl) {
+        const recurringCfg = normalizeTaskRecurringConfig(task?.recurring);
+        const recurrenceLabel = recurringCfg
+          ? (window.TaskMDARecurrence?.formatRecurrenceLabel?.(recurringCfg) || 'Récurrence configurable')
+          : 'Non récurrente';
+        refs.recurrenceEl.textContent = recurrenceLabel;
+        refs.recurrenceWrapEl.classList.remove('hidden');
+      }
+      if (refs.subtasksEl && taskRef && resolved) {
+        renderTaskDetailSubtasks(refs.subtasksEl, task, { taskRef, canToggle: canToggleSubtasks, resolved });
+      }
+      return refs;
+    }
+
+    /**
+     * Rend les pièces jointes de la modale détail tâche.
+     * Supporte:
+     * - pièces jointes natives de la tâche,
+     * - documents projet liés (optionnel, vue projet).
+     */
+    function renderGlobalTaskDetailAttachments(task, options = {}) {
+      const refs = options.refs || getGlobalTaskDetailModalElements();
+      const canEdit = Boolean(options.canEdit);
+      const includeLinkedDocs = options.includeLinkedDocs === true;
+      const linkedDocs = Array.isArray(options.linkedDocs) ? options.linkedDocs : [];
+      const attachments = Array.isArray(task?.attachments) ? task.attachments : [];
+      if (!refs.attachmentsEl) return;
+
+      const allItems = [
+        ...attachments.map((file, index) => ({ type: 'attachment', file, index })),
+        ...(includeLinkedDocs ? linkedDocs.map((doc) => ({ type: 'project-doc', doc })) : [])
+      ];
+      if (allItems.length === 0) {
+        refs.attachmentsEl.innerHTML = '<p class="text-slate-500">Aucun document lie.</p>';
+        return;
+      }
+
+      refs.attachmentsEl.innerHTML = allItems.map((item) => {
+        if (item.type === 'attachment') {
+          const file = item.file || {};
+          const safeHref = sanitizeDownloadHref(file?.data || '', String(file?.type || ''));
+          const href = safeHref ? safeHref.replace(/"/g, '&quot;') : '#';
+          const storagePath = String(file?.storagePath || '').trim();
+          const canOpenFromStorage = !safeHref && storagePath;
+          const attachmentName = escapeHtml(file?.name || `piece-jointe-${item.index + 1}`);
+          return `
+            <span class="inline-flex items-center gap-2 mr-3 mb-1">
+              ${safeHref ? `
+                <a class="inline-flex items-center gap-1 text-primary hover:underline" href="${href}" download="${attachmentName}">
+                  <span class="material-symbols-outlined text-sm">attach_file</span>
+                  <span>${attachmentName}</span>
+                </a>
+              ` : `
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-1 text-primary hover:underline ${canOpenFromStorage ? '' : 'opacity-60 pointer-events-none'}"
+                  data-storage-attachment-open="1"
+                  data-storage-path="${escapeHtml(storagePath)}"
+                  data-storage-name="${attachmentName}"
+                  data-storage-type="${escapeHtml(String(file?.type || 'application/octet-stream'))}"
+                  ${canOpenFromStorage ? '' : 'disabled'}
+                >
+                  <span class="material-symbols-outlined text-sm">attach_file</span>
+                  <span>${attachmentName}</span>
+                </button>
+              `}
+              ${canEdit ? `<button type="button" class="task-action-btn task-action-btn-danger" onclick="removeAttachment('${escapeHtml(task.taskId)}', ${item.index})">Supprimer</button>` : ''}
+            </span>
+          `;
+        }
+
+        const doc = item.doc || {};
+        const safeHref = sanitizeDownloadHref(doc?.data || '', String(doc?.type || ''));
+        const href = safeHref ? safeHref.replace(/"/g, '&quot;') : '#';
+        return `
+          <a class="inline-flex items-center gap-1 text-primary hover:underline mr-3 ${safeHref ? '' : 'opacity-60 pointer-events-none'}" href="${href}" ${safeHref ? `download="${escapeHtml(doc?.name || 'document')}"` : ''}>
+            <span class="material-symbols-outlined text-sm">description</span>
+            <span>${escapeHtml(doc?.name || 'document')}</span>
+          </a>
+        `;
+      }).join('');
+    }
+
+    /**
+     * Branche les actions footer de la modale détail tâche:
+     * convert / email / edit / archive / delete.
+     *
+     * Les callbacks sont injectés par contexte (global vs projet) afin de
+     * conserver les règles métier tout en mutualisant le wiring UI.
+     */
+    function wireGlobalTaskDetailActions(options = {}) {
+      const refs = options.refs || getGlobalTaskDetailModalElements();
+      const canEdit = Boolean(options.canEdit);
+      const canArchive = Boolean(options.canArchive);
+      const canDelete = Boolean(options.canDelete);
+      const onConvert = typeof options.onConvert === 'function' ? options.onConvert : null;
+      const onEmail = typeof options.onEmail === 'function' ? options.onEmail : null;
+      const onEdit = typeof options.onEdit === 'function' ? options.onEdit : null;
+      const onArchive = typeof options.onArchive === 'function' ? options.onArchive : null;
+      const onDelete = typeof options.onDelete === 'function' ? options.onDelete : null;
+
+      if (refs.btnConvert) {
+        refs.btnConvert.classList.toggle('hidden', !canEdit || !onConvert);
+        refs.btnConvert.onclick = onConvert
+          ? async () => {
+            await closeGlobalTaskDetails();
+            await onConvert();
+          }
+          : null;
+      }
+      if (refs.taskEmailTemplateSelect) {
+        refs.taskEmailTemplateSelect.value = getSavedTaskEmailTemplatePreference();
+      }
+      if (refs.btnTaskEmail) {
+        refs.btnTaskEmail.classList.toggle('hidden', !onEmail);
+        refs.btnTaskEmail.onclick = onEmail
+          ? async () => {
+            const selectedTemplate = normalizeTaskEmailTemplate(refs.taskEmailTemplateSelect?.value || 'auto');
+            saveTaskEmailTemplatePreference(selectedTemplate);
+            await onEmail(selectedTemplate);
+          }
+          : null;
+      }
+      if (refs.btnEdit) {
+        refs.btnEdit.classList.toggle('hidden', !canEdit || !onEdit);
+        refs.btnEdit.onclick = onEdit
+          ? async () => {
+            await closeGlobalTaskDetails();
+            await onEdit();
+          }
+          : null;
+      }
+      if (refs.btnArchive) {
+        refs.btnArchive.classList.toggle('hidden', !canArchive || !onArchive);
+        refs.btnArchive.onclick = onArchive
+          ? async () => {
+            await closeGlobalTaskDetails();
+            await onArchive();
+          }
+          : null;
+      }
+      if (refs.btnDelete) {
+        refs.btnDelete.classList.toggle('hidden', !canDelete || !onDelete);
+        refs.btnDelete.onclick = onDelete
+          ? async () => {
+            await closeGlobalTaskDetails();
+            await onDelete();
+          }
+          : null;
+      }
+    }
+
+    /**
+     * Construit le payload de contexte utilisé par la fiche RGPD et les
+     * opérations d'édition inline sur la modale détail tâche.
+     */
+    function buildTaskDetailContextPayload(task, options = {}) {
+      const sourceType = String(options.sourceType || '').trim();
+      const state = options.state || null;
+      const projectId = String(options.projectId || '').trim();
+      const taskRef = String(options.taskRef || '').trim();
+      if (sourceType === 'standalone') {
+        return {
+          context: {
+            entityType: 'globalTask',
+            entityId: String(task?.id || '').trim(),
+            label: `Tâche hors projet: ${task?.title || 'Tâche'}`
+          },
+          resolved: options.resolved || { sourceType: 'standalone', task },
+          taskRef
+        };
+      }
+      const effectiveProjectId = projectId || String(state?.project?.projectId || '').trim();
+      return {
+        context: {
+          entityType: 'task',
+          entityId: `${effectiveProjectId}:${task?.taskId || ''}`,
+          label: `Tâche: ${task?.title || 'Tâche'}`
+        },
+        resolved: options.resolved || { sourceType: 'project', projectId: effectiveProjectId, state, task },
+        taskRef
+      };
+    }
+
+    /**
+     * Normalise le bloc `resolved` pour une tâche de projet.
+     * Ce helper permet d'unifier la structure transmise aux helpers UI/domain.
+     */
+    function buildProjectTaskResolved(task, state, projectId) {
+      const effectiveProjectId = String(projectId || state?.project?.projectId || '').trim();
+      return {
+        sourceType: 'project',
+        state,
+        task,
+        projectId: effectiveProjectId
+      };
+    }
+
+    /**
+     * Applique le contexte courant de détail tâche dans l'état runtime
+     * puis rafraîchit la carte d'impact RGPD associée.
+     */
+    async function setAndRenderTaskDetailContext(task, options = {}) {
+      const payload = buildTaskDetailContextPayload(task, options);
+      currentGlobalTaskDetailContext = payload.context;
+      currentGlobalTaskDetailTask = { ...task };
+      currentGlobalTaskDetailResolved = payload.resolved;
+      currentGlobalTaskDetailRef = payload.taskRef;
+      await renderTaskDetailRgpdImpactCard(currentGlobalTaskDetailContext);
+    }
+
+    /**
+     * Prépare les variables communes de la modale détail tâche pour limiter
+     * la duplication entre les entrées "global" et "projet".
+     */
+    function buildTaskDetailModalCommonMeta(task, options = {}) {
+      const state = options.state || null;
+      const sourceType = String(options.sourceType || '').trim();
+      const sourceProjectName = String(
+        options.sourceProjectName
+        || (sourceType === 'standalone' ? 'Hors projet' : (state?.project?.name || 'Projet'))
+      );
+      const groupName = String(options.groupName || getTaskGroupName(task, state) || task?.groupName || 'Aucun groupe');
+      const canEdit = sourceType === 'standalone'
+        ? true
+        : Boolean(options.canEdit ?? canEditTaskInProject(task, state));
+      const canArchive = sourceType === 'standalone'
+        ? true
+        : Boolean(options.canArchive ?? canEditTaskInProject(task, state));
+      const canDelete = sourceType === 'standalone'
+        ? true
+        : Boolean(options.canDelete ?? canDeleteTaskInProject(task, state));
+      const canToggleSubtasks = Boolean(
+        options.canToggleSubtasks
+        ?? canToggleTaskDetailSubtasks(task, options.resolved || null)
+      );
+      return {
+        canEdit,
+        canArchive,
+        canDelete,
+        sourceProjectName,
+        groupName,
+        canToggleSubtasks
+      };
+    }
+
+    /**
+     * Ouvre la modale détail pour une tâche transverse (global/projet résolu
+     * depuis une `taskRef`) et assemble les sous-composants communs.
+     */
     async function openGlobalTaskDetails(taskRef) {
       const modal = document.getElementById('modal-global-task-details');
       if (!modal) return;
@@ -19616,165 +19594,53 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       const task = resolved.task;
       const state = resolved.sourceType === 'project' ? resolved.state : null;
       const isStandalone = resolved.sourceType === 'standalone';
-      const canEdit = isStandalone ? true : canEditTaskInProject(task, state);
-      const canArchive = isStandalone ? true : canEditTaskInProject(task, state);
-      const canDelete = isStandalone ? true : canDeleteTaskInProject(task, state);
+      const detailMeta = buildTaskDetailModalCommonMeta(task, {
+        state,
+        sourceType: isStandalone ? 'standalone' : 'project',
+        resolved
+      });
+      const { canEdit, canArchive, canDelete, sourceProjectName, groupName, canToggleSubtasks } = detailMeta;
       resetTaskDetailInlineEditingState();
-      const titleEl = document.getElementById('global-task-detail-title');
-      const subtitleEl = document.getElementById('global-task-detail-subtitle');
-      const badgesEl = document.getElementById('global-task-detail-badges');
-      const descriptionEl = document.getElementById('global-task-detail-description');
-      const requestDateEl = document.getElementById('global-task-detail-request-date');
-      const dueDateEl = document.getElementById('global-task-detail-due-date');
-      const assigneesEl = document.getElementById('global-task-detail-assignees');
-      const groupEl = document.getElementById('global-task-detail-group');
-      const recurrenceWrapEl = document.getElementById('global-task-detail-recurrence-wrap');
-      const recurrenceEl = document.getElementById('global-task-detail-recurrence');
-      const subtasksEl = document.getElementById('global-task-detail-subtasks');
-      const attachmentsEl = document.getElementById('global-task-detail-attachments');
-      const btnConvert = document.getElementById('btn-global-task-detail-convert');
-      const btnTaskEmail = document.getElementById('btn-global-task-detail-email');
-      const taskEmailTemplateSelect = document.getElementById('global-task-detail-email-template');
-      const btnEdit = document.getElementById('btn-global-task-detail-edit');
-      const btnArchive = document.getElementById('btn-global-task-detail-archive');
-      const btnDelete = document.getElementById('btn-global-task-detail-delete');
-      const statusMeta = getTaskStatusMeta(task.status || 'todo');
-      const urgencyMeta = getTaskUrgencyMeta(task.urgency || 'medium');
-      const sourceProjectName = isStandalone
-        ? 'Hors projet'
-        : (state?.project?.name || 'Projet');
-      const sourceTheme = String(task.theme || 'General');
-      const assigneeNames = getTaskAssigneeName(task, state) || 'Aucun responsable';
-      const groupName = getTaskGroupName(task, state) || task.groupName || 'Aucun groupe';
-      const attachments = Array.isArray(task.attachments) ? task.attachments : [];
-      const canToggleSubtasks = canToggleTaskDetailSubtasks(task, resolved);
+      const refs = getGlobalTaskDetailModalElements();
 
-      if (titleEl) titleEl.textContent = task.title || 'Tache';
-      if (subtitleEl) {
-        subtitleEl.innerHTML = `${escapeHtml(sourceProjectName)} • <span id="global-task-detail-theme">${escapeHtml(sourceTheme || 'General')}</span>`;
-      }
-      if (badgesEl) {
-        badgesEl.innerHTML = `
-          <span id="global-task-detail-urgency-chip" class="${urgencyMeta.chipClass}">${urgencyMeta.label}</span>
-          <span id="global-task-detail-status-chip" class="${statusMeta.chipClass}">${statusMeta.label}</span>
-          ${buildTaskAssigneeKindBadgeHtml(task, state)}
-          ${buildTaskHierarchyChipsHtml(task, state)}
-          ${sharingModeBadge(task.sharingMode)}
-        `;
-      }
-      renderTaskDescriptionToElement(task, descriptionEl);
-      if (requestDateEl) requestDateEl.textContent = formatDate(task.requestDate);
-      if (dueDateEl) dueDateEl.textContent = formatTaskDeadline(task);
-      if (assigneesEl) assigneesEl.innerHTML = `<span class="inline-flex items-center gap-1.5">${buildTaskAssigneeInlineHtml(task, state)}</span>`;
-      if (groupEl) groupEl.textContent = groupName;
-      if (recurrenceWrapEl && recurrenceEl) {
-        const recurringCfg = normalizeTaskRecurringConfig(task?.recurring);
-        const recurrenceLabel = recurringCfg
-          ? (window.TaskMDARecurrence?.formatRecurrenceLabel?.(recurringCfg) || 'Récurrence configurable')
-          : 'Non récurrente';
-        recurrenceEl.textContent = recurrenceLabel;
-        recurrenceWrapEl.classList.remove('hidden');
-      }
-      if (subtasksEl) {
-        renderTaskDetailSubtasks(subtasksEl, task, { taskRef, canToggle: canToggleSubtasks, resolved });
-      }
-      if (attachmentsEl) {
-        if (attachments.length === 0) {
-          attachmentsEl.innerHTML = '<p class="text-slate-500">Aucun document lié.</p>';
-        } else {
-          const canDeleteAttachment = canEdit;
-          attachmentsEl.innerHTML = attachments.map((file, index) => {
-            const safeHref = sanitizeDownloadHref(file?.data || '', String(file?.type || ''));
-            const href = safeHref ? safeHref.replace(/"/g, '&quot;') : '#';
-            const storagePath = String(file?.storagePath || '').trim();
-            const canOpenFromStorage = !safeHref && storagePath;
-            return `
-            <span class="inline-flex items-center gap-2 mr-3 mb-1">
-              ${safeHref ? `
-                <a class="inline-flex items-center gap-1 text-primary hover:underline" href="${href}" download="${escapeHtml(file?.name || `piece-jointe-${index + 1}`)}">
-                  <span class="material-symbols-outlined text-sm">attach_file</span>
-                  <span>${escapeHtml(file?.name || `piece-jointe-${index + 1}`)}</span>
-                </a>
-              ` : `
-                <button
-                  type="button"
-                  class="inline-flex items-center gap-1 text-primary hover:underline ${canOpenFromStorage ? '' : 'opacity-60 pointer-events-none'}"
-                  data-storage-attachment-open="1"
-                  data-storage-path="${escapeHtml(storagePath)}"
-                  data-storage-name="${escapeHtml(file?.name || `piece-jointe-${index + 1}`)}"
-                  data-storage-type="${escapeHtml(String(file?.type || 'application/octet-stream'))}"
-                  ${canOpenFromStorage ? '' : 'disabled'}
-                >
-                  <span class="material-symbols-outlined text-sm">attach_file</span>
-                  <span>${escapeHtml(file?.name || `piece-jointe-${index + 1}`)}</span>
-                </button>
-              `}
-              ${canDeleteAttachment ? `<button type="button" class="task-action-btn task-action-btn-danger" onclick="removeAttachment('${escapeHtml(task.taskId)}', ${index})">Supprimer</button>` : ''}
-            </span>
-          `;
-          }).join('');
-        }
-      }
+      renderGlobalTaskDetailCommonSection(task, state, {
+        refs,
+        sourceProjectName,
+        groupName,
+        sharingMode: task.sharingMode,
+        taskRef,
+        canToggleSubtasks,
+        resolved
+      });
+      renderGlobalTaskDetailAttachments(task, { refs, canEdit, includeLinkedDocs: false });
 
-      if (btnConvert) {
-        btnConvert.classList.toggle('hidden', !canEdit);
-        btnConvert.onclick = async () => {
-          await closeGlobalTaskDetails();
-          await convertTaskToProject(taskRef);
-        };
-      }
-      if (taskEmailTemplateSelect) {
-        taskEmailTemplateSelect.value = getSavedTaskEmailTemplatePreference();
-      }
-      if (btnTaskEmail) {
-        btnTaskEmail.classList.remove('hidden');
-        btnTaskEmail.onclick = async () => {
-          const selectedTemplate = normalizeTaskEmailTemplate(taskEmailTemplateSelect?.value || 'auto');
-          saveTaskEmailTemplatePreference(selectedTemplate);
-          await sendTaskEmailByRef(taskRef, selectedTemplate);
-        };
-      }
-      if (btnEdit) {
-        btnEdit.classList.toggle('hidden', !canEdit);
-        btnEdit.onclick = async () => {
-          await closeGlobalTaskDetails();
-          await editGlobalTask(taskRef);
-        };
-      }
-      if (btnArchive) {
-        btnArchive.classList.toggle('hidden', !canArchive);
-        btnArchive.onclick = async () => {
-          await closeGlobalTaskDetails();
-          await archiveGlobalTask(taskRef);
-        };
-      }
-      if (btnDelete) {
-        btnDelete.classList.toggle('hidden', !canDelete);
-        btnDelete.onclick = async () => {
-          await closeGlobalTaskDetails();
-          await deleteGlobalTask(taskRef);
-        };
-      }
+      wireGlobalTaskDetailActions({
+        refs,
+        canEdit,
+        canArchive,
+        canDelete,
+        onConvert: async () => convertTaskToProject(taskRef),
+        onEmail: async (selectedTemplate) => sendTaskEmailByRef(taskRef, selectedTemplate),
+        onEdit: async () => editGlobalTask(taskRef),
+        onArchive: async () => archiveGlobalTask(taskRef),
+        onDelete: async () => deleteGlobalTask(taskRef)
+      });
 
-      currentGlobalTaskDetailContext = isStandalone
-        ? {
-          entityType: 'globalTask',
-          entityId: String(task.id || '').trim(),
-          label: `Tâche hors projet: ${task.title || 'Tâche'}`
-        }
-        : {
-          entityType: 'task',
-          entityId: `${state?.project?.projectId || ''}:${task.taskId || ''}`,
-          label: `Tâche: ${task.title || 'Tâche'}`
-        };
-      currentGlobalTaskDetailTask = { ...task };
-      currentGlobalTaskDetailResolved = resolved;
-      await renderTaskDetailRgpdImpactCard(currentGlobalTaskDetailContext);
-      currentGlobalTaskDetailRef = taskRef;
+      await setAndRenderTaskDetailContext(task, {
+        sourceType: isStandalone ? 'standalone' : 'project',
+        state,
+        projectId: resolved?.projectId || state?.project?.projectId || '',
+        resolved,
+        taskRef
+      });
       initTaskDetailInlineEditing(canEdit);
       modal.classList.remove('hidden');
     }
 
+    /**
+     * Ouvre la modale détail pour une tâche du projet courant.
+     * Version spécialisée "contexte projet" avec documents liés projet.
+     */
     async function openProjectTaskDetails(taskId) {
       if (!currentProjectId || !taskId) return;
       const modal = document.getElementById('modal-global-task-details');
@@ -19787,197 +19653,48 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         return;
       }
 
-      const canEdit = canEditTaskInProject(task, state);
-      const canArchive = canEditTaskInProject(task, state);
-      const canDelete = canDeleteTaskInProject(task, state);
+      const projectResolved = buildProjectTaskResolved(task, state, currentProjectId);
+      const detailMeta = buildTaskDetailModalCommonMeta(task, {
+        state,
+        sourceType: 'project',
+        resolved: projectResolved
+      });
+      const { canEdit, canArchive, canDelete, sourceProjectName, groupName, canToggleSubtasks } = detailMeta;
       resetTaskDetailInlineEditingState();
-      const titleEl = document.getElementById('global-task-detail-title');
-      const subtitleEl = document.getElementById('global-task-detail-subtitle');
-      const badgesEl = document.getElementById('global-task-detail-badges');
-      const descriptionEl = document.getElementById('global-task-detail-description');
-      const requestDateEl = document.getElementById('global-task-detail-request-date');
-      const dueDateEl = document.getElementById('global-task-detail-due-date');
-      const assigneesEl = document.getElementById('global-task-detail-assignees');
-      const groupEl = document.getElementById('global-task-detail-group');
-      const recurrenceWrapEl = document.getElementById('global-task-detail-recurrence-wrap');
-      const recurrenceEl = document.getElementById('global-task-detail-recurrence');
-      const subtasksEl = document.getElementById('global-task-detail-subtasks');
-      const attachmentsEl = document.getElementById('global-task-detail-attachments');
-      const btnConvert = document.getElementById('btn-global-task-detail-convert');
-      const btnTaskEmail = document.getElementById('btn-global-task-detail-email');
-      const taskEmailTemplateSelect = document.getElementById('global-task-detail-email-template');
-      const btnEdit = document.getElementById('btn-global-task-detail-edit');
-      const btnArchive = document.getElementById('btn-global-task-detail-archive');
-      const btnDelete = document.getElementById('btn-global-task-detail-delete');
-      const statusMeta = getTaskStatusMeta(task.status || 'todo');
-      const urgencyMeta = getTaskUrgencyMeta(task.urgency || 'medium');
-      const sourceProjectName = state?.project?.name || 'Projet';
-      const sourceTheme = String(task.theme || 'General');
-      const assigneeNames = getTaskAssigneeName(task, state) || 'Aucun responsable';
-      const groupName = getTaskGroupName(task, state) || task.groupName || 'Aucun groupe';
-      const attachments = Array.isArray(task.attachments) ? task.attachments : [];
+      const refs = getGlobalTaskDetailModalElements();
       const linkedDocs = (state.documents || []).filter(doc => (doc.linkedTaskIds || []).includes(taskId));
       const sharingMode = task.sharingMode || state?.project?.sharingMode || 'shared';
-      const canToggleSubtasks = canToggleTaskDetailSubtasks(task, {
-        sourceType: 'project',
-        state,
-        task,
-        projectId: currentProjectId
+      const projectTaskRef = buildGlobalTaskRef({ sourceType: 'project', sourceProjectId: currentProjectId, taskId: task.taskId });
+
+      renderGlobalTaskDetailCommonSection(task, state, {
+        refs,
+        sourceProjectName,
+        groupName,
+        sharingMode,
+        taskRef: projectTaskRef,
+        canToggleSubtasks,
+        resolved: projectResolved
+      });
+      renderGlobalTaskDetailAttachments(task, { refs, canEdit, includeLinkedDocs: true, linkedDocs });
+
+      wireGlobalTaskDetailActions({
+        refs,
+        canEdit,
+        canArchive,
+        canDelete,
+        onConvert: async () => convertTaskToProject(projectTaskRef),
+        onEmail: async (selectedTemplate) => sendTaskEmail(task.taskId, selectedTemplate),
+        onEdit: async () => editTask(taskId),
+        onArchive: async () => archiveTask(taskId),
+        onDelete: async () => deleteTask(taskId)
       });
 
-      if (titleEl) titleEl.textContent = task.title || 'Tache';
-      if (subtitleEl) {
-        subtitleEl.innerHTML = `${escapeHtml(sourceProjectName)} • <span id="global-task-detail-theme">${escapeHtml(sourceTheme || 'General')}</span>`;
-      }
-      if (badgesEl) {
-        badgesEl.innerHTML = `
-          <span id="global-task-detail-urgency-chip" class="${urgencyMeta.chipClass}">${urgencyMeta.label}</span>
-          <span id="global-task-detail-status-chip" class="${statusMeta.chipClass}">${statusMeta.label}</span>
-          ${buildTaskAssigneeKindBadgeHtml(task, state)}
-          ${buildTaskHierarchyChipsHtml(task, state)}
-          ${sharingModeBadge(sharingMode)}
-        `;
-      }
-      renderTaskDescriptionToElement(task, descriptionEl);
-      if (requestDateEl) requestDateEl.textContent = formatDate(task.requestDate);
-      if (dueDateEl) dueDateEl.textContent = formatTaskDeadline(task);
-      if (assigneesEl) assigneesEl.innerHTML = `<span class="inline-flex items-center gap-1.5">${buildTaskAssigneeInlineHtml(task, state)}</span>`;
-      if (groupEl) groupEl.textContent = groupName;
-      if (recurrenceWrapEl && recurrenceEl) {
-        const recurringCfg = normalizeTaskRecurringConfig(task?.recurring);
-        const recurrenceLabel = recurringCfg
-          ? (window.TaskMDARecurrence?.formatRecurrenceLabel?.(recurringCfg) || 'Récurrence configurable')
-          : 'Non récurrente';
-        recurrenceEl.textContent = recurrenceLabel;
-        recurrenceWrapEl.classList.remove('hidden');
-      }
-      if (subtasksEl) {
-        renderTaskDetailSubtasks(subtasksEl, task, {
-          taskRef: buildGlobalTaskRef({ sourceType: 'project', sourceProjectId: currentProjectId, taskId: task.taskId }),
-          canToggle: canToggleSubtasks,
-          resolved: {
-            sourceType: 'project',
-            state,
-            task,
-            projectId: currentProjectId
-          }
-        });
-      }
-      if (attachmentsEl) {
-        const allItems = [
-          ...attachments.map((file, index) => ({ type: 'attachment', file, index })),
-          ...linkedDocs.map((doc) => ({ type: 'project-doc', doc }))
-        ];
-        if (allItems.length === 0) {
-          attachmentsEl.innerHTML = '<p class="text-slate-500">Aucun document lie.</p>';
-        } else {
-          attachmentsEl.innerHTML = allItems.map((item) => {
-            if (item.type === 'attachment') {
-              const file = item.file || {};
-              const safeHref = sanitizeDownloadHref(file?.data || '', String(file?.type || ''));
-              const href = safeHref ? safeHref.replace(/"/g, '&quot;') : '#';
-              const storagePath = String(file?.storagePath || '').trim();
-              const canOpenFromStorage = !safeHref && storagePath;
-              return `
-                <span class="inline-flex items-center gap-2 mr-3 mb-1">
-                  ${safeHref ? `
-                    <a class="inline-flex items-center gap-1 text-primary hover:underline" href="${href}" download="${escapeHtml(file?.name || `piece-jointe-${item.index + 1}`)}">
-                      <span class="material-symbols-outlined text-sm">attach_file</span>
-                      <span>${escapeHtml(file?.name || `piece-jointe-${item.index + 1}`)}</span>
-                    </a>
-                  ` : `
-                    <button
-                      type="button"
-                      class="inline-flex items-center gap-1 text-primary hover:underline ${canOpenFromStorage ? '' : 'opacity-60 pointer-events-none'}"
-                      data-storage-attachment-open="1"
-                      data-storage-path="${escapeHtml(storagePath)}"
-                      data-storage-name="${escapeHtml(file?.name || `piece-jointe-${item.index + 1}`)}"
-                      data-storage-type="${escapeHtml(String(file?.type || 'application/octet-stream'))}"
-                      ${canOpenFromStorage ? '' : 'disabled'}
-                    >
-                      <span class="material-symbols-outlined text-sm">attach_file</span>
-                      <span>${escapeHtml(file?.name || `piece-jointe-${item.index + 1}`)}</span>
-                    </button>
-                  `}
-                  ${canEdit ? `<button type="button" class="task-action-btn task-action-btn-danger" onclick="removeAttachment('${escapeHtml(task.taskId)}', ${item.index})">Supprimer</button>` : ''}
-                </span>
-              `;
-            }
-            const doc = item.doc || {};
-            const safeHref = sanitizeDownloadHref(doc?.data || '', String(doc?.type || ''));
-            const href = safeHref ? safeHref.replace(/"/g, '&quot;') : '#';
-            return `
-              <a class="inline-flex items-center gap-1 text-primary hover:underline mr-3 ${safeHref ? '' : 'opacity-60 pointer-events-none'}" href="${href}" ${safeHref ? `download="${escapeHtml(doc?.name || 'document')}"` : ''}>
-                <span class="material-symbols-outlined text-sm">description</span>
-                <span>${escapeHtml(doc?.name || 'document')}</span>
-              </a>
-            `;
-          }).join('');
-        }
-      }
-
-      if (btnConvert) {
-        btnConvert.classList.toggle('hidden', !canEdit);
-        btnConvert.onclick = async () => {
-          const taskRef = buildGlobalTaskRef({
-            sourceType: 'project',
-            sourceProjectId: currentProjectId,
-            taskId: task.taskId
-          });
-          await closeGlobalTaskDetails();
-          await convertTaskToProject(taskRef);
-        };
-      }
-      if (taskEmailTemplateSelect) {
-        taskEmailTemplateSelect.value = getSavedTaskEmailTemplatePreference();
-      }
-      if (btnTaskEmail) {
-        btnTaskEmail.classList.remove('hidden');
-        btnTaskEmail.onclick = async () => {
-          const selectedTemplate = normalizeTaskEmailTemplate(taskEmailTemplateSelect?.value || 'auto');
-          saveTaskEmailTemplatePreference(selectedTemplate);
-          await sendTaskEmail(task.taskId, selectedTemplate);
-        };
-      }
-      if (btnEdit) {
-        btnEdit.classList.toggle('hidden', !canEdit);
-        btnEdit.onclick = async () => {
-          await closeGlobalTaskDetails();
-          await editTask(taskId);
-        };
-      }
-      if (btnArchive) {
-        btnArchive.classList.toggle('hidden', !canArchive);
-        btnArchive.onclick = async () => {
-          await closeGlobalTaskDetails();
-          await archiveTask(taskId);
-        };
-      }
-      if (btnDelete) {
-        btnDelete.classList.toggle('hidden', !canDelete);
-        btnDelete.onclick = async () => {
-          await closeGlobalTaskDetails();
-          await deleteTask(taskId);
-        };
-      }
-
-      currentGlobalTaskDetailContext = {
-        entityType: 'task',
-        entityId: `${state?.project?.projectId || ''}:${task.taskId || ''}`,
-        label: `Tâche: ${task.title || 'Tâche'}`
-      };
-      currentGlobalTaskDetailTask = { ...task };
-      currentGlobalTaskDetailResolved = {
+      await setAndRenderTaskDetailContext(task, {
         sourceType: 'project',
-        projectId: currentProjectId,
         state,
-        task
-      };
-      await renderTaskDetailRgpdImpactCard(currentGlobalTaskDetailContext);
-      currentGlobalTaskDetailRef = buildGlobalTaskRef({
-        sourceType: 'project',
-        sourceProjectId: currentProjectId,
-        taskId
+        projectId: currentProjectId,
+        resolved: projectResolved,
+        taskRef: projectTaskRef
       });
       initTaskDetailInlineEditing(canEdit);
       modal.classList.remove('hidden');
@@ -22162,6 +21879,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       currentProjectState = state;
       editProjectFromDashboard = fromDashboard === true;
       document.getElementById('edit-project-name').value = state.project.name || '';
+      document.getElementById('edit-project-internal-reference').value = String(state.project.internalReference || '').trim();
       setProjectDescriptionEditorContent('edit-project-description-editor', 'edit-project-description', state.project.description || '');
       const editImageInput = document.getElementById('edit-project-description-image-input');
       if (editImageInput) editImageInput.value = '';
@@ -22225,6 +21943,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       const projectDeadline = readProjectDeadlineFromForm('edit-project');
       const changes = {
         name,
+        internalReference: String(document.getElementById('edit-project-internal-reference')?.value || '').trim() || null,
         description: getProjectDescriptionHtmlForStorage('edit-project-description-editor', 'edit-project-description'),
         status: document.getElementById('edit-project-status').value || 'en-cours',
         priority: normalizeProjectPriority(document.getElementById('edit-project-priority')?.value || 'normale'),
@@ -23021,8 +22740,15 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       return accessibleStates.length > 0 ? accessibleStates : validStates;
     }
 
-    async function getGlobalTasksList() {
+    /**
+     * Construit le contexte des tâches transverses en une seule lecture projet.
+     * Retourne:
+     * - `allTasks`: fusion tâches projet + hors projet,
+     * - `stateByProjectId`: map d'accès rapide pour permissions/rendu.
+     */
+    async function getGlobalTasksRenderContext() {
       const states = await getAllProjectStates();
+      const stateByProjectId = new Map(states.map((state) => [state?.project?.projectId, state]));
       const fromProjects = [];
       states.forEach(state => {
         (state.tasks || []).forEach(task => {
@@ -23047,9 +22773,22 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         sharingMode: item.sharingMode || 'private'
       }));
 
-      return [...fromProjects, ...fromStandalone].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      const allTasks = [...fromProjects, ...fromStandalone].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      return { allTasks, stateByProjectId };
     }
 
+    async function getGlobalTasksList() {
+      const context = await getGlobalTasksRenderContext();
+      return context.allTasks;
+    }
+
+    /**
+     * Construit la liste transverse des documents:
+     * - pièces jointes de tâches projet,
+     * - documents projet dédiés,
+     * - documents hors projet.
+     * Retour trié du plus récent au plus ancien.
+     */
     async function getGlobalDocumentsList() {
       const states = await getAllProjectStates();
       const docs = [];
@@ -23119,17 +22858,26 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       return docs.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
     }
 
+    /**
+     * Rendu principal de la rubrique Tâches (vue transverse).
+     * Cette fonction orchestre:
+     * - collecte + filtres,
+     * - routage par mode d'affichage (cards/list/kanban/timeline/calendar/archives),
+     * - pagination et actions contextuelles.
+     */
     async function renderGlobalTasks() {
       const container = document.getElementById('global-tasks-container');
       const paginationContainer = document.getElementById('global-tasks-pagination');
       if (!container) return;
+      lastGlobalTasksRenderContext = null;
       updateTaskCardsLayoutLabel('global-task-layout-label', 0);
       if (paginationContainer) paginationContainer.innerHTML = '';
       updateGlobalTasksViewButtons();
-      const all = await getGlobalTasksList();
+      const tasksContext = await getGlobalTasksRenderContext();
+      const all = tasksContext.allTasks;
       syncGlobalThemeFilterAssist(all);
-      const allProjectStates = await getAllProjectStates();
-      const stateByProjectId = new Map(allProjectStates.map(s => [s.project?.projectId, s]));
+      const stateByProjectId = tasksContext.stateByProjectId;
+      lastGlobalTasksRenderContext = tasksContext;
 
       const query = `${globalSearchQuery} ${document.getElementById('global-task-search')?.value || ''}`.trim();
       const status = document.getElementById('global-task-status')?.value || 'all';
@@ -23693,6 +23441,12 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       renderPagination('global-tasks-pagination', pagination, 'setGlobalTasksPage', 'taches');
     }
 
+    /**
+     * Rend la vue Archives des tâches transverses.
+     * Entrées:
+     * - `allTasks`: jeu global brut,
+     * - `stateByProjectId`: map d'états projet pour droits d'action.
+     */
     function renderGlobalArchivedTasks(allTasks, stateByProjectId, targetContainer) {
       const container = targetContainer || document.getElementById('global-tasks-container');
       const paginationContainer = document.getElementById('global-tasks-pagination');
@@ -23756,6 +23510,11 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       }).join('');
     }
 
+    /**
+     * Post-traitement UI historique du rendu Tâches.
+     * Conserve le comportement "premier usage" (empty state CTA) sans
+     * impacter le cœur de `renderGlobalTasks`.
+     */
     const renderGlobalTasksBase = renderGlobalTasks;
     renderGlobalTasks = async function renderGlobalTasksWithEmptyState() {
       await renderGlobalTasksBase();
@@ -23764,7 +23523,11 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       if (globalTasksViewMode === 'calendar' || globalTasksViewMode === 'archives') return;
       const paginationContainer = document.getElementById('global-tasks-pagination');
 
-      const all = await getGlobalTasksList();
+      // Réutilise le contexte déjà calculé par renderGlobalTasksBase.
+      // Fallback sécurisé si un appel externe déclenche ce wrapper isolément.
+      const tasksContext = lastGlobalTasksRenderContext || await getGlobalTasksRenderContext();
+      const all = tasksContext.allTasks;
+      const stateByProjectId = tasksContext.stateByProjectId;
       const query = `${globalSearchQuery} ${document.getElementById('global-task-search')?.value || ''}`.trim();
       const status = document.getElementById('global-task-status')?.value || 'all';
       const assigneeKind = String(document.getElementById('global-task-assignee-kind')?.value || 'all').trim();
@@ -23776,10 +23539,11 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         task.description,
         task.sourceProjectName,
         task.theme,
+        getTaskAssigneeName(task, stateByProjectId.get(task.sourceProjectId)),
         sharingModeLabel(task.sharingMode)
       ], query));
       if (status !== 'all') filtered = filtered.filter(task => (task.status || 'todo') === status);
-      if (assigneeKind !== 'all') filtered = filtered.filter(task => matchesTaskAssigneeKindFilter(task, null, assigneeKind));
+      if (assigneeKind !== 'all') filtered = filtered.filter(task => matchesTaskAssigneeKindFilter(task, stateByProjectId.get(task.sourceProjectId), assigneeKind));
       if (theme.trim()) filtered = filtered.filter(task => matchesQuery([task.theme], theme));
       filtered = filtered.filter(task => urgencies.has(getTaskUrgencyMeta(task.urgency).key));
       filtered = filtered.filter(task => !task.archivedAt);
@@ -24931,16 +24695,26 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       document.body.classList.remove('overflow-hidden');
     }
 
+    /**
+     * Façade orchestrateur vers la preview document du module global-docs.
+     */
     async function openDocumentPreviewByRef(refEncoded = '') {
       if (!globalDocsRuntime?.openDocumentPreviewByRef) return;
       await globalDocsRuntime.openDocumentPreviewByRef(refEncoded);
     }
 
+    /**
+     * Façade orchestrateur vers le téléchargement document du module global-docs.
+     */
     async function downloadDocumentByRef(refEncoded = '') {
       if (!globalDocsRuntime?.downloadDocumentByRef) return;
       await globalDocsRuntime.downloadDocumentByRef(refEncoded);
     }
 
+    /**
+     * Rend la rubrique Documents via le runtime module.
+     * Fallback: état vide explicite si le module n'est pas chargé.
+     */
     async function renderGlobalDocs() {
       if (globalDocsRuntime?.renderGlobalDocs) {
         if (delegatingRenderGlobalDocs) return;
@@ -24991,6 +24765,9 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       taskSelect.size = Math.min(10, Math.max(4, tasks.length));
     }
 
+    /**
+     * Résout un document pour la modale de rattachement (binding).
+     */
     async function resolveDocumentForBinding(docId) {
       if (!globalDocsRuntime?.resolveDocumentForBinding) return null;
       return globalDocsRuntime.resolveDocumentForBinding(docId);
@@ -25016,6 +24793,9 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       globalDocsRuntime.initDocumentBindingInlineEditing(canEdit);
     }
 
+    /**
+     * Ouvre la modale de rattachement document (projet/tâche/visibilité).
+     */
     async function openDocumentBindingModal(docId) {
       if (!globalDocsRuntime?.openDocumentBindingModal) return;
       await globalDocsRuntime.openDocumentBindingModal(docId);
@@ -25026,6 +24806,9 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       globalDocsRuntime.closeDocumentBindingModal();
     }
 
+    /**
+     * Persiste les changements de rattachement document.
+     */
     async function saveDocumentBindingChanges(options = {}) {
       if (!globalDocsRuntime?.saveDocumentBindingChanges) return;
       await globalDocsRuntime.saveDocumentBindingChanges(options);
@@ -25036,6 +24819,9 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       await globalDocsRuntime.copyDocumentBindingStoragePath();
     }
 
+    /**
+     * Supprime un document depuis la vue transverse.
+     */
     async function deleteGlobalDocument(docId) {
       if (!globalDocsRuntime?.deleteGlobalDocument) {
         showToast('Module documents indisponible');
@@ -31544,6 +31330,10 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       });
     }
 
+    /**
+     * Résout le contexte complet d'un document pour prévisualisation:
+     * source, droits, métadonnées et payload utile au lecteur.
+     */
     async function resolveDocumentPreviewContext(ref = null) {
       if (docStorageBindingRuntime?.resolveDocumentPreviewContext) {
         return docStorageBindingRuntime.resolveDocumentPreviewContext(ref);
@@ -31737,6 +31527,10 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       return true;
     }
 
+    /**
+     * Ouvre la modale de prévisualisation document.
+     * Le contenu est transmis encodé pour conserver une API simple côté UI.
+     */
     async function openDocumentPreview(dataEncoded, nameEncoded, typeEncoded, refEncoded = '') {
       const modal = document.getElementById('modal-doc-preview');
       const title = document.getElementById('doc-preview-title');
@@ -32631,6 +32425,10 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       }
     }
 
+    /**
+     * Ouvre l'éditeur documentaire transverse en résolvant automatiquement
+     * le type de source (hors projet / document projet / pièce jointe tâche).
+     */
     async function openGlobalDocumentEditor(docId) {
       const id = String(docId || '').trim();
       if (!id) return;
@@ -36050,6 +35848,8 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       refreshLinkedPendingSummaries();
       document.getElementById('modal-new-project').classList.remove('hidden');
       document.getElementById('project-name').value = '';
+      const createProjectInternalReferenceInput = document.getElementById('project-internal-reference');
+      if (createProjectInternalReferenceInput) createProjectInternalReferenceInput.value = '';
       setProjectDescriptionEditorContent('project-description-editor', 'project-description-input', '');
       const createImageInput = document.getElementById('project-description-image-input');
       if (createImageInput) createImageInput.value = '';
@@ -36090,6 +35890,8 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       if (passphraseInput) passphraseInput.value = '';
       const themesInput = document.getElementById('project-themes-input');
       if (themesInput) themesInput.value = '';
+      const createProjectInternalReferenceInput = document.getElementById('project-internal-reference');
+      if (createProjectInternalReferenceInput) createProjectInternalReferenceInput.value = '';
       const createPresetName = document.getElementById('project-group-preset-name-input');
       const createPresetDesc = document.getElementById('project-group-preset-description-input');
       if (createPresetName) createPresetName.value = '';
@@ -36109,6 +35911,8 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       if (editProjectDocInput) editProjectDocInput.value = '';
       const editPassphraseInput = document.getElementById('edit-project-passphrase');
       if (editPassphraseInput) editPassphraseInput.value = '';
+      const editProjectInternalReferenceInput = document.getElementById('edit-project-internal-reference');
+      if (editProjectInternalReferenceInput) editProjectInternalReferenceInput.value = '';
       updateEditProjectDocFilesSummary();
     }
 
@@ -36984,6 +36788,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
           currentUser.userId,
           {
             name: name,
+            internalReference: String(document.getElementById('project-internal-reference')?.value || '').trim() || null,
             createdByName: String(currentUser?.name || ''),
             description: getProjectDescriptionHtmlForStorage('project-description-editor', 'project-description-input'),
             status: document.getElementById('project-status').value,
@@ -37101,7 +36906,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
 
     // Task modal
     document.getElementById('btn-add-task').addEventListener('click', () => {
-      openProjectTaskCreateModalWithStatus('todo');
+      triggerProjectPrimaryAction();
     });
     document.getElementById('btn-global-add-task')?.addEventListener('click', () => {
       openGlobalTaskCreateModalWithStatus('todo');
@@ -38023,7 +37828,14 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         showToast('Votre navigateur ne supporte pas la liaison directe de fichiers');
         return [];
       }
-      const handles = await window.showOpenFilePicker({ multiple: true });
+      let handles = [];
+      try {
+        handles = await window.showOpenFilePicker({ multiple: true });
+      } catch (error) {
+        // Cas normal: fermeture/annulation de la boite de dialogue par l utilisateur.
+        if (error?.name === 'AbortError') return [];
+        throw error;
+      }
       if (!Array.isArray(handles) || handles.length === 0) return [];
       const scope = String(options.scope || 'global').trim() || 'global';
       const projectId = String(options.projectId || 'global').trim() || 'global';

@@ -1866,6 +1866,19 @@
       `;
     }
 
+    function resolveFeedPostFallbackTitle(post, refs) {
+      const explicitTitle = String(post?.title || '').trim();
+      if (explicitTitle) return explicitTitle;
+      const refsList = Array.isArray(refs) ? refs : [];
+      const taskRef = refsList.find((ref) => String(ref?.type || '').trim() === 'task');
+      const projectRef = refsList.find((ref) => String(ref?.type || '').trim() === 'project');
+      const taskLabel = String(taskRef?.label || '').trim();
+      if (taskLabel) return taskLabel;
+      const projectLabel = String(projectRef?.label || '').trim();
+      if (projectLabel) return projectLabel;
+      return 'Sans titre';
+    }
+
     async function buildGlobalFeedCardsHtml(posts, allDocs, mentionCatalog) {
       const cardsHtml = [];
       for (const post of (Array.isArray(posts) ? posts : [])) {
@@ -1887,7 +1900,7 @@
         }
         const identity = actions.resolveKnownUserIdentity?.(post.authorUserId || '', post.authorName || actions.fallbackDirectoryName?.(post.authorUserId || '')) || {};
         const avatarStyle = actions.safeAvatarInlineStyle?.(identity.avatarDataUrl, actions.stringToColor?.(post.authorUserId || post.authorName || '')) || '';
-        const displayTitle = String(post.title || '').trim() || 'Sans titre';
+        const displayTitle = resolveFeedPostFallbackTitle(post, refs);
         cardsHtml.push(`
           <article id="global-feed-post-${postId}" class="feed-item ${isFocused ? 'border-blue-400 shadow-[0_0_0_2px_rgba(59,130,246,0.15)]' : ''} cursor-pointer" onclick="toggleCollapsibleContent(this.querySelector('.collapsible-toggle'))">
             <div class="feed-item-head">

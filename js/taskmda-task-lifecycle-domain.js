@@ -135,6 +135,7 @@
         setEditingTaskId(task.taskId || null);
         setEditingStandaloneTaskId(standaloneTaskMode ? (task.id || getEditingStandaloneTaskId() || null) : null);
         document.getElementById('task-title').value = task.title || '';
+        document.getElementById('task-internal-reference').value = String(task.internalReference || '').trim();
         opts.setProjectDescriptionEditorContent?.('task-description-editor', 'task-description', task.descriptionHtml || task.description || '');
         const manualAssignees = currentAssignees
           .filter((a) => !a.userId && !a.agentId && a.name)
@@ -186,6 +187,7 @@
       const defaultStatus = opts.normalizeTaskStatusForCreate?.(getPendingTaskStatusPrefill() || 'todo') || 'todo';
       setPendingTaskStatusPrefill(null);
       document.getElementById('task-title').value = '';
+      document.getElementById('task-internal-reference').value = '';
       opts.setProjectDescriptionEditorContent?.('task-description-editor', 'task-description', '');
       document.getElementById('task-assignee-manual').value = '';
       document.getElementById('task-request-date').value = opts.toYmd?.(new Date()) || '';
@@ -452,6 +454,7 @@
       const normalizedTheme = normalizeTaskThemeValue(document.getElementById('task-theme')?.value || '', 'General');
       const payload = {
         title,
+        internalReference: String(document.getElementById('task-internal-reference')?.value || '').trim() || null,
         assignee: primaryAssignee.name || '',
         assigneeUserId: primaryAssignee.userId || null,
         assignees,
@@ -507,6 +510,7 @@
         const standaloneTask = {
           id: isEditStandalone ? editingStandaloneTaskId : opts.uuidv4?.(),
           title: payload.title,
+          internalReference: payload.internalReference || null,
           assignee: payload.assignee,
           assigneeUserId: payload.assigneeUserId,
           assignees: payload.assignees || [],
@@ -619,11 +623,13 @@
       const standaloneModeInput = document.getElementById('task-standalone-mode');
       if (standaloneModeInput) standaloneModeInput.value = 'private';
       const taskThemeInput = document.getElementById('task-theme');
+      const taskInternalReferenceInput = document.getElementById('task-internal-reference');
       const taskGroupInput = document.getElementById('task-group');
       const taskGroupPendingBox = document.getElementById('task-group-pending-members');
       const taskAssigneeManualInput = document.getElementById('task-assignee-manual');
       const taskAssigneeQuickInput = document.getElementById('task-assignee-quick-input');
       if (taskThemeInput) taskThemeInput.value = '';
+      if (taskInternalReferenceInput) taskInternalReferenceInput.value = '';
       if (taskGroupInput) taskGroupInput.value = '';
       if (taskGroupPendingBox) {
         taskGroupPendingBox.classList.add('hidden');
