@@ -201,7 +201,7 @@
     const list = Array.isArray(crumbs) ? crumbs : [];
     return `
       <nav class="workflow-breadcrumb-nav" aria-label="Breadcrumb workflow">
-        ${list.map((crumb) => `<span class="workflow-breadcrumb-item">${safeEsc(crumb)}</span>`).join('<span class="workflow-breadcrumb-sep">â€º</span>')}
+        ${list.map((crumb) => `<span class="workflow-breadcrumb-item">${safeEsc(crumb)}</span>`).join('<span class="workflow-breadcrumb-sep">›</span>')}
       </nav>
     `;
   }

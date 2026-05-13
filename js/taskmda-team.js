@@ -8128,6 +8128,31 @@
         .trim();
     }
 
+    function countLikelyMojibakeMarkers(value) {
+      const text = String(value || '');
+      const matches = text.match(/Ã.|Â.|â./g);
+      return Array.isArray(matches) ? matches.length : 0;
+    }
+
+    function repairLikelyMojibakeText(value) {
+      const raw = String(value || '');
+      if (!raw) return '';
+      if (countLikelyMojibakeMarkers(raw) === 0) return raw;
+      try {
+        const bytes = new Uint8Array(raw.length);
+        for (let index = 0; index < raw.length; index += 1) {
+          bytes[index] = raw.charCodeAt(index) & 0xff;
+        }
+        const decoded = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+        if (!decoded || decoded.includes('\uFFFD')) return raw;
+        const rawNoise = countLikelyMojibakeMarkers(raw);
+        const fixedNoise = countLikelyMojibakeMarkers(decoded);
+        return fixedNoise < rawNoise ? decoded : raw;
+      } catch (_) {
+        return raw;
+      }
+    }
+
     function shouldRenderDashboardHeroFullContent(plainText, htmlContent, hasImage = false) {
       const plain = String(plainText || '').trim();
       const html = String(htmlContent || '').trim();
@@ -8312,8 +8337,15 @@
       list.innerHTML = items.map((post, index) => {
         const isHero = showHero && index === 0;
         const postId = String(post.postId || '').trim();
+        const rawRefs = Array.isArray(post.refs) ? post.refs : [];
+        const calendarInfoRefTitle = (() => {
+          const ref = rawRefs.find((item) => String(item?.type || '').trim() === 'calendar-info');
+          if (!ref) return '';
+          const label = repairLikelyMojibakeText(String(ref.label || '').trim());
+          // Format attendu: "Titre info • période"; on conserve la partie titre.
+          return String(label.split('•')[0] || '').trim();
+        })();
         const directRefs = (() => {
-          const rawRefs = Array.isArray(post.refs) ? post.refs : [];
           const seen = new Set();
           return rawRefs
             .filter((ref) => {
@@ -8337,15 +8369,18 @@
         })();
         const richContentHtml = renderGlobalFeedContentHtml(post.content || '', mentionCatalog);
         const plainText = getProjectDescriptionPlainText(post.content || '');
-        const content = stripMentionMarkupForDashboard(plainText);
+        const content = stripMentionMarkupForDashboard(repairLikelyMojibakeText(plainText));
         let [headlineRaw, ...subtitleRaws] = content.split('\\n');
-        const headline = stripMentionMarkupForDashboard(headlineRaw || '') || 'Mise à jour';
+        const headline = stripMentionMarkupForDashboard(repairLikelyMojibakeText(headlineRaw || '')) || 'Mise à jour';
         const normalizeDashboardNewsCardTitle = (value) => String(value || '')
           .replace(/^\s*(nouveau\s+projet\s+cr[ée]é\s*:\s*)/i, '')
           .replace(/^\s*(nouvelle\s+t[âa]che\s+cr[ée]ée\s*:\s*)/i, '')
           .trim();
-        const postTitle = normalizeDashboardNewsCardTitle(String(post?.title || '').trim());
-        const cardTitle = postTitle || normalizeDashboardNewsCardTitle(headline) || 'Mise à jour';
+        const postTitle = normalizeDashboardNewsCardTitle(repairLikelyMojibakeText(String(post?.title || '').trim()));
+        const cardTitle = postTitle
+          || normalizeDashboardNewsCardTitle(calendarInfoRefTitle)
+          || normalizeDashboardNewsCardTitle(headline)
+          || 'Mise à jour';
         
         let subtitleSrc = subtitleRaws.join(' ').trim();
         if (!subtitleSrc) {
@@ -8410,7 +8445,8 @@
             ${imgHtml}
             <div class="dashboard-news-item-main">
               ${useFullHeroContent
-                ? `<div class="dashboard-news-rich feed-item-body">${richContentHtml}</div>`
+                ? `<div class="dashboard-news-text">${escapeHtml(cardTitle)}</div>
+                   <div class="dashboard-news-rich feed-item-body">${richContentHtml}</div>`
                 : `${!hasDefaultHero ? `<div class="dashboard-news-text">${escapeHtml(cardTitle)}</div>` : ''}
                    ${subtitleVisible ? `<div class="dashboard-news-sub dashboard-news-sub-rich">${subtitleHtml}</div>` : ''}`
               }
@@ -23633,6 +23669,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
           taskRef: buildGlobalTaskRef(task),
           date: taskDueDateKey(task),
           title: task.title || 'Tache',
+          status: task.status || 'todo',
           description: task.description || '',
           theme: task.theme || 'General',
           source: task.sourceProjectName || 'Hors projet',
@@ -23690,6 +23727,15 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         .sort((a, b) => a.sortDate - b.sortDate);
 
       const isSharedEntry = (entry) => normalizeSharingMode(entry?.sharingMode, 'private') === 'shared';
+      const isCompletedEntry = (entry) => (
+        entry?.entryType === 'task'
+        && normalizeTaskStatusValue(entry?.status) === 'termine'
+      );
+      const buildCompletedDot = (entry) => (
+        isCompletedEntry(entry)
+          ? '<span class="calendar-completed-dot" title="Tache terminee" aria-label="Tache terminee"></span>'
+          : ''
+      );
       const getEntryOpenAction = (entry) => {
         if (entry?.entryType === 'task' && entry?.taskRef) {
           return `openGlobalTaskDetails('${entry.taskRef}')`;
@@ -23790,7 +23836,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
                 <span class="material-symbols-outlined">add</span>
               </button>
               <div class="mt-1 space-y-1">
-                ${(dayEntries || []).slice(0, 2).map(item => `<div class="calendar-day-item ${isSharedEntry(item) ? 'calendar-day-item-shared' : 'calendar-day-item-private'}">${escapeHtml(item.title || '')}</div>`).join('')}
+                ${(dayEntries || []).slice(0, 2).map(item => `<div class="calendar-day-item ${isSharedEntry(item) ? 'calendar-day-item-shared' : 'calendar-day-item-private'}">${buildCompletedDot(item)}${escapeHtml(item.title || '')}</div>`).join('')}
                 ${dayEntries.length > 2 ? `<div class="calendar-day-more">+${dayEntries.length - 2}</div>` : ''}
               </div>
               ${(sharedCount + privateCount) > 0 ? `
@@ -23843,7 +23889,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         dayDetails.innerHTML = selectedEntries.map(entry => `
           <div class="calendar-detail-card ${isSharedEntry(entry) ? 'calendar-detail-card-shared' : 'calendar-detail-card-private'} ${getEntryOpenAction(entry) ? 'cursor-pointer' : ''}" ${getEntryOpenAction(entry) ? `onclick="${getEntryOpenAction(entry)}" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();${getEntryOpenAction(entry)};}"` : ''}>
             <div class="flex items-center justify-between gap-2">
-              <p class="font-semibold text-slate-800">${escapeHtml(entry.title || 'Element')}</p>
+              <p class="font-semibold text-slate-800">${buildCompletedDot(entry)}${escapeHtml(entry.title || 'Element')}</p>
               <span class="inline-flex text-[10px] px-2 py-1 rounded-full font-semibold ${isSharedEntry(entry) ? 'calendar-chip-shared' : 'calendar-chip-private'}">${isSharedEntry(entry) ? 'Collaborative' : 'Privée'}</span>
             </div>
             <p class="text-xs text-slate-500 mt-1">${escapeHtml(entry.source || 'Hors projet')} - ${escapeHtml(entry.theme || 'Général')}</p>
@@ -23906,7 +23952,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
                 <span class="text-xs text-slate-500">${bucket.entries.length}</span>
               </div>
               <div class="mt-2 space-y-1">
-                ${(bucket.entries || []).slice(0, 3).map((entry) => `<div class="calendar-day-item ${isSharedEntry(entry) ? 'calendar-day-item-shared' : 'calendar-day-item-private'}">${escapeHtml(entry.title || '')}</div>`).join('')}
+                ${(bucket.entries || []).slice(0, 3).map((entry) => `<div class="calendar-day-item ${isSharedEntry(entry) ? 'calendar-day-item-shared' : 'calendar-day-item-private'}">${buildCompletedDot(entry)}${escapeHtml(entry.title || '')}</div>`).join('')}
                 ${bucket.entries.length > 3 ? `<div class="calendar-day-more">+${bucket.entries.length - 3}</div>` : ''}
               </div>
               <div class="mt-2 flex items-center gap-1 text-[10px]">
@@ -23950,7 +23996,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         yearDetails.innerHTML = selectedMonthEntries.map(entry => `
           <div class="calendar-detail-card ${isSharedEntry(entry) ? 'calendar-detail-card-shared' : 'calendar-detail-card-private'} ${getEntryOpenAction(entry) ? 'cursor-pointer' : ''}" ${getEntryOpenAction(entry) ? `onclick="${getEntryOpenAction(entry)}" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();${getEntryOpenAction(entry)};}"` : ''}>
             <div class="flex items-center justify-between gap-2">
-              <p class="font-semibold text-slate-800">${escapeHtml(entry.title || 'Element')}</p>
+              <p class="font-semibold text-slate-800">${buildCompletedDot(entry)}${escapeHtml(entry.title || 'Element')}</p>
               <span class="inline-flex text-[10px] px-2 py-1 rounded-full font-semibold ${isSharedEntry(entry) ? 'calendar-chip-shared' : 'calendar-chip-private'}">${isSharedEntry(entry) ? 'Collaborative' : 'Privée'}</span>
             </div>
             <p class="text-xs text-slate-500 mt-1">${escapeHtml(entry.source || 'Hors projet')} - ${escapeHtml(entry.theme || 'Général')}</p>
@@ -23964,7 +24010,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       container.innerHTML = mixed.map(entry => `
         <div class="calendar-entry-card ${isSharedEntry(entry) ? 'calendar-entry-card-shared' : 'calendar-entry-card-private'} ${getEntryOpenAction(entry) ? 'cursor-pointer' : ''}" ${getEntryOpenAction(entry) ? `onclick="${getEntryOpenAction(entry)}" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();${getEntryOpenAction(entry)};}"` : ''}>
           <div class="flex items-center justify-between gap-2">
-            <h4 class="font-semibold text-slate-800">${escapeHtml(entry.title || 'Element')}</h4>
+            <h4 class="font-semibold text-slate-800">${buildCompletedDot(entry)}${escapeHtml(entry.title || 'Element')}</h4>
             <span class="text-xs text-slate-500">${escapeHtml(entry.entryType === 'info' ? buildCalendarItemDateLabel(entry) : formatDate(entry.date))}</span>
           </div>
           <p class="text-xs text-slate-500 mt-1">${escapeHtml(entry.source || 'Hors projet')} - ${escapeHtml(entry.theme || 'Général')}</p>

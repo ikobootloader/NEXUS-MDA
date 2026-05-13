@@ -9354,6 +9354,12 @@ html.dark .calendar-day-item-shared {
   color: #6ee7b7;
 }
 
+html.dark .calendar-completed-dot {
+  background: #4ade80;
+  color: #0f172a;
+  box-shadow: 0 0 0 1px rgba(226, 232, 240, 0.2);
+}
+
 html.dark .calendar-day-more {
   color: #97a9c9;
 }
@@ -9597,6 +9603,27 @@ html.dark .project-calendar-year-month-selected {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+.calendar-completed-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  margin-right: 6px;
+  border-radius: 999px;
+  vertical-align: middle;
+  background: #16a34a;
+  color: #ffffff;
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1;
+  box-shadow: 0 0 0 1px rgba(15, 23, 42, 0.06);
+}
+
+.calendar-completed-dot::before {
+  content: "\2713";
 }
 
 .calendar-day-item-shared {
