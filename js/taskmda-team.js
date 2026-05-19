@@ -8370,11 +8370,13 @@
         const richContentHtml = renderGlobalFeedContentHtml(post.content || '', mentionCatalog);
         const plainText = getProjectDescriptionPlainText(post.content || '');
         const content = stripMentionMarkupForDashboard(repairLikelyMojibakeText(plainText));
-        let [headlineRaw, ...subtitleRaws] = content.split('\\n');
+        let [headlineRaw, ...subtitleRaws] = content.split('\n');
         const headline = stripMentionMarkupForDashboard(repairLikelyMojibakeText(headlineRaw || '')) || 'Mise à jour';
         const normalizeDashboardNewsCardTitle = (value) => String(value || '')
           .replace(/^\s*(nouveau\s+projet\s+cr[ée]é\s*:\s*)/i, '')
           .replace(/^\s*(nouvelle\s+t[âa]che\s+cr[ée]ée\s*:\s*)/i, '')
+          // Défensif: si "Projet:" est collé au titre, forcer le retour ligne attendu.
+          .replace(/\s*Projet\s*:\s*/i, '\nProjet: ')
           .trim();
         const postTitle = normalizeDashboardNewsCardTitle(repairLikelyMojibakeText(String(post?.title || '').trim()));
         const cardTitle = postTitle
@@ -15717,6 +15719,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
               storageMode: docFile?.storageMode || '',
               storageProvider: docFile?.storageProvider || '',
               storagePath: docFile?.storagePath || '',
+              thumbnailDataUrl: String(docFile?.thumbnailDataUrl || ''),
               storedAt: Number(docFile?.storedAt || 0) || null,
               linkedNoteIds: [noteId],
               theme: noteTheme,
@@ -28000,6 +28003,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
             storageMode: file.storageMode || '',
             storageProvider: file.storageProvider || '',
             storagePath: file.storagePath || '',
+            thumbnailDataUrl: String(file.thumbnailDataUrl || ''),
             storedAt: Number(file.storedAt || 0) || null,
             theme,
             sharingMode,
@@ -32580,10 +32584,24 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
           type: doc.type,
           size: doc.size,
           data: doc.data,
+          thumbnailDataUrl: String(doc.thumbnailDataUrl || ''),
           notes: doc.notes || '',
           theme: String(doc.theme || '').trim() || 'General'
         });
       });
+
+      const getDocTypeIcon = (doc) => {
+        const type = String(doc?.type || '').toLowerCase();
+        const name = String(doc?.name || '').toLowerCase();
+        if (type.startsWith('image/')) return 'image';
+        if (type.includes('pdf') || name.endsWith('.pdf')) return 'picture_as_pdf';
+        if (type.includes('spreadsheet') || name.endsWith('.xlsx') || name.endsWith('.xls') || name.endsWith('.csv')) return 'table_chart';
+        if (type.includes('word') || name.endsWith('.docx') || name.endsWith('.doc') || name.endsWith('.odt')) return 'article';
+        if (type.includes('presentation') || name.endsWith('.pptx') || name.endsWith('.ppt')) return 'slideshow';
+        if (type.startsWith('text/') || name.endsWith('.txt') || name.endsWith('.md')) return 'notes';
+        if (type.includes('zip') || name.endsWith('.zip') || name.endsWith('.rar') || name.endsWith('.7z')) return 'folder_zip';
+        return 'description';
+      };
 
       let filtered = [...docs];
       if (docsFilters.query.trim()) {
@@ -32662,13 +32680,22 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         const bindingDocId = escapeHtml(`${currentProjectId}:project-doc:${doc.docId}`);
         return `
         <div class="doc-card bg-surface-container-low rounded-xl p-4">
-          <div class="flex items-center justify-between mb-3">
-            <span class="material-symbols-outlined text-primary">description</span>
-            <span class="text-[10px] font-semibold uppercase px-2 py-1 rounded bg-white">${escapeHtml(getDocumentCategory(doc))}</span>
+          <div class="doc-card-layout">
+            <div class="doc-card-thumb-wrap">
+              ${String(doc.thumbnailDataUrl || '').trim()
+                ? `<img src="${escapeHtml(doc.thumbnailDataUrl)}" alt="" class="doc-card-thumb" loading="lazy">`
+                : `<span class="material-symbols-outlined text-primary doc-card-thumb-icon">${escapeHtml(getDocTypeIcon(doc))}</span>`}
+            </div>
+            <div class="doc-card-main">
+              <div class="flex items-center justify-between mb-3">
+                <span class="material-symbols-outlined text-primary">${escapeHtml(getDocTypeIcon(doc))}</span>
+                <span class="text-[10px] font-semibold uppercase px-2 py-1 rounded bg-white">${escapeHtml(getDocumentCategory(doc))}</span>
+              </div>
+              <h4 class="workspace-card-title font-semibold text-sm truncate mb-1">${escapeHtml(doc.name || `document-${idx + 1}`)}</h4>
+              <p class="workspace-card-subtitle text-xs mb-2">Source: ${escapeHtml(doc.taskTitle || 'Tâche')}</p>
+              <p class="workspace-card-subtitle text-xs mb-2">Thématique: ${escapeHtml(String(doc.theme || 'General'))}</p>
+            </div>
           </div>
-          <h4 class="workspace-card-title font-semibold text-sm truncate mb-1">${escapeHtml(doc.name || `document-${idx + 1}`)}</h4>
-          <p class="workspace-card-subtitle text-xs mb-2">Source: ${escapeHtml(doc.taskTitle || 'Tâche')}</p>
-          <p class="workspace-card-subtitle text-xs mb-2">Thématique: ${escapeHtml(String(doc.theme || 'General'))}</p>
           ${linkedNotesHtml}
           <p class="text-[11px] text-slate-500 mb-2 truncate" title="${escapeHtml(linkedLabel)}">${escapeHtml(linkedLabel)}</p>
           <div class="text-[11px] text-slate-500 mb-3">${doc.uploadedAt ? new Date(doc.uploadedAt).toLocaleDateString('fr-FR') : ''}</div>
@@ -38538,4 +38565,3 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         });
       });
     }
-

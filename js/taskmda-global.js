@@ -1071,6 +1071,7 @@
             storageMode: file.storageMode || '',
             storageProvider: file.storageProvider || '',
             storagePath: file.storagePath || '',
+            thumbnailDataUrl: String(file.thumbnailDataUrl || ''),
             linked: file.linked && typeof file.linked === 'object' ? { ...file.linked } : null,
             storedAt: Number(file.storedAt || 0) || null,
             theme,
@@ -1209,18 +1210,39 @@
 
       container.classList.add('has-results');
       const esc = helpers.escapeHtml || ((value) => String(value || ''));
+      const getDocTypeIcon = (doc) => {
+        const type = String(doc?.type || '').toLowerCase();
+        const name = String(doc?.name || '').toLowerCase();
+        if (type.startsWith('image/')) return 'image';
+        if (type.includes('pdf') || name.endsWith('.pdf')) return 'picture_as_pdf';
+        if (type.includes('spreadsheet') || name.endsWith('.xlsx') || name.endsWith('.xls') || name.endsWith('.csv')) return 'table_chart';
+        if (type.includes('word') || name.endsWith('.docx') || name.endsWith('.doc') || name.endsWith('.odt')) return 'article';
+        if (type.includes('presentation') || name.endsWith('.pptx') || name.endsWith('.ppt')) return 'slideshow';
+        if (type.startsWith('text/') || name.endsWith('.txt') || name.endsWith('.md')) return 'notes';
+        if (type.includes('zip') || name.endsWith('.zip') || name.endsWith('.rar') || name.endsWith('.7z')) return 'folder_zip';
+        return 'description';
+      };
 
       container.innerHTML = filtered.map((doc) => `
           <div class="doc-card workspace-card-shell bg-surface-container-low rounded-xl p-4">
-          <div class="flex items-center justify-between mb-2">
-            <span class="material-symbols-outlined text-primary">description</span>
-            <div class="flex items-center gap-1">
-              ${helpers.sharingModeBadge?.(doc.sharingMode) || ''}
-              <span class="text-[10px] font-semibold uppercase px-2 py-1 rounded bg-white">${esc(helpers.getDocumentCategory?.(doc) || '')}</span>
+          <div class="doc-card-layout">
+            <div class="doc-card-thumb-wrap">
+              ${String(doc.thumbnailDataUrl || '').trim()
+                ? `<img src="${esc(doc.thumbnailDataUrl)}" alt="" class="doc-card-thumb" loading="lazy">`
+                : `<span class="material-symbols-outlined text-primary doc-card-thumb-icon">${esc(getDocTypeIcon(doc))}</span>`}
+            </div>
+            <div class="doc-card-main">
+              <div class="flex items-center justify-between mb-2">
+                <span class="material-symbols-outlined text-primary">${esc(getDocTypeIcon(doc))}</span>
+                <div class="flex items-center gap-1">
+                  ${helpers.sharingModeBadge?.(doc.sharingMode) || ''}
+                  <span class="text-[10px] font-semibold uppercase px-2 py-1 rounded bg-white">${esc(helpers.getDocumentCategory?.(doc) || '')}</span>
+                </div>
+              </div>
+              <h4 class="workspace-card-title font-semibold text-sm truncate">${esc(doc.name || 'document')}</h4>
+              <p class="workspace-card-subtitle text-xs mt-1">${esc(doc.sourceProjectName || 'Hors projet')} • ${esc(doc.theme || 'Général')}</p>
             </div>
           </div>
-          <h4 class="workspace-card-title font-semibold text-sm truncate">${esc(doc.name || 'document')}</h4>
-          <p class="workspace-card-subtitle text-xs mt-1">${esc(doc.sourceProjectName || 'Hors projet')} • ${esc(doc.theme || 'Général')}</p>
           <div class="mt-3 flex items-center justify-between text-xs">
             <span class="text-slate-500">${helpers.formatFileSize?.(doc.size || 0) || ''}</span>
             <div class="doc-hover-actions flex items-center gap-2 flex-wrap">

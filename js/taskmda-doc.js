@@ -39,6 +39,125 @@
       };
     }
 
+    function readFileAsDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        try {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result || ''));
+          reader.onerror = () => reject(reader.error || new Error('file-read-error'));
+          reader.readAsDataURL(file);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    }
+
+    function readFileAsUint8Array(file) {
+      return new Promise((resolve, reject) => {
+        try {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const buffer = reader.result;
+            if (buffer instanceof ArrayBuffer) {
+              resolve(new Uint8Array(buffer));
+              return;
+            }
+            resolve(new Uint8Array());
+          };
+          reader.onerror = () => reject(reader.error || new Error('file-read-error'));
+          reader.readAsArrayBuffer(file);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    }
+
+    function loadImageFromDataUrl(dataUrl) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error('image-load-error'));
+        img.src = String(dataUrl || '');
+      });
+    }
+
+    function renderThumbnailDataUrlFromCanvas(canvas, mimeType = 'image/jpeg', quality = 0.82) {
+      try {
+        const dataUrl = canvas.toDataURL(mimeType, quality);
+        return String(dataUrl || '');
+      } catch (_) {
+        try {
+          return String(canvas.toDataURL('image/png') || '');
+        } catch (_) {
+          return '';
+        }
+      }
+    }
+
+    function drawContainThumbnail(sourceWidth, sourceHeight, drawFn) {
+      const maxWidth = 220;
+      const maxHeight = 160;
+      const width = Number(sourceWidth || 0);
+      const height = Number(sourceHeight || 0);
+      if (!(width > 0) || !(height > 0)) return '';
+      const scale = Math.min(maxWidth / width, maxHeight / height, 1);
+      const targetWidth = Math.max(1, Math.round(width * scale));
+      const targetHeight = Math.max(1, Math.round(height * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = targetWidth;
+      canvas.height = targetHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return '';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, targetWidth, targetHeight);
+      drawFn(ctx, targetWidth, targetHeight);
+      return renderThumbnailDataUrlFromCanvas(canvas);
+    }
+
+    async function createDocumentThumbnailDataUrl(fileLike) {
+      const file = fileLike;
+      if (!file) return '';
+      const type = String(file.type || '').toLowerCase().trim();
+      try {
+        if (type.startsWith('image/')) {
+          const imageDataUrl = await readFileAsDataUrl(file);
+          if (!imageDataUrl) return '';
+          const img = await loadImageFromDataUrl(imageDataUrl);
+          return drawContainThumbnail(img.naturalWidth || img.width, img.naturalHeight || img.height, (ctx, targetWidth, targetHeight) => {
+            ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+          });
+        }
+        if (type === 'application/pdf') {
+          const pdfjs = global.pdfjsLib;
+          if (!pdfjs || typeof pdfjs.getDocument !== 'function') return '';
+          const rawBytes = await readFileAsUint8Array(file);
+          if (!rawBytes.length) return '';
+          const loadingTask = pdfjs.getDocument({ data: rawBytes });
+          const pdfDoc = await loadingTask.promise;
+          const firstPage = await pdfDoc.getPage(1);
+          const viewport = firstPage.getViewport({ scale: 1 });
+          const baseWidth = Number(viewport.width || 0);
+          const baseHeight = Number(viewport.height || 0);
+          if (!(baseWidth > 0) || !(baseHeight > 0)) return '';
+          const maxWidth = 220;
+          const scale = Math.min(maxWidth / baseWidth, 1);
+          const targetViewport = firstPage.getViewport({ scale });
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.floor(targetViewport.width));
+          canvas.height = Math.max(1, Math.floor(targetViewport.height));
+          const ctx = canvas.getContext('2d');
+          if (!ctx) return '';
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          await firstPage.render({ canvasContext: ctx, viewport: targetViewport }).promise;
+          return renderThumbnailDataUrlFromCanvas(canvas);
+        }
+      } catch (error) {
+        console.info('Document thumbnail skipped:', error);
+      }
+      return '';
+    }
+
     async function resolveDocumentDataForRuntime(doc) {
       if (String(doc?.data || '').trim()) return String(doc.data || '');
       if (String(doc?.storageMode || '').trim() === 'linked-file') {
@@ -179,9 +298,11 @@
           projectId: fileProjectId,
           theme: fileTheme
         });
+        const thumbnailDataUrl = await createDocumentThumbnailDataUrl(normalized.raw);
         docs.push({
           ...baseDoc,
           data: '',
+          thumbnailDataUrl,
           storageMode: fsMeta.storageMode,
           storageProvider: fsMeta.storageProvider,
           storagePath: fsMeta.storagePath,

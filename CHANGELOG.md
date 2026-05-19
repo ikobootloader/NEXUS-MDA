@@ -1,5 +1,22 @@
 # Changelog - TaskMDA Team
 
+## Mise a jour incrementale - Mai 2026 (Miniatures automatiques des documents)
+
+- Documents (global + projet):
+  - generation locale automatique d une miniature a l import pour les images (`image/*`) et les PDF (`application/pdf`, page 1 via `pdf.js`).
+  - stockage de la miniature dans les metadonnees document (`thumbnailDataUrl`) pour affichage immediat dans les cartes.
+  - fallback conserve sur icone document quand aucune miniature n est disponible (formats non pris en charge ou echec rendu).
+  - affichage de la miniature a gauche des cartes documents dans les vues `Documents` (transverse et projet), avec style dedie clair/sombre.
+  - correctif de propagation: la miniature est maintenant conservee dans tous les flux de persistence concernes (`globalDocs` et creation/lecture des cartes projet), ce qui corrige les cas ou elle etait generee mais non affichee.
+  - fallback icone par type active (image, PDF, tableur, Word, presentation, texte, archive, generique).
+
+## Mise a jour incrementale - Mai 2026 (Dashboard fil d info: retour ligne Projet)
+
+- Dashboard / fil d information:
+  - correctif du parsing des retours ligne dans `renderDashboardNews` (`split('\n')` au lieu de `split('\\n')`) pour conserver la separation entre le titre de tache et la ligne `Projet: ...`.
+  - normalisation defensive du titre de carte pour forcer un retour ligne avant `Projet:` quand la mention est collee au titre.
+  - ajustement CSS `.dashboard-news-text` avec `white-space: pre-line` pour afficher correctement le saut de ligne.
+
 ## Mise a jour incrementale - Mai 2026 (Bouton general projet contextuel)
 
 - Projet / ergonomie:

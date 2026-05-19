@@ -6711,6 +6711,7 @@ textarea:focus {
   font-weight: 800;
   color: var(--text-primary);
   line-height: 1.3;
+  white-space: pre-line;
   overflow: hidden;
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -11823,6 +11824,47 @@ html[data-wf-action-buttons="icon"] #btn-global-doc-add:focus-visible {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 16px;
+}
+
+.doc-card-layout {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.doc-card-thumb-wrap {
+  width: 74px;
+  height: 56px;
+  border-radius: 10px;
+  border: 1px solid #dbe5f2;
+  background: #f8fbff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.doc-card-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.doc-card-thumb-icon {
+  font-size: 22px;
+  opacity: 0.9;
+}
+
+.doc-card-main {
+  min-width: 0;
+}
+
+html.dark .doc-card-thumb-wrap {
+  border-color: #334862;
+  background: #132138;
 }
 
 #global-doc-files-label {
