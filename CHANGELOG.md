@@ -1,5 +1,13 @@
 # Changelog - TaskMDA Team
 
+## Correctif - Mai 2026 (fil d'info: liens HTML en lecture)
+
+- Fil d'info (`js/taskmda-team.js`):
+  - correction de `renderGlobalFeedContentHtml(...)` pour éviter la corruption des balises `<a>` (ex: `mailto:`) dans la modale de lecture.
+  - les mentions (`@...` / `@[Nom]`) sont désormais appliquées uniquement sur les noeuds texte rendus, et plus sur le HTML brut/attributs.
+- Verification:
+  - `node --check js/taskmda-team.js` OK.
+
 ## Correctif - Mai 2026 (warning Tailwind CDN local)
 
 - UI shell (`taskmda-team.html` + `vendor/tailwindcss.js`):
