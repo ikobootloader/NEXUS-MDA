@@ -47,9 +47,13 @@
       normalizeSharingMode: coreNormalizeSharingMode,
       normalizeProjectReadAccess: coreNormalizeProjectReadAccess,
       sharingModeLabel: coreSharingModeLabel,
+      sharingModeBadge: coreSharingModeBadge,
       toYmd: coreToYmd,
       formatFileSize: coreFormatFileSize,
+      formatDate: coreFormatDate,
       paginateItems: corePaginateItems,
+      matchesQuery: coreMatchesQuery,
+      sanitizeFilenameSegment: coreSanitizeFilenameSegment,
       normalizeTaskStatusValue: coreNormalizeTaskStatusValue,
       normalizeTaskStatusForCreate: coreNormalizeTaskStatusForCreate,
       normalizeActionButtonLabel: coreNormalizeActionButtonLabel,
@@ -1055,11 +1059,12 @@
       };
 
       await putEncrypted('globalPosts', autoPost, 'postId');
+      invalidateGlobalFeedReadModel();
       knownGlobalPostIds.add(postId);
       if (sharedFolderHandle) {
         await writeGlobalFeedPostToSharedFolder(autoPost);
       }
-      if (workspaceMode === 'global' && globalWorkspaceView === 'feed') {
+      if (isGlobalFeedViewActive()) {
         await renderGlobalFeed();
       }
     }
@@ -2105,6 +2110,21 @@
     let sharedWriteQueue = [];
     let sharedWriteQueuedIds = new Set();
     let isSharedWriteProcessing = false;
+    const SHARED_WRITE_BACKOFF_BASE_MS = 900;
+    const SHARED_WRITE_BACKOFF_MAX_MS = 5000;
+    const SHARED_WRITE_BACKOFF_JITTER_MS = 220;
+    const SHARED_QUEUE_DEBUG_REPORT_INTERVAL_MS = 15000;
+    const SHARED_QUEUE_HEALTH_DROP_ALERT_THRESHOLD = 3;
+    const SHARED_QUEUE_HEALTH_ALERT_COOLDOWN_MS = 30000;
+    const sharedWriteMetrics = {
+      enqueued: 0,
+      synced: 0,
+      retried: 0,
+      dropped: 0,
+      cycles: 0,
+      maxQueueDepth: 0,
+      lastErrorAt: 0
+    };
     const sharedProjectKeyHealth = new Map();
     const loggedLegacySharedKeyProjectIds = new Set();
     const loggedInaccessibleSharedProjectIds = new Set();
@@ -2112,9 +2132,194 @@
     const duplicateTaskCreateDiagnostics = new Map();
     const duplicateCreateEventReplayLogged = new Set();
     const creatorIdentityBackfillProjects = new Set();
+    let sharedQueueDebugReportTimer = null;
+    let sharedQueueHealthLastDroppedTotal = 0;
+    let sharedQueueHealthLastAlertAt = 0;
 
     function isFileSystemSupported() {
       return 'showDirectoryPicker' in window;
+    }
+
+    function getSharedWriteEventPriority(event) {
+      const type = String(event?.type || '').trim().toUpperCase();
+      if (type.startsWith('DELETE_')) return 90;
+      if (type === 'UPDATE_TASK' || type === 'UPDATE_PROJECT' || type === 'UPDATE_DOCUMENT' || type === 'UPDATE_NOTE') return 70;
+      if (type.startsWith('CREATE_')) return 50;
+      return 40;
+    }
+
+    function getSharedWriteBackoffDelayMs(attempts) {
+      const attempt = Math.max(1, Number(attempts || 1));
+      const expDelay = Math.min(SHARED_WRITE_BACKOFF_BASE_MS * (2 ** (attempt - 1)), SHARED_WRITE_BACKOFF_MAX_MS);
+      const jitter = Math.floor(Math.random() * SHARED_WRITE_BACKOFF_JITTER_MS);
+      return expDelay + jitter;
+    }
+
+    function logSharedWriteMetrics(reason = '') {
+      if (!APP_DEBUG) return;
+      debugLog('[sync-queue]', reason || 'snapshot', {
+        queueDepth: sharedWriteQueue.length,
+        processing: isSharedWriteProcessing,
+        enqueued: sharedWriteMetrics.enqueued,
+        synced: sharedWriteMetrics.synced,
+        retried: sharedWriteMetrics.retried,
+        dropped: sharedWriteMetrics.dropped,
+        cycles: sharedWriteMetrics.cycles,
+        maxQueueDepth: sharedWriteMetrics.maxQueueDepth,
+        lastErrorAt: sharedWriteMetrics.lastErrorAt || 0
+      });
+    }
+
+    function getSharedQueueDebugSnapshot() {
+      return {
+        projectEvents: {
+          queueDepth: sharedWriteQueue.length,
+          processing: isSharedWriteProcessing,
+          enqueued: sharedWriteMetrics.enqueued,
+          synced: sharedWriteMetrics.synced,
+          retried: sharedWriteMetrics.retried,
+          dropped: sharedWriteMetrics.dropped,
+          cycles: sharedWriteMetrics.cycles,
+          maxQueueDepth: sharedWriteMetrics.maxQueueDepth
+        },
+        globalMessages: {
+          queuedIds: globalMessageSharedQueuedIds.size,
+          enqueued: globalMessageSharedQueueMetrics.enqueued,
+          synced: globalMessageSharedQueueMetrics.synced,
+          retried: globalMessageSharedQueueMetrics.retried,
+          dropped: globalMessageSharedQueueMetrics.dropped
+        },
+        workflow: {
+          queuedIds: workflowSharedQueuedChangeIds.size,
+          enqueued: workflowSharedQueueMetrics.enqueued,
+          synced: workflowSharedQueueMetrics.synced,
+          retried: workflowSharedQueueMetrics.retried,
+          dropped: workflowSharedQueueMetrics.dropped
+        }
+      };
+    }
+
+    function resetSharedQueueMetrics() {
+      sharedWriteMetrics.enqueued = 0;
+      sharedWriteMetrics.synced = 0;
+      sharedWriteMetrics.retried = 0;
+      sharedWriteMetrics.dropped = 0;
+      sharedWriteMetrics.cycles = 0;
+      sharedWriteMetrics.maxQueueDepth = 0;
+      sharedWriteMetrics.lastErrorAt = 0;
+
+      globalMessageSharedQueueMetrics.enqueued = 0;
+      globalMessageSharedQueueMetrics.synced = 0;
+      globalMessageSharedQueueMetrics.retried = 0;
+      globalMessageSharedQueueMetrics.dropped = 0;
+
+      workflowSharedQueueMetrics.enqueued = 0;
+      workflowSharedQueueMetrics.synced = 0;
+      workflowSharedQueueMetrics.retried = 0;
+      workflowSharedQueueMetrics.dropped = 0;
+
+      sharedQueueHealthLastDroppedTotal = 0;
+      sharedQueueHealthLastAlertAt = 0;
+    }
+
+    function exportSharedQueueDebugSnapshot() {
+      const snapshot = getSharedQueueDebugSnapshot();
+      debugLog('[sync-queue:export]', snapshot);
+      return snapshot;
+    }
+
+    function validateSharedQueueIntegrityInDebug() {
+      if (!APP_DEBUG) return true;
+      const queueDepth = Number(sharedWriteQueue.length || 0);
+      const projectQueued = Number(sharedWriteQueuedIds.size || 0);
+      const messageQueued = Number(globalMessageSharedQueuedIds.size || 0);
+      const workflowQueued = Number(workflowSharedQueuedChangeIds.size || 0);
+      const hasInvalidCount = [queueDepth, projectQueued, messageQueued, workflowQueued].some((value) => !Number.isFinite(value) || value < 0);
+      if (hasInvalidCount) {
+        debugLog('[sync-queue:integrity-error]', {
+          queueDepth,
+          projectQueued,
+          messageQueued,
+          workflowQueued
+        });
+        return false;
+      }
+      if (isSharedWriteProcessing && queueDepth === 0) {
+        debugLog('[sync-queue:integrity-warn]', 'processing-with-empty-queue');
+      }
+      if (projectQueued < queueDepth) {
+        debugLog('[sync-queue:integrity-warn]', {
+          reason: 'projectQueuedIds-less-than-queueDepth',
+          queueDepth,
+          projectQueued
+        });
+      }
+      return true;
+    }
+
+    async function runSharedQueueDebugProbe(durationMs = 20000) {
+      const safeDuration = Math.max(5000, Math.min(120000, Number(durationMs) || 20000));
+      const startedAt = Date.now();
+      const before = getSharedQueueDebugSnapshot();
+      const beforeDropped = Number(before?.projectEvents?.dropped || 0)
+        + Number(before?.globalMessages?.dropped || 0)
+        + Number(before?.workflow?.dropped || 0);
+      await new Promise((resolve) => setTimeout(resolve, safeDuration));
+      const after = getSharedQueueDebugSnapshot();
+      const afterDropped = Number(after?.projectEvents?.dropped || 0)
+        + Number(after?.globalMessages?.dropped || 0)
+        + Number(after?.workflow?.dropped || 0);
+      const deltaDropped = afterDropped - beforeDropped;
+      const integrityOk = validateSharedQueueIntegrityInDebug();
+      const verdict = integrityOk && deltaDropped <= SHARED_QUEUE_HEALTH_DROP_ALERT_THRESHOLD
+        ? 'ok'
+        : 'warn';
+      const report = {
+        verdict,
+        startedAt,
+        finishedAt: Date.now(),
+        durationMs: safeDuration,
+        deltaDropped,
+        before,
+        after
+      };
+      debugLog('[sync-queue:probe]', report);
+      return report;
+    }
+
+    function startSharedQueueDebugReporter() {
+      if (!APP_DEBUG) return;
+      if (sharedQueueDebugReportTimer) return;
+      sharedQueueDebugReportTimer = setInterval(() => {
+        validateSharedQueueIntegrityInDebug();
+        debugLog('[sync-queue:report]', getSharedQueueDebugSnapshot());
+        evaluateSharedQueueHealthInDebug();
+      }, SHARED_QUEUE_DEBUG_REPORT_INTERVAL_MS);
+    }
+
+    function stopSharedQueueDebugReporter() {
+      if (!sharedQueueDebugReportTimer) return;
+      clearInterval(sharedQueueDebugReportTimer);
+      sharedQueueDebugReportTimer = null;
+    }
+
+    function evaluateSharedQueueHealthInDebug() {
+      if (!APP_DEBUG) return;
+      const droppedTotal = Number(sharedWriteMetrics.dropped || 0)
+        + Number(globalMessageSharedQueueMetrics.dropped || 0)
+        + Number(workflowSharedQueueMetrics.dropped || 0);
+      const droppedDelta = droppedTotal - Number(sharedQueueHealthLastDroppedTotal || 0);
+      sharedQueueHealthLastDroppedTotal = droppedTotal;
+      if (droppedDelta < SHARED_QUEUE_HEALTH_DROP_ALERT_THRESHOLD) return;
+      const now = Date.now();
+      if (now - Number(sharedQueueHealthLastAlertAt || 0) < SHARED_QUEUE_HEALTH_ALERT_COOLDOWN_MS) return;
+      sharedQueueHealthLastAlertAt = now;
+      showToast(`Debug sync: hausse des echecs queue (+${droppedDelta})`);
+      debugLog('[sync-queue:health-alert]', {
+        droppedDelta,
+        droppedTotal,
+        snapshot: getSharedQueueDebugSnapshot()
+      });
     }
 
     function registerDuplicateTaskCreateDiagnostic(taskId, event, reason = 'duplicate-task-id') {
@@ -2340,7 +2545,9 @@
           knownEventIds.add(event.eventId);
         }
         await refreshStats();
-        await renderProjects();
+        if (isProjectsListViewActive()) {
+          await renderProjects();
+        }
       }
 
       if (!options.silent) {
@@ -2401,84 +2608,7 @@
       return added;
     }
 
-    /**
-     * Découvre et charge tous les projets existants dans le dossier partagé
-     * Appelé lors de la connexion initiale au dossier
-     */
-    async function discoverAndLoadExistingProjects(options = {}) {
-      const stats = {
-        projectsFound: 0,
-        projectsLoaded: 0,
-        projectsSkippedMissingKey: 0,
-        eventsLoaded: 0,
-        legacySharedKeyFilesDetected: 0,
-        legacySharedKeyProjectIds: [],
-        rebuildSkippedProjects: []
-      };
-      if (!sharedFolderHandle) return stats;
-      const shouldRebuildLocal = options.rebuildLocal === true;
-
-      debugLog('Discovering existing projects...');
-
-      try {
-        const projectsDir = await sharedFolderHandle.getDirectoryHandle('projects', { create: true });
-
-        // Parcourir tous les dossiers de projets
-        for await (const entry of projectsDir.values()) {
-          if (entry.kind !== 'directory') continue;
-
-          const projectId = entry.name;
-          debugLog('Found project:', projectId);
-
-          // Enregistrer le projet
-          await registerProject(projectId);
-
-          // Charger tous les événements de ce projet (onlyNew = false pour tout charger)
-          const events = await readEventsFromSharedFolder(projectId, false);
-
-          debugLog(`Loading ${events.length} events from project ${projectId}`);
-
-          // Traiter tous les événements dans l'ordre chronologique
-          if (shouldRebuildLocal) {
-            const existingStateBeforeRebuild = await getProjectState(projectId, { ignoreAccessCheck: true });
-            const hasCreateProjectEvent = events.some((event) => event?.type === EventTypes.CREATE_PROJECT);
-            // Ne jamais supprimer l'état local sans base reconstructible.
-            if (events.length > 0 && hasCreateProjectEvent) {
-              await deleteFromStore('localState', projectId);
-              for (const event of events) {
-                await applyEventToState(event);
-                await maybeNotifyCollaboratorEvent(event);
-                knownEventIds.add(event.eventId);
-              }
-              const rebuiltState = await getProjectState(projectId, { ignoreAccessCheck: true });
-              if (!rebuiltState?.project) {
-                if (existingStateBeforeRebuild?.project) {
-                  await putEncrypted('localState', existingStateBeforeRebuild, 'projectId');
-                }
-                console.warn('Rebuild produced incomplete state, local snapshot restored:', projectId);
-              }
-            } else {
-              if (events.length > 0 && !hasCreateProjectEvent) {
-                console.warn('Rebuild skipped: missing CREATE_PROJECT event in shared history:', projectId);
-              } else {
-                console.warn('Rebuild skipped for project without readable shared events:', projectId);
-              }
-            }
-          } else {
-            for (const event of events) {
-              await processEvent(event);
-              knownEventIds.add(event.eventId);
-            }
-          }
-        }
-
-        debugLog('All existing projects loaded');
-      } catch (error) {
-        console.error('❌ Error discovering projects:', error);
-      }
-    }
-
-    // Override: rechargement robuste des projets collaboratifs
+    // Rechargement robuste des projets collaboratifs
     async function discoverAndLoadExistingProjects(options = {}) {
       const stats = {
         projectsFound: 0,
@@ -2609,6 +2739,9 @@
         sharedWriteQueue = [];
         sharedWriteQueuedIds = new Set();
         isSharedWriteProcessing = false;
+        globalMessageSharedQueuedIds.clear();
+        workflowSharedQueuedChangeIds.clear();
+        resetSharedQueueMetrics();
         updateBackgroundSyncStatus('idle', 0);
         await refreshLocalSharedKeyProjectIds();
         await loadAppBrandingConfig({ ensureRemote: true });
@@ -2619,7 +2752,9 @@
         if (!isPolling) startPolling();
         updateSyncStatus('connected');
         await refreshStats();
-        await renderProjects();
+        if (isProjectsListViewActive()) {
+          await renderProjects();
+        }
         ensureAutoEncryptedUserBackupToSharedFolder({ force: true, silent: true });
         if (showNotice) {
           if ((loadStats?.projectsFound || 0) === 0) {
@@ -2731,6 +2866,9 @@
       sharedWriteQueue = [];
       sharedWriteQueuedIds = new Set();
       isSharedWriteProcessing = false;
+      globalMessageSharedQueuedIds.clear();
+      workflowSharedQueuedChangeIds.clear();
+      resetSharedQueueMetrics();
       updateBackgroundSyncStatus('idle', 0);
       stopPolling();
       if (forgetSavedHandle) {
@@ -2739,7 +2877,9 @@
       updateSyncStatus('disconnected');
       updateFolderButtons();
       await refreshStats();
-      await renderProjects();
+      if (isProjectsListViewActive()) {
+        await renderProjects();
+      }
       showToast('Visibilité privée active');
     }
 
@@ -3826,7 +3966,7 @@
       }
 
       updateGlobalTasksViewButtons();
-      if (workspaceMode === 'global' && globalWorkspaceView === 'tasks') {
+      if (isGlobalTasksViewActive()) {
         renderGlobalTasks().catch(() => null);
       }
       if (workspaceMode === 'global' && globalWorkspaceView === 'calendar') {
@@ -3835,7 +3975,7 @@
       if (workspaceMode === 'global' && globalWorkspaceView === 'notes') {
         Promise.resolve(globalNotesRuntime?.renderGlobalNotes?.() ?? renderGlobalNotes()).catch(() => null);
       }
-      if (workspaceMode === 'global' && globalWorkspaceView === 'feed') {
+      if (isGlobalFeedViewActive()) {
         renderGlobalFeed().catch(() => null);
       }
       if (workspaceMode === 'global' && globalWorkspaceView === 'settings') {
@@ -4040,7 +4180,9 @@
     async function processSharedWriteQueue() {
       if (isSharedWriteProcessing || !sharedFolderHandle) return;
       isSharedWriteProcessing = true;
+      sharedWriteMetrics.cycles += 1;
       updateBackgroundSyncStatus('syncing', sharedWriteQueue.length);
+      logSharedWriteMetrics('cycle-start');
       try {
         while (sharedWriteQueue.length > 0 && sharedFolderHandle) {
           const item = sharedWriteQueue[0];
@@ -4048,24 +4190,29 @@
           if (synced) {
             sharedWriteQueue.shift();
             if (item.queueKey) sharedWriteQueuedIds.delete(item.queueKey);
+            sharedWriteMetrics.synced += 1;
             updateBackgroundSyncStatus(sharedWriteQueue.length > 0 ? 'syncing' : 'idle', sharedWriteQueue.length);
             continue;
           }
 
           item.attempts = Number(item.attempts || 0) + 1;
+          sharedWriteMetrics.retried += 1;
+          sharedWriteMetrics.lastErrorAt = Date.now();
           updateBackgroundSyncStatus('queued', sharedWriteQueue.length);
           if (item.attempts >= 3) {
             sharedWriteQueue.shift();
             if (item.queueKey) sharedWriteQueuedIds.delete(item.queueKey);
+            sharedWriteMetrics.dropped += 1;
             addNotification('Synchronisation', `Evenement non synchronise: ${item.event?.type || 'inconnu'}`, item.projectId);
             updateBackgroundSyncStatus('error', Math.max(sharedWriteQueue.length, 1));
             continue;
           }
-          await new Promise(resolve => setTimeout(resolve, Math.min(1200 * item.attempts, 4000)));
+          await new Promise(resolve => setTimeout(resolve, getSharedWriteBackoffDelayMs(item.attempts)));
         }
       } finally {
         isSharedWriteProcessing = false;
         updateBackgroundSyncStatus(sharedWriteQueue.length > 0 ? 'queued' : 'idle', sharedWriteQueue.length);
+        logSharedWriteMetrics('cycle-end');
       }
     }
 
@@ -4079,14 +4226,22 @@
       if (!folders) return false;
       const queueKey = `${projectId}:${event.eventId}`;
       if (sharedWriteQueuedIds.has(queueKey)) return true;
+      const priority = getSharedWriteEventPriority(event);
       sharedWriteQueuedIds.add(queueKey);
-      sharedWriteQueue.push({
+      const nextItem = {
         projectId,
         event,
         attempts: 0,
-        queueKey
-      });
+        queueKey,
+        priority
+      };
+      const insertAt = sharedWriteQueue.findIndex((item) => Number(item?.priority || 0) < priority);
+      if (insertAt === -1) sharedWriteQueue.push(nextItem);
+      else sharedWriteQueue.splice(insertAt, 0, nextItem);
+      sharedWriteMetrics.enqueued += 1;
+      sharedWriteMetrics.maxQueueDepth = Math.max(sharedWriteMetrics.maxQueueDepth, sharedWriteQueue.length);
       updateBackgroundSyncStatus('queued', sharedWriteQueue.length);
+      logSharedWriteMetrics('enqueue');
       processSharedWriteQueue();
       return true;
     }
@@ -4243,6 +4398,7 @@
     async function startPolling() {
       if (isPolling) return;
       isPolling = true;
+      startSharedQueueDebugReporter();
 
       pollInterval = setInterval(async () => {
         for (const [projectId] of projectFolders) {
@@ -4271,6 +4427,7 @@
         clearInterval(pollInterval);
         pollInterval = null;
         isPolling = false;
+        stopSharedQueueDebugReporter();
         debugLog('Polling stopped');
       }
     }
@@ -4559,6 +4716,8 @@
     let projectNotesFiltersUiRuntime = null;
     let globalNotesFiltersUiRuntime = null;
     let globalReadActionsUiRuntime = null;
+    let globalNotesReadModalContentRuntime = null;
+    let globalNotesReadInlineEditRuntime = null;
     let projectNotesActionsUiRuntime = null;
     let projectReadActionsUiRuntime = null;
     let projectNoteEditorActionsUiRuntime = null;
@@ -4574,6 +4733,13 @@
     let projectDocsControlsUiRuntime = null;
     let projectActivityFiltersUiRuntime = null;
     let projectThemeBindingsUiRuntime = null;
+    let editorInteropRuntime = null;
+    let globalDocRefUtilsRuntime = null;
+    let feedDigestUiRuntime = null;
+    let feedDigestEditorRuntime = null;
+    let feedDigestMimeRuntime = null;
+    let feedDigestPdfRuntime = null;
+    let feedDigestContentRuntime = null;
     let attachmentsUiRuntime = null;
     let discussionInputUiRuntime = null;
     let globalGroupChannelUiRuntime = null;
@@ -4981,7 +5147,9 @@
       refreshGlobalMessageHiddenGroupsForCurrentUser();
       updateUserInfo();
       await refreshStats();
-      await renderProjects();
+      if (isProjectsListViewActive()) {
+        await renderProjects();
+      }
       showToast('Import JSON terminé');
     }
 
@@ -5332,8 +5500,8 @@
 
     function bindMultiSelectToggle(selectId) {
       const select = document.getElementById(selectId);
-      if (!select || select.dataset.toggleBound === '1') return;
-      select.dataset.toggleBound = '1';
+      if (!select || select.dataset.multiSelectToggleBound === '1') return;
+      select.dataset.multiSelectToggleBound = '1';
       select.addEventListener('mousedown', (event) => {
         const option = event.target?.closest?.('option');
         if (!option) return;
@@ -5502,12 +5670,22 @@
       showToast(successMessage);
       await renderGlobalSettings();
       if (currentProjectState) {
-        renderProjectRoleSelectors(currentProjectState);
-        await renderProjectMembers(currentProjectState);
-        renderProjectInvitations(currentProjectState);
-        renderProjectPermissionMatrix(currentProjectState);
+        await renderProjectCollaborationPanels(currentProjectState, { includeExtended: false });
       }
       return true;
+    }
+
+    async function renderProjectCollaborationPanels(state, options = {}) {
+      if (!state) return;
+      const includeExtended = options.includeExtended === true;
+      projectMembersDomainRuntime?.renderProjectRoleSelectors?.(state);
+      await projectMembersDomainRuntime?.renderProjectMembers?.(state);
+      projectMembersDomainRuntime?.renderProjectInvitations?.(state);
+      projectMembersDomainRuntime?.renderProjectPermissionMatrix?.(state);
+      if (!includeExtended) return;
+      await projectMembersDomainRuntime?.renderProjectUserGroups?.(state);
+      await projectMembersDomainRuntime?.renderProjectGroups?.(state);
+      projectMembersDomainRuntime?.renderProjectThemes?.(state);
     }
 
     async function createProjectRoleFromSettings() {
@@ -6153,9 +6331,7 @@
       if (roleNameInput) roleNameInput.disabled = !canManageBranding;
       if (roleBaseInput) roleBaseInput.disabled = !canManageBranding;
       if (roleAddBtn) roleAddBtn.disabled = !canManageBranding;
-      if (viaAnnuaireUiRuntime?.renderViaAnnuaireSettingsPanel) {
-        await viaAnnuaireUiRuntime.renderViaAnnuaireSettingsPanel({ canManageBranding });
-      }
+      await viaAnnuaireUiRuntime?.renderViaAnnuaireSettingsPanel?.({ canManageBranding });
       if (appAdminBadge) {
         appAdminBadge.textContent = canManageBranding
           ? `Role: Admin application (${adminName})`
@@ -6499,18 +6675,12 @@
     }
 
     function matchesQuery(fields, query) {
-      if (!query) return true;
-      const needle = normalizeSearch(query);
-      return fields
-        .filter(v => v !== null && v !== undefined)
-        .some(v => normalizeSearch(v).includes(needle));
+      return coreMatchesQuery(fields, query);
     }
 
     function setActiveSidebarNav(navKey) {
-      if (shellUiRuntime?.setActiveSidebarNav) {
-        shellUiRuntime.setActiveSidebarNav(navKey);
-        return;
-      }
+      const setActiveNav = shellUiRuntime?.setActiveSidebarNav;
+      if (setActiveNav) return setActiveNav(navKey);
       const links = {
         dashboard: document.getElementById('nav-dashboard'),
         projects: document.getElementById('nav-projects'),
@@ -6535,9 +6705,8 @@
     }
 
     function normalizeWorkflowSidebarGroup(rawGroup) {
-      if (shellUiRuntime?.normalizeWorkflowSidebarGroup) {
-        return shellUiRuntime.normalizeWorkflowSidebarGroup(rawGroup);
-      }
+      const normalizeGroup = shellUiRuntime?.normalizeWorkflowSidebarGroup;
+      if (normalizeGroup) return normalizeGroup(rawGroup);
       const group = String(rawGroup || '').trim().toLowerCase();
       if (group === 'structure' || group === 'processes' || group === 'pilotage' || group === 'referentiels' || group === 'supervision') {
         return group;
@@ -6546,9 +6715,8 @@
     }
 
     function setWorkflowSidebarSubnavOpen(nextOpen) {
-      if (shellUiRuntime?.setWorkflowSidebarSubnavOpen) {
-        return shellUiRuntime.setWorkflowSidebarSubnavOpen(nextOpen);
-      }
+      const setSubnavOpen = shellUiRuntime?.setWorkflowSidebarSubnavOpen;
+      if (setSubnavOpen) return setSubnavOpen(nextOpen);
       const isOpen = !!nextOpen;
       const panel = document.getElementById('workflow-sidebar-subnav');
       const btn = document.getElementById('nav-workflow-subnav-toggle');
@@ -6565,9 +6733,8 @@
     }
 
     function setActiveWorkflowSidebarGroup(rawGroup) {
-      if (shellUiRuntime?.setActiveWorkflowSidebarGroup) {
-        return shellUiRuntime.setActiveWorkflowSidebarGroup(rawGroup);
-      }
+      const setActiveGroup = shellUiRuntime?.setActiveWorkflowSidebarGroup;
+      if (setActiveGroup) return setActiveGroup(rawGroup);
       const group = normalizeWorkflowSidebarGroup(rawGroup);
       const links = {
         structure: document.getElementById('nav-workflow-group-structure'),
@@ -6601,7 +6768,9 @@
         applyLiveSearchFilter();
         return;
       }
-      await renderProjects();
+      if (isProjectsListViewActive()) {
+        await renderProjects();
+      }
     }
 
     function applyLiveSearchFilter() {
@@ -6772,7 +6941,7 @@
         return;
       }
       if (item.action === 'open-global-post') {
-        await openGlobalFeedPost(item.postId);
+        await globalFeedRuntime?.openGlobalFeedPost?.(item.postId);
       }
     }
 
@@ -7291,7 +7460,7 @@
         }
       }
       if (notif.targetType === 'global-post' && notif.targetId) {
-        await openGlobalFeedPost(notif.targetId);
+        await globalFeedRuntime?.openGlobalFeedPost?.(notif.targetId);
       }
       toggleNotificationsPanel(false);
     }
@@ -7782,9 +7951,8 @@
     }
 
     async function syncViaAnnuaireDepartmentsFromApi(options = {}) {
-      if (viaAnnuaireUiRuntime?.syncViaAnnuaireDepartmentsFromApi) {
-        return viaAnnuaireUiRuntime.syncViaAnnuaireDepartmentsFromApi(options);
-      }
+      const syncDepartments = viaAnnuaireUiRuntime?.syncViaAnnuaireDepartmentsFromApi;
+      if (syncDepartments) return syncDepartments(options);
       const silent = !!options.silent;
       if (!silent) showToast('Sync départements dégradée: module annuaire indisponible, fallback local appliqué');
       return VIA_ANNUAIRE_FALLBACK_DEPARTEMENTS;
@@ -7912,10 +8080,6 @@
       return coreIsViaAnnuaireDomainMatch(item, domain);
     }
 
-    function escapeOdsWhereValue(value) {
-      return String(value || '').replace(/"/g, '\\"');
-    }
-
     function getTaskCompletionTimestamp(task) {
       if (!task) return 0;
       const candidates = [
@@ -8016,7 +8180,7 @@
             showToast(`Archivage auto: ${archivedTotal} tâche(s) terminée(s) archivées`);
           }
           await refreshStats();
-          if (workspaceMode === 'global' && globalWorkspaceView === 'tasks') {
+          if (isGlobalTasksViewActive()) {
             await renderGlobalTasks();
           }
           if (workspaceMode === 'project' && currentProjectId) {
@@ -8072,7 +8236,7 @@
       // Si on est dans la vue détaillée de ce projet, la rafraîchir
       if (currentProjectId === projectId) {
         await showProjectDetail(projectId);
-      } else {
+      } else if (isProjectsListViewActive()) {
         await renderProjects();
         applyLiveSearchFilter();
       }
@@ -8694,6 +8858,15 @@
     }
 
     async function renderProjects() {
+      const renderProjectsStartedAt = (typeof performance !== 'undefined' && typeof performance.now === 'function')
+        ? performance.now()
+        : Date.now();
+      const logRenderProjectsPerf = (meta = {}) => {
+        const renderProjectsFinishedAt = (typeof performance !== 'undefined' && typeof performance.now === 'function')
+          ? performance.now()
+          : Date.now();
+        debugLog('[perf] renderProjects(ms)=', Math.round((renderProjectsFinishedAt - renderProjectsStartedAt) * 100) / 100, meta);
+      };
       if (window.TaskMDACrypto && typeof window.TaskMDACrypto.isUnlocked === 'function' && !window.TaskMDACrypto.isUnlocked()) {
         return;
       }
@@ -8882,6 +9055,7 @@
         }
         await renderDashboardNews();
         if (isStale()) return;
+        logRenderProjectsPerf({ reason: 'empty-all', totalProjects: 0, viewMode: projectsViewMode });
         return;
       }
 
@@ -8891,6 +9065,7 @@
         container.innerHTML = '<p class="text-slate-500 text-center py-8">Aucun projet ne correspond à la recherche</p>';
         await renderDashboardNews();
         if (isStale()) return;
+        logRenderProjectsPerf({ reason: 'empty-filtered', totalProjects: sortedProjects.length, viewMode: projectsViewMode });
         return;
       }
 
@@ -8908,6 +9083,7 @@
         if (paginationContainer) paginationContainer.innerHTML = '';
         await renderDashboardNews();
         if (isStale()) return;
+        logRenderProjectsPerf({ reason: 'carousel', totalProjects: sortedProjects.length, viewMode: projectsViewMode });
         return;
       } else {
         if (carousel) carousel.classList.add('hidden');
@@ -9058,6 +9234,13 @@
       }).join('');
       renderPagination('projects-pagination', pagination, 'setProjectsPage', 'projets');
       await renderDashboardNews();
+      logRenderProjectsPerf({
+        reason: 'list',
+        totalProjects: sortedProjects.length,
+        pageItems: pagination.pageItems.length,
+        currentPage: pagination.currentPage,
+        viewMode: projectsViewMode
+      });
     }
 
     let currentProjectId = null;
@@ -9065,6 +9248,132 @@
     let currentProjectEvents = [];
     let workspaceMode = 'dashboard'; // dashboard | project | global
     let globalWorkspaceView = 'tasks'; // tasks | workflow | calendar | docs | notes | messages | feed | rgpd | settings
+    const GLOBAL_FEED_READ_MODEL_TTL_MS = 1200;
+    let globalFeedReadModelCache = {
+      key: '',
+      expiresAt: 0,
+      scope: null
+    };
+    function isGlobalFeedViewActive() {
+      return workspaceMode === 'global' && globalWorkspaceView === 'feed';
+    }
+    function isGlobalTasksViewActive() {
+      return workspaceMode === 'global' && globalWorkspaceView === 'tasks';
+    }
+    function isProjectsListViewActive() {
+      return workspaceMode === 'dashboard' || (workspaceMode === 'project' && !currentProjectId);
+    }
+    function getProjectStatusChipHtml(statusValue = 'en-cours') {
+      const status = String(statusValue || 'en-cours');
+      if (status === 'urgent') return '<span class="workspace-chip workspace-chip-status-urgent">Urgent</span>';
+      if (status === 'termine') return '<span class="workspace-chip workspace-chip-status-termine">Termine</span>';
+      if (status === 'planifie') return '<span class="workspace-chip workspace-chip-status-planifie">Planifie</span>';
+      return '<span class="workspace-chip workspace-chip-status-active">En cours</span>';
+    }
+    function getProjectStatusProgressClass(statusValue = 'en-cours') {
+      const status = String(statusValue || 'en-cours');
+      if (status === 'urgent') return 'bg-red-500 w-[82%]';
+      if (status === 'termine') return 'bg-emerald-500 w-full';
+      if (status === 'planifie') return 'bg-amber-500 w-[28%]';
+      return 'bg-primary w-[58%]';
+    }
+    function tryPatchProjectCardStatusIncremental(projectId, nextStatus = 'en-cours') {
+      if (!isProjectsListViewActive()) return false;
+      const pid = String(projectId || '').trim();
+      if (!pid) return false;
+      const cardSelectorValue = window.CSS?.escape ? window.CSS.escape(pid) : pid.replace(/"/g, '\\"');
+      const card = document.querySelector(`#projects-container [data-project-card-id="${cardSelectorValue}"]`);
+      if (!card) return false;
+      const status = String(nextStatus || 'en-cours');
+      const badgesHost = card.querySelector('.project-card-badges-meta');
+      if (badgesHost) {
+        const previousStatusChip = badgesHost.querySelector('.workspace-chip-status-urgent, .workspace-chip-status-termine, .workspace-chip-status-planifie, .workspace-chip-status-active');
+        if (previousStatusChip) {
+          previousStatusChip.outerHTML = getProjectStatusChipHtml(status);
+        } else {
+          badgesHost.insertAdjacentHTML('beforeend', getProjectStatusChipHtml(status));
+        }
+      }
+      const progressFill = card.querySelector('.project-progress-fill');
+      if (progressFill) {
+        progressFill.className = `project-progress-fill ${getProjectStatusProgressClass(status)}`;
+      }
+      const statusLabel = card.querySelector('.project-status-label');
+      if (statusLabel) {
+        statusLabel.textContent = status;
+      }
+      if (status === 'termine') {
+        const markDoneBtn = card.querySelector('.card-hover-actions button[onclick*="markProjectDoneFromDashboard"]');
+        markDoneBtn?.remove();
+      }
+      return true;
+    }
+    function tryRemoveProjectCardIncremental(projectId) {
+      if (!isProjectsListViewActive()) return false;
+      const pid = String(projectId || '').trim();
+      if (!pid) return false;
+      const cardSelectorValue = window.CSS?.escape ? window.CSS.escape(pid) : pid.replace(/"/g, '\\"');
+      const card = document.querySelector(`#projects-container [data-project-card-id="${cardSelectorValue}"]`);
+      if (!card) return false;
+      card.remove();
+      updateProjectsBulkDeleteUi();
+      const remainingCards = document.querySelectorAll('#projects-container [data-project-card-id]');
+      if (remainingCards.length === 0) return false;
+      return true;
+    }
+    function tryRemoveProjectCardsIncremental(projectIds = []) {
+      if (!isProjectsListViewActive()) return false;
+      const ids = Array.isArray(projectIds)
+        ? projectIds.map((id) => String(id || '').trim()).filter(Boolean)
+        : [];
+      if (ids.length === 0) return false;
+      let removedCount = 0;
+      ids.forEach((pid) => {
+        const cardSelectorValue = window.CSS?.escape ? window.CSS.escape(pid) : pid.replace(/"/g, '\\"');
+        const card = document.querySelector(`#projects-container [data-project-card-id="${cardSelectorValue}"]`);
+        if (!card) return;
+        card.remove();
+        removedCount += 1;
+      });
+      updateProjectsBulkDeleteUi();
+      if (removedCount !== ids.length) return false;
+      const remainingCards = document.querySelectorAll('#projects-container [data-project-card-id]');
+      if (remainingCards.length === 0) return false;
+      return true;
+    }
+    function buildGlobalFeedReadModelKey() {
+      return [
+        String(globalFeedFilterMode || 'all'),
+        String(globalFeedSortMode || 'desc'),
+        String(currentUser?.userId || '')
+      ].join('|');
+    }
+    function invalidateGlobalFeedReadModel() {
+      globalFeedReadModelCache = {
+        key: '',
+        expiresAt: 0,
+        scope: null
+      };
+    }
+    async function getGlobalFeedRenderScopeCached(prepareScope) {
+      if (typeof prepareScope !== 'function') return null;
+      const now = Date.now();
+      const key = buildGlobalFeedReadModelKey();
+      if (
+        globalFeedReadModelCache.scope
+        && globalFeedReadModelCache.key === key
+        && now <= Number(globalFeedReadModelCache.expiresAt || 0)
+      ) {
+        return globalFeedReadModelCache.scope;
+      }
+      const scope = await prepareScope();
+      globalFeedReadModelCache = {
+        key,
+        expiresAt: now + GLOBAL_FEED_READ_MODEL_TTL_MS,
+        scope
+      };
+      return scope;
+    }
     let workflowRuntime = null;
     let globalSettingsTab = localStorage.getItem('taskmda_global_settings_tab') || 'branding'; // branding | themes | groups | roles | annuaire | file-watcher | email | quick-links | views
     let globalSettingsHelpOpen = false;
@@ -9286,12 +9595,38 @@
     let knownWorkflowChangeIds = new Set();
     let globalMessageSharedDeleteQueue = Promise.resolve();
     let workflowSharedWriteQueue = Promise.resolve();
+    const globalMessageSharedQueueMetrics = {
+      enqueued: 0,
+      synced: 0,
+      retried: 0,
+      dropped: 0
+    };
+    const globalMessageSharedQueuedIds = new Set();
+    const workflowSharedQueueMetrics = {
+      enqueued: 0,
+      synced: 0,
+      retried: 0,
+      dropped: 0
+    };
+    const workflowSharedQueuedChangeIds = new Set();
     let globalFeedFocusPostId = '';
     let globalFeedFilterMode = 'all'; // all | auto | manual | mentions | project-refs | task-refs
     let globalFeedSortMode = 'desc'; // desc | asc
     let globalFeedMentionCatalogCache = null;
     let globalFeedComposerCollapsed = true;
     let globalFeedDigestViewMode = String(localStorage.getItem(GLOBAL_FEED_DIGEST_VIEW_STORAGE_KEY) || '').trim().toLowerCase() === 'full' ? 'full' : 'compact';
+    const GLOBAL_NOTES_READ_MODEL_TTL_MS = 1200;
+    let globalNotesReadModelCache = {
+      list: null,
+      byId: new Map(),
+      expiresAt: 0
+    };
+    const GLOBAL_DOCS_READ_MODEL_TTL_MS = 1200;
+    let globalDocsReadModelCache = {
+      list: null,
+      byId: new Map(),
+      expiresAt: 0
+    };
     const GLOBAL_MESSAGE_READ_STORAGE_KEY = 'taskmda_global_message_reads_v1';
     let globalMessageReadMap = loadGlobalMessageReadMap();
     let globalMessageHiddenGroupChannels = loadGlobalMessageHiddenGroupChannels();
@@ -9310,6 +9645,102 @@
     const TASK_COMPLETION_FX_QUEUE_TTL_MS = 16000;
     let draggedGlobalTaskRef = null;
     let projectKanbanPageByStatus = { todo: 1, 'en-cours': 1, suspendu: 1, termine: 1 };
+
+    function invalidateGlobalNotesReadModel() {
+      globalNotesReadModelCache = {
+        list: null,
+        byId: new Map(),
+        expiresAt: 0
+      };
+    }
+
+    async function getAllGlobalNotesCached() {
+      const now = Date.now();
+      if (Array.isArray(globalNotesReadModelCache.list) && now <= Number(globalNotesReadModelCache.expiresAt || 0)) {
+        return globalNotesReadModelCache.list;
+      }
+      const notes = await getAllDecrypted('globalNotes', 'noteId');
+      const safeNotes = Array.isArray(notes) ? notes : [];
+      const byId = new Map();
+      safeNotes.forEach((note) => {
+        const id = String(note?.noteId || '').trim();
+        if (id) byId.set(id, note);
+      });
+      globalNotesReadModelCache = {
+        list: safeNotes,
+        byId,
+        expiresAt: now + GLOBAL_NOTES_READ_MODEL_TTL_MS
+      };
+      return safeNotes;
+    }
+
+    async function getGlobalNoteByIdCached(noteId = '') {
+      const id = String(noteId || '').trim();
+      if (!id) return null;
+      const now = Date.now();
+      if (now <= Number(globalNotesReadModelCache.expiresAt || 0) && globalNotesReadModelCache.byId.has(id)) {
+        return globalNotesReadModelCache.byId.get(id) || null;
+      }
+      const note = await getDecrypted('globalNotes', id, 'noteId');
+      if (note && now <= Number(globalNotesReadModelCache.expiresAt || 0)) {
+        globalNotesReadModelCache.byId.set(id, note);
+      }
+      return note || null;
+    }
+
+    async function putGlobalNoteCached(note) {
+      const saved = await putEncrypted('globalNotes', note, 'noteId');
+      invalidateGlobalNotesReadModel();
+      return saved;
+    }
+
+    async function deleteGlobalNoteByIdCached(noteId = '') {
+      const deleted = await deleteFromStore('globalNotes', noteId);
+      invalidateGlobalNotesReadModel();
+      return deleted;
+    }
+
+    function invalidateGlobalDocsReadModel() {
+      globalDocsReadModelCache = {
+        list: null,
+        byId: new Map(),
+        expiresAt: 0
+      };
+    }
+
+    async function getAllGlobalDocsCached() {
+      const now = Date.now();
+      if (Array.isArray(globalDocsReadModelCache.list) && now <= Number(globalDocsReadModelCache.expiresAt || 0)) {
+        return globalDocsReadModelCache.list;
+      }
+      const docs = await getAllDecrypted('globalDocs', 'id');
+      const safeDocs = Array.isArray(docs) ? docs : [];
+      const byId = new Map();
+      safeDocs.forEach((doc) => {
+        const id = String(doc?.id || '').trim();
+        if (id) byId.set(id, doc);
+      });
+      globalDocsReadModelCache = {
+        list: safeDocs,
+        byId,
+        expiresAt: now + GLOBAL_DOCS_READ_MODEL_TTL_MS
+      };
+      return safeDocs;
+    }
+
+    async function getGlobalDocByIdCached(docId = '') {
+      const id = String(docId || '').trim();
+      if (!id) return null;
+      const now = Date.now();
+      if (now <= Number(globalDocsReadModelCache.expiresAt || 0) && globalDocsReadModelCache.byId.has(id)) {
+        return globalDocsReadModelCache.byId.get(id) || null;
+      }
+      const doc = await getDecrypted('globalDocs', id, 'id');
+      if (doc && now <= Number(globalDocsReadModelCache.expiresAt || 0)) {
+        globalDocsReadModelCache.byId.set(id, doc);
+      }
+      return doc || null;
+    }
     let globalKanbanPageByStatus = { todo: 1, 'en-cours': 1, suspendu: 1, termine: 1 };
     let currentGlobalTaskDetailRef = '';
     let currentGlobalTaskDetailContext = null;
@@ -9643,12 +10074,6 @@
       return normalized;
     }
 
-    function isProjectResourceLockedByOther(state, resourceType, resourceId, userId = currentUser?.userId) {
-      const lock = getProjectResourceLock(state, resourceType, resourceId);
-      if (!lock) return false;
-      return String(lock.ownerUserId || '') !== String(userId || '');
-    }
-
     function formatLockOwner(lock) {
       if (!lock) return 'Un autre utilisateur';
       const name = String(lock.ownerName || '').trim();
@@ -9793,10 +10218,7 @@
     }
 
     function formatDate(dateValue) {
-      if (!dateValue) return 'Non définie';
-      const date = new Date(dateValue);
-      if (Number.isNaN(date.getTime())) return 'Non définie';
-      return date.toLocaleDateString('fr-FR');
+      return coreFormatDate(dateValue);
     }
 
     function normalizeDeadlineMode(value, fallback = 'date') {
@@ -10447,11 +10869,7 @@
     }
 
     function sharingModeBadge(mode) {
-      const normalized = normalizeSharingMode(mode, 'private');
-      if (normalized === 'shared') {
-        return '<span class="text-[10px] px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 font-semibold">Collaborative</span>';
-      }
-      return '<span class="text-[10px] px-2 py-1 rounded-full bg-slate-100 text-slate-700 font-semibold">Privée</span>';
+      return coreSharingModeBadge(mode);
     }
 
     function toYmd(date) {
@@ -10645,6 +11063,7 @@ async function setProjectsPage(page) {
 
       let deleted = 0;
       let skipped = 0;
+      const deletedProjectIds = [];
       for (const projectId of projectIds) {
         const state = await getProjectState(projectId);
         if (!state?.project || !canDeleteProjectMeta(state)) {
@@ -10666,6 +11085,7 @@ async function setProjectsPage(page) {
           void syncProjectEventsToSharedSpace(projectId, [event], { ensureRegistered: true });
         }
         deleted += 1;
+        deletedProjectIds.push(projectId);
       }
 
       if (workspaceMode === 'project' && currentProjectId && selectedProjectIdsForBulkDelete.has(currentProjectId)) {
@@ -10675,7 +11095,12 @@ async function setProjectsPage(page) {
       projectsBulkSelectionMode = false;
       updateProjectsBulkDeleteUi();
       await refreshStats();
-      await renderProjects();
+      if (isProjectsListViewActive()) {
+        const patched = tryRemoveProjectCardsIncremental(deletedProjectIds);
+        if (!patched) {
+          await renderProjects();
+        }
+      }
       applyLiveSearchFilter();
       showToast(`Suppression en masse: ${deleted} projet(s) supprimé(s)${skipped > 0 ? `, ${skipped} ignoré(s)` : ''}`);
     }
@@ -11703,6 +12128,10 @@ async function setProjectsPage(page) {
     }
 
     function setProjectSettingsTab(tabKey) {
+      if (projectMembersDomainRuntime?.setProjectSettingsTab) {
+        projectMembersDomainRuntime.setProjectSettingsTab(tabKey);
+        return;
+      }
       const allowed = new Set(['overview', 'members', 'collab', 'themes', 'permissions', 'structure']);
       const next = allowed.has(String(tabKey || '')) ? String(tabKey) : 'members';
       projectSettingsTab = next;
@@ -12142,21 +12571,6 @@ async function setProjectsPage(page) {
           onClick();
         };
       });
-    }
-
-    async function renderMemberDirectoryAutocomplete(state) {
-      const input = document.getElementById('member-name-input');
-      const list = document.getElementById('member-name-options');
-      if (!input || !list) return;
-      const directoryUsers = await getAllDecrypted('directoryUsers', 'userId');
-      const existingMemberIds = new Set((state?.members || []).map(m => m.userId));
-      const names = Array.from(new Set(
-        (directoryUsers || [])
-          .filter(u => u && u.userId && !existingMemberIds.has(u.userId))
-          .map(u => String(u.name || '').trim())
-          .filter(Boolean)
-      )).sort((a, b) => a.localeCompare(b, 'fr'));
-      list.innerHTML = names.map(name => `<option value="${escapeHtml(name)}"></option>`).join('');
     }
 
     async function refreshTaskAssigneeOptions(state, selectedUserId = '', selectedName = '') {
@@ -12814,7 +13228,7 @@ async function setProjectsPage(page) {
         await publishEvent(event);
         if (sharedFolderHandle) { void syncProjectEventsToSharedSpace(currentProjectId, [event]); }
         await syncProjectNoteGlobalFeed(currentProjectId, note.noteId);
-        if (workspaceMode === 'global' && globalWorkspaceView === 'feed') {
+        if (isGlobalFeedViewActive()) {
           await renderGlobalFeed();
         }
         currentProjectState = await getProjectState(currentProjectId);
@@ -13129,7 +13543,10 @@ async function setProjectsPage(page) {
       const tags = Array.isArray(note?.tags)
         ? Array.from(new Set(note.tags.map((tag) => String(tag || '').trim()).filter(Boolean)))
         : [];
-      return tags.length > 0 ? tags : ['Sans thematique'];
+      if (tags.length > 0) return tags;
+      const theme = String(note?.theme || '').trim();
+      if (theme) return [theme];
+      return ['Sans thematique'];
     }
 
     /** Même règle que `TaskMDAGlobalNotesFiltersUI` : tags prioritaires, sinon `theme`, sinon seau unique. */
@@ -13387,6 +13804,8 @@ async function setProjectsPage(page) {
       }
       editingProjectNoteId = note ? String(note.noteId || '') : '';
       const titleInput = document.getElementById('project-note-title');
+      const themeInput = document.getElementById('project-note-theme');
+      const themeKnownSelect = document.getElementById('project-note-theme-known');
       const tagsInput = document.getElementById('project-note-tags');
       const pinnedInput = document.getElementById('project-note-pinned');
       const shareInput = document.getElementById('project-note-share-feed');
@@ -13398,6 +13817,8 @@ async function setProjectsPage(page) {
           modalTitle: note ? 'Modifier la note' : 'Nouvelle note',
           titleInputId: 'project-note-title',
           title: String(note?.title || ''),
+          themeInputId: 'project-note-theme',
+          theme: String(note?.theme || ''),
           tagsInputId: 'project-note-tags',
           tags: stringifyProjectNoteTags(note?.tags || []),
           visibilityInputId: 'project-note-pinned',
@@ -13408,6 +13829,8 @@ async function setProjectsPage(page) {
         });
       } else {
         if (titleInput) titleInput.value = String(note?.title || '');
+        if (themeInput) themeInput.value = String(note?.theme || '');
+        if (themeKnownSelect) themeKnownSelect.value = '';
         if (tagsInput) tagsInput.value = stringifyProjectNoteTags(note?.tags || []);
         if (pinnedInput) pinnedInput.checked = Number(note?.pinnedAt || 0) > 0;
         if (shareInput) shareInput.checked = note?.shareToGlobalFeed === true;
@@ -13418,8 +13841,22 @@ async function setProjectsPage(page) {
         String(note?.contentHtml || '').trim() || plainTextToRichHtml(String(note?.content || '').trim())
       );
       if (attachmentsInput) attachmentsInput.value = '';
+      void refreshProjectNoteThemePicker(state);
+      syncThemePickerSelectionFromInput('project-note-theme-known', 'project-note-theme');
+      if (themeInput && !themeInput.dataset.projectNoteThemeInputBound) {
+        themeInput.dataset.projectNoteThemeInputBound = '1';
+        themeInput.addEventListener('input', () => {
+          syncThemePickerSelectionFromInput('project-note-theme-known', 'project-note-theme');
+        });
+      }
+      if (themeKnownSelect && !themeKnownSelect.dataset.projectNoteThemeKnownBound) {
+        themeKnownSelect.dataset.projectNoteThemeKnownBound = '1';
+        themeKnownSelect.addEventListener('change', () => {
+          syncThemePickerInputFromSelection('project-note-theme-known', 'project-note-theme');
+          scheduleProjectNoteDraftSave();
+        });
+      }
       pendingLinkedProjectNoteDocs = [];
-      refreshLinkedPendingSummaries();
       refreshLinkedPendingSummaries();
       updateProjectNoteAttachmentFilesSummary();
       populateProjectNoteTaskOptions(state, Array.isArray(note?.linkedTaskIds) ? (note.linkedTaskIds[0] || '') : '');
@@ -13431,8 +13868,9 @@ async function setProjectsPage(page) {
       document.body.classList.add('overflow-hidden');
       if (!note) {
         const existingDraft = loadProjectNoteDraft(currentProjectId, '');
-        if (existingDraft && (existingDraft.title || existingDraft.content || (existingDraft.tags || []).length)) {
+        if (existingDraft && (existingDraft.title || existingDraft.theme || existingDraft.content || (existingDraft.tags || []).length)) {
           if (titleInput && !titleInput.value) titleInput.value = String(existingDraft.title || '');
+          if (themeInput && !themeInput.value) themeInput.value = String(existingDraft.theme || '');
           if (tagsInput && !tagsInput.value) tagsInput.value = stringifyProjectNoteTags(existingDraft.tags || []);
           if (pinnedInput) pinnedInput.checked = !!existingDraft.pinnedAt;
           if (shareInput) shareInput.checked = existingDraft.shareToGlobalFeed === true;
@@ -13451,6 +13889,7 @@ async function setProjectsPage(page) {
       } else {
         updateProjectNoteDraftStatus('Édition en cours');
       }
+      syncThemePickerSelectionFromInput('project-note-theme-known', 'project-note-theme');
       requestAnimationFrame(() => {
         titleInput?.focus();
       });
@@ -13464,7 +13903,7 @@ async function setProjectsPage(page) {
       const preserveDraft = options?.preserveDraft !== false;
       if (preserveDraft && currentProjectId) {
         const draftSnapshot = readProjectNoteEditorDraft();
-        if (draftSnapshot.title || draftSnapshot.content || (draftSnapshot.tags || []).length) {
+        if (draftSnapshot.title || draftSnapshot.theme || draftSnapshot.content || (draftSnapshot.tags || []).length) {
           saveProjectNoteDraft(draftSnapshot);
           updateProjectNoteDraftStatus(`Brouillon enregistré à ${new Date().toLocaleTimeString('fr-FR')}`);
         }
@@ -13475,6 +13914,8 @@ async function setProjectsPage(page) {
         document.body.classList.remove('overflow-hidden');
       }
       const titleInput = document.getElementById('project-note-title');
+      const themeInput = document.getElementById('project-note-theme');
+      const themeKnownSelect = document.getElementById('project-note-theme-known');
       const tagsInput = document.getElementById('project-note-tags');
       const pinnedInput = document.getElementById('project-note-pinned');
       const shareInput = document.getElementById('project-note-share-feed');
@@ -13491,6 +13932,8 @@ async function setProjectsPage(page) {
           modalTitle: 'Nouvelle note',
           titleInputId: 'project-note-title',
           title: '',
+          themeInputId: 'project-note-theme',
+          theme: '',
           tagsInputId: 'project-note-tags',
           tags: '',
           visibilityInputId: 'project-note-pinned',
@@ -13504,6 +13947,8 @@ async function setProjectsPage(page) {
       }
       setProjectDescriptionEditorContent('project-note-content-editor', 'project-note-content', '');
       if (!notesShared?.applyEditorForm) {
+        if (themeInput) themeInput.value = '';
+        if (themeKnownSelect) themeKnownSelect.value = '';
         if (tagsInput) tagsInput.value = '';
         if (pinnedInput) pinnedInput.checked = false;
         if (shareInput) shareInput.checked = false;
@@ -13511,7 +13956,6 @@ async function setProjectsPage(page) {
       if (taskSelect) taskSelect.value = '';
       if (attachmentsInput) attachmentsInput.value = '';
       pendingLinkedProjectNoteDocs = [];
-      refreshLinkedPendingSummaries();
       refreshLinkedPendingSummaries();
       updateProjectNoteAttachmentFilesSummary();
       setProjectNoteSaveButtonLabel('Enregistrer la note');
@@ -13530,6 +13974,7 @@ async function setProjectsPage(page) {
 
     function readProjectNoteEditorDraft() {
       const title = String(document.getElementById('project-note-title')?.value || '').trim();
+      const theme = String(document.getElementById('project-note-theme')?.value || '').trim();
       const contentHtml = getProjectDescriptionHtmlForStorage('project-note-content-editor', 'project-note-content');
       const content = getProjectDescriptionPlainText(contentHtml);
       const tags = normalizeProjectNoteTags(document.getElementById('project-note-tags')?.value || '');
@@ -13538,6 +13983,7 @@ async function setProjectsPage(page) {
       const shareToGlobalFeed = !!document.getElementById('project-note-share-feed')?.checked;
       return {
         title,
+        theme,
         content,
         contentHtml,
         tags,
@@ -13549,10 +13995,12 @@ async function setProjectsPage(page) {
 
     function ensureProjectNoteDraftAutosaveBindings() {
       const modal = document.getElementById('modal-project-note');
-      if (!modal || modal.dataset.noteAutosaveBound === '1') return;
-      modal.dataset.noteAutosaveBound = '1';
+      if (!modal || modal.dataset.projectNoteAutosaveBound === '1') return;
+      modal.dataset.projectNoteAutosaveBound = '1';
       const fieldIds = [
         'project-note-title',
+        'project-note-theme',
+        'project-note-theme-known',
         'project-note-tags',
         'project-note-linked-task',
         'project-note-pinned',
@@ -13574,8 +14022,8 @@ async function setProjectsPage(page) {
         quill.__projectNoteDraftBound = true;
       } else {
         const fallbackEditor = document.getElementById(noteEditorId);
-        if (fallbackEditor && fallbackEditor.dataset.noteDraftBound !== '1') {
-          fallbackEditor.dataset.noteDraftBound = '1';
+        if (fallbackEditor && fallbackEditor.dataset.projectNoteDraftBound !== '1') {
+          fallbackEditor.dataset.projectNoteDraftBound = '1';
           fallbackEditor.addEventListener('input', () => scheduleProjectNoteDraftSave());
         }
       }
@@ -13625,6 +14073,7 @@ async function setProjectsPage(page) {
         deletedAt: null
       };
       await putEncrypted('globalPosts', post, 'postId');
+      invalidateGlobalFeedReadModel();
       knownGlobalPostIds.add(post.postId);
       if (sharedFolderHandle) {
         await writeGlobalFeedPostToSharedFolder(post);
@@ -13638,6 +14087,7 @@ async function setProjectsPage(page) {
       existing.deletedAt = Date.now();
       existing.updatedAt = Date.now();
       await putEncrypted('globalPosts', existing, 'postId');
+      invalidateGlobalFeedReadModel();
       if (sharedFolderHandle) {
         await writeGlobalFeedPostToSharedFolder(existing);
       }
@@ -13667,7 +14117,7 @@ async function setProjectsPage(page) {
         return;
       }
       const draft = readProjectNoteEditorDraft();
-      const noteTheme = String((Array.isArray(draft.tags) && draft.tags.length > 0 ? draft.tags[0] : 'General') || 'General').trim() || 'General';
+      const noteTheme = String(draft.theme || (Array.isArray(draft.tags) && draft.tags.length > 0 ? draft.tags[0] : 'General') || 'General').trim() || 'General';
       const noteAttachmentDocs = await readDocumentFilesFromInput('project-note-attachments', {
         projectId: currentProjectId,
         scope: 'project',
@@ -13693,6 +14143,7 @@ async function setProjectsPage(page) {
             noteId,
             changes: {
               title: draft.title,
+              theme: String(draft.theme || '').trim(),
               content: draft.content,
               contentHtml: draft.contentHtml,
               tags: draft.tags,
@@ -13705,6 +14156,7 @@ async function setProjectsPage(page) {
         : {
             noteId,
             title: draft.title,
+            theme: String(draft.theme || '').trim(),
             content: draft.content,
             contentHtml: draft.contentHtml,
             tags: draft.tags,
@@ -13751,7 +14203,7 @@ async function setProjectsPage(page) {
       saveProjectNoteDraft(null, currentProjectId, existing ? existing.noteId : '');
       saveProjectNoteDraft(null, currentProjectId, '');
       await syncProjectNoteGlobalFeed(currentProjectId, noteId);
-      if (workspaceMode === 'global' && globalWorkspaceView === 'feed') {
+      if (isGlobalFeedViewActive()) {
         await renderGlobalFeed();
       }
       closeProjectNoteEditor({ preserveDraft: false });
@@ -13778,55 +14230,39 @@ async function setProjectsPage(page) {
     }
 
     function renderProjectNotes(state = currentProjectState) {
-      ensureProjectNotesVerticalThemeLayout();
       const listEl = document.getElementById('project-notes-list');
       const counterEl = document.getElementById('project-notes-count');
       if (!listEl || !state?.project) return;
+      if (!isProjectNotesViewActive()) {
+        // Rendu differe: on garde les options de liaison a jour sans recalculer la liste.
+        populateProjectNoteTaskOptions(state);
+        return;
+      }
+      ensureProjectNotesVerticalThemeLayout();
       const notesAll = getProjectNotesForState(state);
       renderProjectNotesThemeTabs(notesAll);
-      const notes = projectNotesThemeFilter === 'all'
-        ? notesAll
-        : notesAll.filter((note) => getProjectNoteThemeLabels(note)
-          .some((label) => normalizeProjectNoteThemeKey(label) === projectNotesThemeFilter));
-      const taskTitleById = new Map((state.tasks || []).map((task) => [String(task.taskId || ''), String(task.title || 'Tâche')]));
-      const noteDocsCountById = new Map();
-      (state.documents || []).forEach((doc) => {
-        const noteIds = Array.isArray(doc?.linkedNoteIds) ? doc.linkedNoteIds : [];
-        noteIds.forEach((noteId) => {
-          const key = String(noteId || '').trim();
-          if (!key) return;
-          noteDocsCountById.set(key, Number(noteDocsCountById.get(key) || 0) + 1);
-        });
-      });
-      const authorById = new Map();
-      (state.members || []).forEach((member) => {
-        const userId = String(member?.userId || '').trim();
-        if (!userId) return;
-        const identity = resolveKnownUserIdentity(userId, member.displayName || fallbackDirectoryName(userId));
-        authorById.set(userId, String(identity?.name || member.displayName || fallbackDirectoryName(userId)));
-      });
-      authorById.set(String(currentUser?.userId || ''), String(currentUser?.name || 'Moi'));
-      const canManageById = new Map(notes.map((note) => [String(note.noteId || ''), canManageProjectNote(note, state)]));
+      const notes = filterVisibleProjectNotes(notesAll);
       const renderer = window.TaskMDAProjectNotes?.renderProjectNotesList;
       if (typeof renderer === 'function') {
+        const ctx = buildProjectNotesRenderContext(state, notes);
         const result = renderer(listEl, {
           notes,
           mode: projectNotesFilterMode,
           query: projectNotesSearchQuery,
           currentUserId: String(currentUser?.userId || ''),
-          taskTitleById,
-          authorById,
-          canManageById,
-          noteDocsCountById,
+          taskTitleById: ctx.taskTitleById,
+          authorById: ctx.authorById,
+          canManageById: ctx.canManageById,
+          noteDocsCountById: ctx.noteDocsCountById,
           focusNoteId: projectNotesFocusNoteId
         });
         if (counterEl) {
           const visible = Number(result?.visible || 0);
-          counterEl.textContent = `${visible} note${visible > 1 ? 's' : ''}`;
+          counterEl.textContent = `${visible} note${visible > 1 ? 's' : ''} • favoris prioritaires`;
         }
       } else {
         listEl.innerHTML = '<p class="text-slate-500">Module Notes non chargé.</p>';
-        if (counterEl) counterEl.textContent = '0 note';
+        if (counterEl) counterEl.textContent = '0 note • favoris prioritaires';
       }
       populateProjectNoteTaskOptions(state);
       if (projectNotesFocusNoteId) {
@@ -13836,6 +14272,92 @@ async function setProjectsPage(page) {
           document.getElementById(`project-note-${focusedId}`)?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
         }, 40);
       }
+    }
+
+    function isProjectNotesViewActive() {
+      return workspaceMode === 'project' && activeProjectView === 'notes';
+    }
+
+    function buildProjectNotesRenderContext(state, notes = []) {
+      const safeState = state && typeof state === 'object' ? state : {};
+      const safeNotes = Array.isArray(notes) ? notes : [];
+      const taskTitleById = new Map((safeState.tasks || []).map((task) => [String(task.taskId || ''), String(task.title || 'Tâche')]));
+      const noteDocsCountById = new Map();
+      (safeState.documents || []).forEach((doc) => {
+        const noteIds = Array.isArray(doc?.linkedNoteIds) ? doc.linkedNoteIds : [];
+        noteIds.forEach((nid) => {
+          const key = String(nid || '').trim();
+          if (!key) return;
+          noteDocsCountById.set(key, Number(noteDocsCountById.get(key) || 0) + 1);
+        });
+      });
+      const authorById = new Map();
+      (safeState.members || []).forEach((member) => {
+        const userId = String(member?.userId || '').trim();
+        if (!userId) return;
+        const identity = resolveKnownUserIdentity(userId, member.displayName || fallbackDirectoryName(userId));
+        authorById.set(userId, String(identity?.name || member.displayName || fallbackDirectoryName(userId)));
+      });
+      authorById.set(String(currentUser?.userId || ''), String(currentUser?.name || 'Moi'));
+      const canManageById = new Map(safeNotes.map((note) => [String(note.noteId || ''), canManageProjectNote(note, safeState)]));
+      return { taskTitleById, noteDocsCountById, authorById, canManageById };
+    }
+
+    function filterVisibleProjectNotes(notesAll = []) {
+      const notes = Array.isArray(notesAll) ? notesAll : [];
+      return projectNotesThemeFilter === 'all'
+        ? notes
+        : notes.filter((note) => getProjectNoteThemeLabels(note)
+          .some((label) => normalizeProjectNoteThemeKey(label) === projectNotesThemeFilter));
+    }
+
+    function canIncrementallyPatchProjectNoteFeedToggle() {
+      if (!isProjectNotesViewActive()) return false;
+      if (projectNotesFilterMode === 'published' || projectNotesFilterMode === 'archived') return false;
+      if (String(projectNotesSearchQuery || '').trim()) return false;
+      return true;
+    }
+
+    function tryPatchProjectNoteCardIncremental(state, noteId) {
+      if (!canIncrementallyPatchProjectNoteFeedToggle()) return false;
+      const renderer = window.TaskMDAProjectNotes?.renderProjectNotesList;
+      if (typeof renderer !== 'function') return false;
+      const listEl = document.getElementById('project-notes-list');
+      if (!listEl) return false;
+      const cardId = `project-note-${String(noteId || '').trim()}`;
+      const currentCard = document.getElementById(cardId);
+      if (!currentCard) return false;
+      const notesAll = getProjectNotesForState(state);
+      const note = notesAll.find((item) => String(item?.noteId || '') === String(noteId || ''));
+      if (!note) return false;
+      const visibleNotes = filterVisibleProjectNotes(notesAll);
+      const fullCtx = buildProjectNotesRenderContext(state, visibleNotes);
+      const noteKey = String(note.noteId || '');
+      if (!fullCtx.canManageById.has(noteKey)) {
+        fullCtx.canManageById.set(noteKey, canManageProjectNote(note, state));
+      }
+
+      const scratch = document.createElement('div');
+      renderer(scratch, {
+        notes: [note],
+        mode: projectNotesFilterMode,
+        query: '',
+        currentUserId: String(currentUser?.userId || ''),
+        taskTitleById: fullCtx.taskTitleById,
+        authorById: fullCtx.authorById,
+        canManageById: fullCtx.canManageById,
+        noteDocsCountById: fullCtx.noteDocsCountById,
+        focusNoteId: ''
+      });
+      const nextCard = scratch.firstElementChild;
+      if (!nextCard) return false;
+      currentCard.replaceWith(nextCard);
+      return true;
+    }
+
+    function rerenderProjectNotesViewIfActive(state = currentProjectState) {
+      if (!isProjectNotesViewActive()) return;
+      renderProjectNotes(state);
     }
 
     async function toggleProjectNotePinned(noteId) {
@@ -13858,7 +14380,7 @@ async function setProjectsPage(page) {
       await publishEvent(event);
       if (sharedFolderHandle) { void syncProjectEventsToSharedSpace(currentProjectId, [event]); }
       currentProjectState = await getProjectState(currentProjectId);
-      renderProjectNotes(currentProjectState);
+      rerenderProjectNotesViewIfActive(currentProjectState);
     }
 
     async function toggleProjectNoteFeedPublish(noteId) {
@@ -13881,11 +14403,13 @@ async function setProjectsPage(page) {
       await publishEvent(event);
       if (sharedFolderHandle) { void syncProjectEventsToSharedSpace(currentProjectId, [event]); }
       await syncProjectNoteGlobalFeed(currentProjectId, note.noteId);
-      if (workspaceMode === 'global' && globalWorkspaceView === 'feed') {
+      if (isGlobalFeedViewActive()) {
         await renderGlobalFeed();
       }
       currentProjectState = await getProjectState(currentProjectId);
-      renderProjectNotes(currentProjectState);
+      if (!tryPatchProjectNoteCardIncremental(currentProjectState, note.noteId)) {
+        rerenderProjectNotesViewIfActive(currentProjectState);
+      }
       showToast(next ? 'Note publiée dans le fil transverse' : 'Note retirée du fil transverse');
     }
 
@@ -13915,11 +14439,11 @@ async function setProjectsPage(page) {
       await publishEvent(event);
       if (sharedFolderHandle) { void syncProjectEventsToSharedSpace(currentProjectId, [event]); }
       await syncProjectNoteGlobalFeed(currentProjectId, note.noteId);
-      if (workspaceMode === 'global' && globalWorkspaceView === 'feed') {
+      if (isGlobalFeedViewActive()) {
         await renderGlobalFeed();
       }
       currentProjectState = await getProjectState(currentProjectId);
-      renderProjectNotes(currentProjectState);
+      rerenderProjectNotesViewIfActive(currentProjectState);
       showToast('Note archivée');
     }
 
@@ -13942,7 +14466,7 @@ async function setProjectsPage(page) {
       await publishEvent(event);
       if (sharedFolderHandle) { void syncProjectEventsToSharedSpace(currentProjectId, [event]); }
       currentProjectState = await getProjectState(currentProjectId);
-      renderProjectNotes(currentProjectState);
+      rerenderProjectNotesViewIfActive(currentProjectState);
       showToast('Note restaurée');
     }
 
@@ -13969,14 +14493,14 @@ async function setProjectsPage(page) {
       await publishEvent(event);
       if (sharedFolderHandle) { void syncProjectEventsToSharedSpace(currentProjectId, [event]); }
       await removeProjectNoteFromGlobalFeed(currentProjectId, note.noteId);
-      if (workspaceMode === 'global' && globalWorkspaceView === 'feed') {
+      if (isGlobalFeedViewActive()) {
         await renderGlobalFeed();
       }
       if (String(projectNoteReadModalNoteId || '') === String(note.noteId || '')) {
         closeProjectNoteReadModal();
       }
       currentProjectState = await getProjectState(currentProjectId);
-      renderProjectNotes(currentProjectState);
+      rerenderProjectNotesViewIfActive(currentProjectState);
       showToast('Note supprimée');
     }
 
@@ -14006,7 +14530,7 @@ async function setProjectsPage(page) {
           requestDate: toYmd(new Date()),
           assignee: '',
           assignees: [],
-          theme: (Array.isArray(note.tags) && note.tags.length > 0) ? String(note.tags[0] || 'General') : 'General',
+          theme: String(note.theme || (Array.isArray(note.tags) && note.tags.length > 0 ? note.tags[0] : 'General') || 'General'),
           subtasks: [],
           attachments: []
         }
@@ -14046,14 +14570,7 @@ async function setProjectsPage(page) {
     }
 
     function sanitizeFilenameSegment(value) {
-      return String(value || '')
-        .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .replace(/[^a-zA-Z0-9._-]+/g, '-')
-        .replace(/-+/g, '-')
-        .replace(/^-|-$/g, '')
-        .toLowerCase()
-        .slice(0, 80) || 'note';
+      return coreSanitizeFilenameSegment(value);
     }
 
     const ZIP_EPOCH_DATE = new Date(1980, 0, 1, 0, 0, 0);
@@ -14179,159 +14696,6 @@ async function setProjectsPage(page) {
       return concatUint8Arrays([...localChunks, centralDirectory, endHeader]);
     }
 
-    async function setGlobalNotesPage(page) {
-      if (!globalNotesRuntime?.setGlobalNotesPage) return;
-      await globalNotesRuntime.setGlobalNotesPage(page);
-    }
-
-    function openGlobalNotesBulkExportModal() {
-      if (!globalNotesRuntime?.openGlobalNotesBulkExportModal) return;
-      globalNotesRuntime.openGlobalNotesBulkExportModal();
-    }
-
-    function closeGlobalNotesBulkExportModal() {
-      if (!globalNotesRuntime?.closeGlobalNotesBulkExportModal) return;
-      globalNotesRuntime.closeGlobalNotesBulkExportModal();
-    }
-
-    function updateGlobalNotesBulkDeleteUi() {
-      const toggleBtn = document.getElementById('btn-global-notes-bulk-toggle');
-      const deleteBtn = document.getElementById('btn-global-notes-bulk-delete');
-      const selectAllBtn = document.getElementById('btn-global-notes-bulk-select-all');
-      const exportBtn = document.getElementById('btn-global-notes-bulk-export');
-      const selectedCount = selectedGlobalNoteIdsForBulkDelete.size;
-      const selectableInputs = Array.from(document.querySelectorAll('#global-notes-list .taskmda-bulk-checkbox-input[data-note-id]'))
-        .filter((input) => input instanceof HTMLInputElement && !input.disabled);
-      const selectedVisibleCount = selectableInputs.filter((input) => selectedGlobalNoteIdsForBulkDelete.has(String(input.dataset.noteId || '').trim())).length;
-      const allVisibleSelected = selectableInputs.length > 0 && selectedVisibleCount === selectableInputs.length;
-
-      if (toggleBtn) {
-        toggleBtn.classList.toggle('task-action-btn-warn', globalNotesBulkSelectionMode);
-        toggleBtn.setAttribute('aria-pressed', globalNotesBulkSelectionMode ? 'true' : 'false');
-        toggleBtn.setAttribute('aria-label', globalNotesBulkSelectionMode ? 'Désactiver la sélection multiple des notes' : 'Activer la sélection multiple des notes');
-        const label = toggleBtn.querySelector('.taskmda-action-label');
-        if (label) label.textContent = globalNotesBulkSelectionMode ? 'Annuler sélection' : 'Sélection multiple';
-      }
-      if (deleteBtn) {
-        deleteBtn.classList.toggle('hidden', !globalNotesBulkSelectionMode);
-        deleteBtn.disabled = selectedCount === 0;
-        deleteBtn.setAttribute('aria-label', `Supprimer les notes sélectionnées (${selectedCount})`);
-        const label = deleteBtn.querySelector('.taskmda-action-label');
-        if (label) label.textContent = `Supprimer sélection (${selectedCount})`;
-      }
-      if (exportBtn) {
-        exportBtn.classList.toggle('hidden', !globalNotesBulkSelectionMode);
-        exportBtn.disabled = selectedCount === 0;
-        exportBtn.setAttribute('aria-label', `Exporter les notes sélectionnées en ZIP (${selectedCount})`);
-        const label = exportBtn.querySelector('.taskmda-action-label');
-        if (label) label.textContent = `Export ZIP (${selectedCount})`;
-      }
-      if (selectAllBtn) {
-        selectAllBtn.classList.toggle('hidden', !globalNotesBulkSelectionMode);
-        const nextLabel = allVisibleSelected ? 'Tout désélectionner' : 'Tout sélectionner';
-        const nextAriaLabel = allVisibleSelected ? 'Tout désélectionner les notes visibles' : 'Tout sélectionner les notes visibles';
-        const nextIcon = allVisibleSelected ? 'remove_done' : 'done_all';
-        selectAllBtn.setAttribute('aria-label', nextAriaLabel);
-        selectAllBtn.setAttribute('data-action-label', nextLabel);
-        selectAllBtn.setAttribute('data-ui-tooltip', nextLabel);
-        selectAllBtn.setAttribute('title', nextLabel);
-        const icon = selectAllBtn.querySelector('.taskmda-action-icon, .material-symbols-outlined');
-        if (icon) icon.textContent = nextIcon;
-        const label = selectAllBtn.querySelector('.taskmda-action-label');
-        if (label) label.textContent = nextLabel;
-        window.TaskMDARefreshIconTooltip?.(selectAllBtn);
-      }
-    }
-
-    function setGlobalNotesBulkSelectionMode(enabled, options = {}) {
-      globalNotesBulkSelectionMode = !!enabled;
-      if (!globalNotesBulkSelectionMode || options.clearSelection) {
-        selectedGlobalNoteIdsForBulkDelete.clear();
-      }
-      updateGlobalNotesBulkDeleteUi();
-    }
-
-    function toggleGlobalNoteBulkSelection(noteId, forceValue = null) {
-      const normalizedId = String(noteId || '').trim();
-      if (!normalizedId || !globalNotesBulkSelectionMode) return;
-      const shouldSelect = typeof forceValue === 'boolean'
-        ? forceValue
-        : !selectedGlobalNoteIdsForBulkDelete.has(normalizedId);
-      if (shouldSelect) selectedGlobalNoteIdsForBulkDelete.add(normalizedId);
-      else selectedGlobalNoteIdsForBulkDelete.delete(normalizedId);
-      updateGlobalNotesBulkDeleteUi();
-    }
-
-    function selectAllVisibleGlobalNotesForBulkDelete() {
-      if (!globalNotesBulkSelectionMode) return;
-      const inputs = Array.from(document.querySelectorAll('#global-notes-list .taskmda-bulk-checkbox-input[data-note-id]'))
-        .filter((input) => input instanceof HTMLInputElement && !input.disabled);
-      if (!inputs.length) {
-        updateGlobalNotesBulkDeleteUi();
-        return;
-      }
-      const allSelected = inputs.every((input) => selectedGlobalNoteIdsForBulkDelete.has(String(input.dataset.noteId || '').trim()));
-      inputs.forEach((input) => {
-        const noteId = String(input.dataset.noteId || '').trim();
-        if (!noteId) return;
-        input.checked = !allSelected;
-        input.closest('.global-note-card')?.classList.toggle('is-bulk-selected', !allSelected);
-        if (allSelected) selectedGlobalNoteIdsForBulkDelete.delete(noteId);
-        else selectedGlobalNoteIdsForBulkDelete.add(noteId);
-      });
-      updateGlobalNotesBulkDeleteUi();
-    }
-
-    async function deleteSelectedGlobalNotes() {
-      if (!globalNotesBulkSelectionMode) return;
-      const selectedIds = Array.from(selectedGlobalNoteIdsForBulkDelete).map((id) => String(id || '').trim()).filter(Boolean);
-      if (!selectedIds.length) {
-        showToast('Aucune note sélectionnée');
-        return;
-      }
-      const allNotesRaw = await getAllDecrypted('globalNotes', 'noteId');
-      const allNotes = Array.isArray(allNotesRaw) ? allNotesRaw : [];
-      const deletableIds = selectedIds.filter((id) => {
-        const note = allNotes.find((row) => String(row?.noteId || '').trim() === id);
-        return note && canManageGlobalNote(note);
-      });
-      if (!deletableIds.length) {
-        showToast('Aucune note supprimable dans la sélection');
-        return;
-      }
-      if (!window.confirm(`Supprimer ${deletableIds.length} note(s) sélectionnée(s) ?`)) return;
-      for (const noteId of deletableIds) {
-        await deleteFromStore('globalNotes', noteId);
-        await removeGlobalNoteFromFeed(noteId);
-      }
-      if (workspaceMode === 'global' && globalWorkspaceView === 'feed') {
-        await renderGlobalFeed();
-      }
-      selectedGlobalNoteIdsForBulkDelete.clear();
-      await renderGlobalNotes();
-      showToast(`${deletableIds.length} note(s) supprimée(s)`);
-    }
-
-    async function toggleGlobalNoteFavorite(noteId = '') {
-      const nid = String(noteId || '').trim();
-      if (!nid) return;
-      const note = await getDecrypted('globalNotes', nid, 'noteId');
-      if (!note) return;
-      if (!canManageGlobalNote(note)) {
-        showToast('Action non autorisée');
-        return;
-      }
-      const isFavorite = Number(note.favoriteAt || 0) > 0;
-      const next = {
-        ...note,
-        favoriteAt: isFavorite ? null : Date.now(),
-        updatedAt: Date.now()
-      };
-      await putEncrypted('globalNotes', next, 'noteId');
-      await renderGlobalNotes();
-      showToast(isFavorite ? 'Note retirée des favoris' : 'Note ajoutée aux favoris');
-    }
-
     // ========================================
     // FONCTIONS UTILITAIRES EXPORT PDF/DOCX
     // ========================================
@@ -14390,28 +14754,7 @@ async function setProjectsPage(page) {
     }
 
     async function exportGlobalNote(noteId = '', format = 'html') {
-      const nid = String(noteId || '').trim();
-      if (!nid) return;
-      const note = await getDecrypted('globalNotes', nid, 'noteId');
-      if (!note) {
-        showToast('Note introuvable');
-        return;
-      }
-      const title = String(note.title || '').trim() || 'Note';
-      const safeTitle = sanitizeFilenameSegment(title);
-      const tag = formatExportDateTag();
-      const contentHtml = sanitizeRichTextHtmlPreserve(String(note.contentHtml || '').trim() || plainTextToRichHtml(String(note.content || '').trim()));
-      if (String(format || '').toLowerCase() === 'txt') {
-        const plain = getProjectDescriptionPlainText(contentHtml);
-        const payload = `${title}\n\n${plain}\n`;
-        downloadBlobFile(payload, `note_${safeTitle}_${tag}.txt`, 'text/plain;charset=utf-8');
-        showToast('Note exportée (TXT)');
-        return;
-      }
-      const tags = Array.isArray(note.tags) ? note.tags.map((entry) => String(entry || '').trim()).filter(Boolean) : [];
-      const html = `<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1e293b}h1{margin:0 0 8px}.meta{color:#64748b;font-size:13px;margin-bottom:12px}.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}.chip{font-size:11px;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;color:#334155}</style></head><body><h1>${escapeHtml(title)}</h1><p class="meta">${escapeHtml(new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR'))}</p><div class="chips">${tags.map((entry) => `<span class="chip">#${escapeHtml(entry)}</span>`).join('')}</div><article>${contentHtml || '<p>Aucun contenu.</p>'}</article></body></html>`;
-      downloadBlobFile(html, `note_${safeTitle}_${tag}.html`, 'text/html;charset=utf-8');
-      showToast('Note exportée (HTML)');
+      await globalNotesRuntime?.exportGlobalNote?.(noteId, format);
     }
 
     // ========================================
@@ -14423,60 +14766,7 @@ async function setProjectsPage(page) {
      * @param {string} noteId - ID de la note à exporter
      */
     async function exportGlobalNoteAsPdf(noteId = '') {
-      const nid = String(noteId || '').trim();
-      if (!nid) return;
-
-      const note = await getDecrypted('globalNotes', nid, 'noteId');
-      if (!note) {
-        showToast('Note introuvable');
-        return;
-      }
-
-      const title = String(note.title || '').trim() || 'Note';
-      const contentHtml = sanitizeRichTextHtmlPreserve(
-        String(note.contentHtml || '').trim() || plainTextToRichHtml(String(note.content || '').trim())
-      );
-      const tags = Array.isArray(note.tags) ? note.tags.map(t => String(t || '').trim()).filter(Boolean) : [];
-      const dateFormatted = new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR');
-
-      const printHtml = `<!doctype html>
-<html lang="fr"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>
-<style>
-body{font-family:'Segoe UI',Arial,sans-serif;padding:24px;color:#1e293b;max-width:800px;margin:0 auto}
-h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
-.meta{color:#64748b;font-size:12px;margin-bottom:12px}
-.tags{margin-bottom:14px}
-.tag{display:inline-block;font-size:10px;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;color:#334155;margin-right:6px;margin-bottom:4px}
-.content{margin-top:20px;line-height:1.6;color:#1e293b}
-.content img{max-width:100%;height:auto}
-@media print{body{padding:0}}
-</style></head><body>
-<h1>${escapeHtml(title)}</h1>
-<p class="meta">${escapeHtml(dateFormatted)}</p>
-${tags.length ? `<div class="tags">${tags.map(tag => `<span class="tag">#${escapeHtml(tag)}</span>`).join('')}</div>` : ''}
-<div class="content">${contentHtml || '<p>Cette note ne contient aucun contenu.</p>'}</div>
-</body></html>`;
-
-      // Ouvrir popup sans noopener pour garder acces au document
-      let popup = null;
-      try {
-        popup = window.open('', '_blank', 'width=900,height=700');
-      } catch (_) {
-        popup = null;
-      }
-
-      if (popup && popup.document) {
-        popup.document.open();
-        popup.document.write(printHtml);
-        popup.document.close();
-        // Lancer print une seule fois apres rendu
-        setTimeout(() => {
-          try { popup.print(); } catch (_) {}
-        }, 300);
-        showToast('Impression ouverte - choisissez Enregistrer en PDF');
-      } else {
-        showToast('Impossible d\'ouvrir la fenetre d\'impression (popup bloquee ?)');
-      }
+      await globalNotesRuntime?.exportGlobalNoteAsPdf?.(noteId);
     }
 
     /**
@@ -14485,87 +14775,7 @@ ${tags.length ? `<div class="tags">${tags.map(tag => `<span class="tag">#${escap
      * @returns {Promise<Blob|null>} Blob PDF ou null si erreur
      */
     async function generatePdfBlobForNote({ title, contentHtml, tags, dateFormatted }) {
-      const tempDiv = document.createElement('div');
-      tempDiv.style.position = 'fixed';
-      tempDiv.style.left = '0';
-      tempDiv.style.top = '0';
-      tempDiv.style.width = '800px';
-      tempDiv.style.zIndex = '-1';
-      tempDiv.style.fontFamily = "'Segoe UI', Arial, sans-serif";
-      tempDiv.style.padding = '20px';
-      tempDiv.style.color = '#1e293b';
-      tempDiv.style.background = '#fff';
-
-      const styleBlock = document.createElement('style');
-      styleBlock.textContent = `
-        .pdf-title { margin: 0 0 8px; font-size: 24px; font-weight: bold; color: #1e293b; }
-        .pdf-meta { color: #64748b; font-size: 12px; margin-bottom: 12px; }
-        .pdf-tags { margin-bottom: 14px; }
-        .pdf-tag { display: inline-block; font-size: 10px; border: 1px solid #cbd5e1; border-radius: 999px; padding: 3px 8px; background: #f8fafc; color: #334155; margin-right: 6px; margin-bottom: 4px; }
-        .pdf-content { margin-top: 20px; line-height: 1.6; color: #1e293b; }
-        .pdf-content img { max-width: 100%; height: auto; }
-      `;
-      tempDiv.appendChild(styleBlock);
-
-      const h1 = document.createElement('h1');
-      h1.className = 'pdf-title';
-      h1.textContent = title;
-      tempDiv.appendChild(h1);
-
-      const meta = document.createElement('p');
-      meta.className = 'pdf-meta';
-      meta.textContent = dateFormatted;
-      tempDiv.appendChild(meta);
-
-      if (tags.length) {
-        const tagsDiv = document.createElement('div');
-        tagsDiv.className = 'pdf-tags';
-        tags.forEach(tag => {
-          const span = document.createElement('span');
-          span.className = 'pdf-tag';
-          span.textContent = '#' + tag;
-          tagsDiv.appendChild(span);
-        });
-        tempDiv.appendChild(tagsDiv);
-      }
-
-      const contentDiv = document.createElement('div');
-      contentDiv.className = 'pdf-content';
-      contentDiv.innerHTML = contentHtml || '<p>Cette note ne contient aucun contenu.</p>';
-      tempDiv.appendChild(contentDiv);
-
-      document.body.appendChild(tempDiv);
-
-      const pdfOpts = {
-        margin: [10, 10, 10, 10],
-        image: { type: 'jpeg', quality: 0.92 },
-        html2canvas: {
-          scale: 1.5,
-          useCORS: true,
-          logging: false,
-          width: 800
-        },
-        jsPDF: {
-          unit: 'mm',
-          format: 'a4',
-          orientation: 'portrait'
-        }
-      };
-
-      try {
-        await new Promise(resolve => setTimeout(resolve, 150));
-        const pdfBlob = await html2pdf().set(pdfOpts).from(tempDiv).outputPdf('blob');
-        return pdfBlob;
-      } catch (error) {
-        console.error('Erreur génération PDF:', error);
-        return null;
-      } finally {
-        setTimeout(() => {
-          if (tempDiv && tempDiv.parentNode) {
-            document.body.removeChild(tempDiv);
-          }
-        }, 1000);
-      }
+      return globalNotesRuntime?.generatePdfBlobForNote?.({ title, contentHtml, tags, dateFormatted }) || null;
     }
 
     // ========================================
@@ -14620,7 +14830,8 @@ ${tags.length ? `<div class="tags">${tags.map(tag => `<span class="tag">#${escap
      * @returns {string} Contenu XML
      */
     function generateDocumentXml(noteData, wordMLContent) {
-      const { title, author, dateFormatted, tags } = noteData;
+      const { title, author, dateFormatted, theme, tags } = noteData;
+      const themeText = String(theme || '').trim();
       const tagsText = Array.isArray(tags) ? tags.map(t => '#' + t).join(' ') : '';
 
       return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -14640,6 +14851,7 @@ ${tags.length ? `<div class="tags">${tags.map(tag => `<span class="tag">#${escap
         <w:t>${escapeXml(author)} | ${escapeXml(dateFormatted)}</w:t>
       </w:r>
     </w:p>
+    ${themeText ? `<w:p><w:r><w:rPr><w:sz w:val="20"/><w:color w:val="0f766e"/></w:rPr><w:t>Thematique: ${escapeXml(themeText)}</w:t></w:r></w:p>` : ''}
     ${tagsText ? `<w:p><w:r><w:rPr><w:sz w:val="18"/></w:rPr><w:t>${escapeXml(tagsText)}</w:t></w:r></w:p>` : ''}
     ${wordMLContent}
     <w:sectPr>
@@ -14963,83 +15175,7 @@ ${tags.length ? `<div class="tags">${tags.map(tag => `<span class="tag">#${escap
      * @param {string} noteId - ID de la note à exporter
      */
     async function exportGlobalNoteAsDocx(noteId = '') {
-      const nid = String(noteId || '').trim();
-      if (!nid) return;
-
-      // 1. Récupérer la note
-      const note = await getDecrypted('globalNotes', nid, 'noteId');
-      if (!note) {
-        showToast('Note introuvable');
-        return;
-      }
-
-      // 2. Préparer les données
-      const title = String(note.title || '').trim() || 'Note';
-      const safeTitle = sanitizeFilenameSegment(title);
-      const contentHtml = sanitizeRichTextHtmlPreserve(
-        String(note.contentHtml || '').trim() || plainTextToRichHtml(String(note.content || '').trim())
-      );
-      const tags = Array.isArray(note.tags) ? note.tags.map(t => String(t || '').trim()).filter(Boolean) : [];
-      const author = String(note.createdByName || fallbackDirectoryName(note.createdBy || ''));
-      const dateFormatted = new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR');
-
-      // 3. Convertir HTML → WordML
-      const { wordML, images, relationships } = convertHtmlToWordML(contentHtml);
-
-      // 4. Générer tous les fichiers XML
-      const files = [
-        {
-          name: '[Content_Types].xml',
-          data: generateContentTypesXml(images),
-          mtime: Date.now()
-        },
-        {
-          name: '_rels/.rels',
-          data: generateRootRelsXml(),
-          mtime: Date.now()
-        },
-        {
-          name: 'word/document.xml',
-          data: generateDocumentXml({ title, author, dateFormatted, tags }, wordML),
-          mtime: Date.now()
-        },
-        {
-          name: 'word/styles.xml',
-          data: generateStylesXml(),
-          mtime: Date.now()
-        }
-      ];
-
-      // 5. Ajouter les relationships si images présentes
-      if (images.length > 0) {
-        files.push({
-          name: 'word/_rels/document.xml.rels',
-          data: generateDocumentRelsXml(relationships),
-          mtime: Date.now()
-        });
-
-        // 6. Ajouter les images décodées
-        images.forEach(img => {
-          files.push({
-            name: `word/media/${img.filename}`,
-            data: base64ToUint8Array(img.base64),
-            mtime: Date.now()
-          });
-        });
-      }
-
-      // 7. Créer le ZIP (fichier DOCX)
-      const zipBytes = buildZipStoreArchive(files);
-
-      // 8. Télécharger
-      const tag = formatExportDateTag();
-      downloadBlobFile(
-        new Blob([zipBytes], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }),
-        `note_${safeTitle}_${tag}.docx`,
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-      );
-
-      showToast('Note exportée (DOCX)');
+      await globalNotesRuntime?.exportGlobalNoteAsDocx?.(noteId);
     }
 
     // ========================================
@@ -15051,38 +15187,7 @@ ${tags.length ? `<div class="tags">${tags.map(tag => `<span class="tag">#${escap
      * @param {string} noteId - ID de la note
      */
     function toggleGlobalNoteExportMenu(noteId, event) {
-      // Empêcher la propagation vers l'article parent
-      if (event) {
-        event.stopPropagation();
-        event.preventDefault();
-      }
-
-      const nid = String(noteId || '').trim();
-      if (!nid) return;
-
-      const menu = document.getElementById(`export-menu-${nid}`);
-      const btn = document.getElementById(`export-menu-btn-${nid}`);
-      if (!menu || !btn) return;
-
-      // Fermer tous les autres menus ouverts (exclure les boutons trigger)
-      document.querySelectorAll('[id^="export-menu-"]:not([id^="export-menu-btn-"])').forEach(otherMenu => {
-        if (otherMenu.id !== menu.id && !otherMenu.classList.contains('hidden')) {
-          otherMenu.classList.add('hidden');
-          const otherId = otherMenu.id.replace('export-menu-', '');
-          const otherBtn = document.getElementById(`export-menu-btn-${otherId}`);
-          if (otherBtn) otherBtn.setAttribute('aria-expanded', 'false');
-        }
-      });
-
-      // Toggle le menu actuel
-      const isHidden = menu.classList.contains('hidden');
-      if (isHidden) {
-        menu.classList.remove('hidden');
-        btn.setAttribute('aria-expanded', 'true');
-      } else {
-        menu.classList.add('hidden');
-        btn.setAttribute('aria-expanded', 'false');
-      }
+      globalNotesRuntime?.toggleGlobalNoteExportMenu?.(noteId, event);
     }
 
     /**
@@ -15090,320 +15195,21 @@ ${tags.length ? `<div class="tags">${tags.map(tag => `<span class="tag">#${escap
      * @param {string} noteId - ID de la note
      */
     function closeGlobalNoteExportMenu(noteId) {
-      const nid = String(noteId || '').trim();
-      if (!nid) return;
-
-      const menu = document.getElementById(`export-menu-${nid}`);
-      const btn = document.getElementById(`export-menu-btn-${nid}`);
-      if (menu) menu.classList.add('hidden');
-      if (btn) btn.setAttribute('aria-expanded', 'false');
-    }
-
-    async function exportGlobalFeedPost(postId = '', format = 'html') {
-      const pid = String(postId || '').trim();
-      if (!pid) return;
-      const post = await getDecrypted('globalPosts', pid, 'postId');
-      if (!post || post.deletedAt) {
-        showToast('Post introuvable');
-        return;
-      }
-      const title = String(post.title || '').trim() || 'Post';
-      const safeTitle = sanitizeFilenameSegment(title);
-      const tag = formatExportDateTag();
-      const contentHtml = sanitizeRichTextHtmlPreserve(String(post.content || '').trim());
-      if (String(format || '').toLowerCase() === 'txt') {
-        const plain = getProjectDescriptionPlainText(contentHtml);
-        const payload = `${title}\n\n${plain}\n`;
-        downloadBlobFile(payload, `post_${safeTitle}_${tag}.txt`, 'text/plain;charset=utf-8');
-        showToast('Post exporte (TXT)');
-        return;
-      }
-      const html = `<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1e293b}h1{margin:0 0 8px}.meta{color:#64748b;font-size:13px;margin-bottom:14px}</style></head><body><h1>${escapeHtml(title)}</h1><p class="meta">${escapeHtml(String(post.authorName || fallbackDirectoryName(post.authorUserId || '')))} | ${escapeHtml(new Date(Number(post.updatedAt || post.createdAt || Date.now())).toLocaleString('fr-FR'))}</p><article>${contentHtml || '<p>Aucun contenu.</p>'}</article></body></html>`;
-      downloadBlobFile(html, `post_${safeTitle}_${tag}.html`, 'text/html;charset=utf-8');
-      showToast('Post exporte (HTML)');
-    }
-
-    async function exportGlobalFeedPostAsPdf(postId = '') {
-      const pid = String(postId || '').trim();
-      if (!pid) return;
-      const post = await getDecrypted('globalPosts', pid, 'postId');
-      if (!post || post.deletedAt) {
-        showToast('Post introuvable');
-        return;
-      }
-
-      const title = String(post.title || '').trim() || 'Post';
-      const contentHtml = sanitizeRichTextHtmlPreserve(String(post.content || '').trim());
-      const author = String(post.authorName || fallbackDirectoryName(post.authorUserId || '')).trim() || 'Auteur inconnu';
-      const dateFormatted = new Date(Number(post.updatedAt || post.createdAt || Date.now())).toLocaleString('fr-FR');
-
-      const printHtml = `<!doctype html>
-<html lang="fr"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>
-<style>
-body{font-family:'Segoe UI',Arial,sans-serif;padding:24px;color:#1e293b;max-width:800px;margin:0 auto}
-h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
-.meta{color:#64748b;font-size:12px;margin-bottom:12px}
-.content{margin-top:20px;line-height:1.6;color:#1e293b}
-.content img{max-width:100%;height:auto}
-@media print{body{padding:0}}
-</style></head><body>
-<h1>${escapeHtml(title)}</h1>
-<p class="meta">${escapeHtml(author)} | ${escapeHtml(dateFormatted)}</p>
-<div class="content">${contentHtml || '<p>Ce post ne contient aucun contenu.</p>'}</div>
-</body></html>`;
-
-      let popup = null;
-      try {
-        popup = window.open('', '_blank', 'width=900,height=700');
-      } catch (_) {
-        popup = null;
-      }
-
-      if (popup && popup.document) {
-        popup.document.open();
-        popup.document.write(printHtml);
-        popup.document.close();
-        setTimeout(() => {
-          try { popup.print(); } catch (_) {}
-        }, 300);
-        showToast('Impression ouverte - choisissez Enregistrer en PDF');
-      } else {
-        showToast('Impossible d ouvrir la fenetre d impression (popup bloquee ?)');
-      }
-    }
-
-    async function exportGlobalFeedPostAsDocx(postId = '') {
-      const pid = String(postId || '').trim();
-      if (!pid) return;
-      const post = await getDecrypted('globalPosts', pid, 'postId');
-      if (!post || post.deletedAt) {
-        showToast('Post introuvable');
-        return;
-      }
-
-      const title = String(post.title || '').trim() || 'Post';
-      const safeTitle = sanitizeFilenameSegment(title);
-      const contentHtml = sanitizeRichTextHtmlPreserve(String(post.content || '').trim());
-      const author = String(post.authorName || fallbackDirectoryName(post.authorUserId || '')).trim() || 'Auteur inconnu';
-      const dateFormatted = new Date(Number(post.updatedAt || post.createdAt || Date.now())).toLocaleString('fr-FR');
-
-      const { wordML, images, relationships } = convertHtmlToWordML(contentHtml);
-      const files = [
-        { name: '[Content_Types].xml', data: generateContentTypesXml(images), mtime: Date.now() },
-        { name: '_rels/.rels', data: generateRootRelsXml(), mtime: Date.now() },
-        { name: 'word/document.xml', data: generateDocumentXml({ title, author, dateFormatted, tags: [] }, wordML), mtime: Date.now() },
-        { name: 'word/styles.xml', data: generateStylesXml(), mtime: Date.now() }
-      ];
-
-      if (images.length > 0) {
-        files.push({
-          name: 'word/_rels/document.xml.rels',
-          data: generateDocumentRelsXml(relationships),
-          mtime: Date.now()
-        });
-        images.forEach((img) => {
-          files.push({
-            name: `word/media/${img.filename}`,
-            data: base64ToUint8Array(img.base64),
-            mtime: Date.now()
-          });
-        });
-      }
-
-      const zipBytes = buildZipStoreArchive(files);
-      const tag = formatExportDateTag();
-      downloadBlobFile(
-        new Blob([zipBytes], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }),
-        `post_${safeTitle}_${tag}.docx`,
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-      );
-      showToast('Post exporte (DOCX)');
-    }
-
-    function toggleGlobalFeedExportMenu(postId, event) {
-      if (event) {
-        event.stopPropagation();
-        event.preventDefault();
-      }
-      const pid = String(postId || '').trim();
-      if (!pid) return;
-
-      const menu = document.getElementById(`feed-export-menu-${pid}`);
-      const btn = document.getElementById(`feed-export-menu-btn-${pid}`);
-      if (!menu || !btn) return;
-
-      document.querySelectorAll('[id^="feed-export-menu-"]:not([id^="feed-export-menu-btn-"])').forEach((otherMenu) => {
-        if (otherMenu.id !== menu.id && !otherMenu.classList.contains('hidden')) {
-          otherMenu.classList.add('hidden');
-          const otherId = otherMenu.id.replace('feed-export-menu-', '');
-          const otherBtn = document.getElementById(`feed-export-menu-btn-${otherId}`);
-          if (otherBtn) otherBtn.setAttribute('aria-expanded', 'false');
-        }
-      });
-
-      const isHidden = menu.classList.contains('hidden');
-      if (isHidden) {
-        menu.classList.remove('hidden');
-        btn.setAttribute('aria-expanded', 'true');
-      } else {
-        menu.classList.add('hidden');
-        btn.setAttribute('aria-expanded', 'false');
-      }
-    }
-
-    function closeGlobalFeedExportMenu(postId) {
-      const pid = String(postId || '').trim();
-      if (!pid) return;
-      const menu = document.getElementById(`feed-export-menu-${pid}`);
-      const btn = document.getElementById(`feed-export-menu-btn-${pid}`);
-      if (menu) menu.classList.add('hidden');
-      if (btn) btn.setAttribute('aria-expanded', 'false');
+      globalNotesRuntime?.closeGlobalNoteExportMenu?.(noteId);
     }
 
     // Event listener global pour fermer les menus au clic extérieur
     document.addEventListener('click', (event) => {
-      const isMenuButton = event.target.closest('[id^="export-menu-btn-"]');
-      const isMenu = event.target.closest('[id^="export-menu-"]');
-      const isFeedMenuButton = event.target.closest('[id^="feed-export-menu-btn-"]');
-      const isFeedMenu = event.target.closest('[id^="feed-export-menu-"]');
-
-      if (!isMenuButton && !isMenu && !isFeedMenuButton && !isFeedMenu) {
-        document.querySelectorAll('[id^="export-menu-"]:not([id^="export-menu-btn-"])').forEach(menu => {
-          if (!menu.classList.contains('hidden')) {
-            menu.classList.add('hidden');
-            const noteId = menu.id.replace('export-menu-', '');
-            const btn = document.getElementById(`export-menu-btn-${noteId}`);
-            if (btn) btn.setAttribute('aria-expanded', 'false');
-          }
-        });
-        document.querySelectorAll('[id^="feed-export-menu-"]:not([id^="feed-export-menu-btn-"])').forEach((menu) => {
-          if (!menu.classList.contains('hidden')) {
-            menu.classList.add('hidden');
-            const postId = menu.id.replace('feed-export-menu-', '');
-            const btn = document.getElementById(`feed-export-menu-btn-${postId}`);
-            if (btn) btn.setAttribute('aria-expanded', 'false');
-          }
-        });
-      }
+      globalNotesRuntime?.handleGlobalNotesExportMenuDocumentClick?.(event);
+      globalFeedRuntime?.handleGlobalFeedExportMenuDocumentClick?.(event);
     });
 
     async function exportSelectedGlobalNotesAsZip(format = 'html') {
-      if (!globalNotesBulkSelectionMode) return;
-      const selectedIds = Array.from(selectedGlobalNoteIdsForBulkDelete).map((id) => String(id || '').trim()).filter(Boolean);
-      if (!selectedIds.length) {
-        showToast('Aucune note sélectionnée');
-        return;
-      }
-      const allNotesRaw = await getAllDecrypted('globalNotes', 'noteId');
-      const allNotes = Array.isArray(allNotesRaw) ? allNotesRaw : [];
-      const selectedNotes = selectedIds
-        .map((id) => allNotes.find((row) => String(row?.noteId || '').trim() === id))
-        .filter((note) => note && canManageGlobalNote(note));
-      if (!selectedNotes.length) {
-        showToast('Aucune note exportable dans la sélection');
-        return;
-      }
-
-      const mode = String(format || 'html').toLowerCase();
-      const files = [];
-
-      // Cas PDF : génération asynchrone des blobs
-      if (mode === 'pdf') {
-        showToast('Export PDF multiple en cours...');
-        for (const note of selectedNotes) {
-          const title = String(note.title || '').trim() || 'Note';
-          const safeTitle = sanitizeFilenameSegment(title);
-          const baseName = `${String(note.createdAt || Date.now())}_${safeTitle}`;
-          const contentHtml = sanitizeRichTextHtmlPreserve(
-            String(note.contentHtml || '').trim() || plainTextToRichHtml(String(note.content || '').trim())
-          );
-          const tags = Array.isArray(note.tags) ? note.tags.map(t => String(t || '').trim()).filter(Boolean) : [];
-          const dateFormatted = new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR');
-
-          const pdfBlob = await generatePdfBlobForNote({ title, contentHtml, tags, dateFormatted });
-          if (pdfBlob) {
-            files.push({
-              name: `${baseName}.pdf`,
-              data: new Uint8Array(await pdfBlob.arrayBuffer()),
-              mtime: Number(note.updatedAt || note.createdAt || Date.now())
-            });
-          }
-        }
-      }
-
-      // Cas DOCX : génération de ZIP complets (DOCX = ZIP de XML)
-      else if (mode === 'docx') {
-        showToast('Export DOCX multiple en cours...');
-        for (const note of selectedNotes) {
-          const title = String(note.title || '').trim() || 'Note';
-          const safeTitle = sanitizeFilenameSegment(title);
-          const baseName = `${String(note.createdAt || Date.now())}_${safeTitle}`;
-          const contentHtml = sanitizeRichTextHtmlPreserve(
-            String(note.contentHtml || '').trim() || plainTextToRichHtml(String(note.content || '').trim())
-          );
-          const tags = Array.isArray(note.tags) ? note.tags.map(t => String(t || '').trim()).filter(Boolean) : [];
-          const author = String(note.createdByName || fallbackDirectoryName(note.createdBy || ''));
-          const dateFormatted = new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR');
-
-          // Convertir HTML → WordML
-          const { wordML, images, relationships } = convertHtmlToWordML(contentHtml);
-
-          // Générer tous les fichiers XML du DOCX
-          const docxFiles = [
-            { name: '[Content_Types].xml', data: generateContentTypesXml(images), mtime: Date.now() },
-            { name: '_rels/.rels', data: generateRootRelsXml(), mtime: Date.now() },
-            { name: 'word/document.xml', data: generateDocumentXml({ title, author, dateFormatted, tags }, wordML), mtime: Date.now() },
-            { name: 'word/styles.xml', data: generateStylesXml(), mtime: Date.now() }
-          ];
-
-          if (images.length > 0) {
-            docxFiles.push({ name: 'word/_rels/document.xml.rels', data: generateDocumentRelsXml(relationships), mtime: Date.now() });
-            images.forEach(img => {
-              docxFiles.push({ name: `word/media/${img.filename}`, data: base64ToUint8Array(img.base64), mtime: Date.now() });
-            });
-          }
-
-          // Créer le ZIP DOCX
-          const docxZip = buildZipStoreArchive(docxFiles);
-          files.push({
-            name: `${baseName}.docx`,
-            data: docxZip,
-            mtime: Number(note.updatedAt || note.createdAt || Date.now())
-          });
-        }
-      }
-
-      // Cas HTML et TXT : génération synchrone simple
-      else {
-        selectedNotes.forEach(note => {
-          const title = String(note.title || '').trim() || 'Note';
-          const safeTitle = sanitizeFilenameSegment(title);
-          const baseName = `${String(note.createdAt || Date.now())}_${safeTitle}`;
-          const tags = Array.isArray(note.tags) ? note.tags.map(t => String(t || '').trim()).filter(Boolean) : [];
-          const contentHtml = sanitizeRichTextHtmlPreserve(
-            String(note.contentHtml || '').trim() || plainTextToRichHtml(String(note.content || '').trim())
-          );
-
-          if (mode === 'txt') {
-            const plain = getProjectDescriptionPlainText(contentHtml);
-            const payload = `${title}\nAuteur: ${String(note.createdByName || fallbackDirectoryName(note.createdBy || '') || 'Auteur')}\nMise a jour: ${new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR')}\nTags: ${tags.join(', ')}\n\n${plain}\n`;
-            files.push({ name: `${baseName}.txt`, data: payload, mtime: Number(note.updatedAt || note.createdAt || Date.now()) });
-          } else {
-            const payload = `<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1e293b}h1{margin:0 0 8px}.meta{color:#64748b;font-size:13px;margin-bottom:12px}.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}.chip{font-size:11px;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;color:#334155}</style></head><body><h1>${escapeHtml(title)}</h1><p class="meta">${escapeHtml(new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR'))}</p><div class="chips">${tags.map(entry => `<span class="chip">#${escapeHtml(entry)}</span>`).join('')}</div><article>${contentHtml || '<p>Aucun contenu.</p>'}</article></body></html>`;
-            files.push({ name: `${baseName}.html`, data: payload, mtime: Number(note.updatedAt || note.createdAt || Date.now()) });
-          }
-        });
-      }
-
-      const zipBytes = buildZipStoreArchive(files);
-      const exportTag = formatExportDateTag();
-      downloadBlobFile(new Blob([zipBytes], { type: 'application/zip' }), `notes_selection_${mode}_${exportTag}.zip`, 'application/zip');
-      showToast(`Export ZIP ${mode.toUpperCase()} prêt (${files.length} notes)`);
+      await globalNotesRuntime?.exportSelectedGlobalNotesAsZip?.(format);
     }
 
     async function confirmGlobalNotesBulkExportFromModal() {
-      if (!globalNotesRuntime?.confirmGlobalNotesBulkExportFromModal) return;
-      await globalNotesRuntime.confirmGlobalNotesBulkExportFromModal();
+      await globalNotesRuntime?.confirmGlobalNotesBulkExportFromModal?.();
     }
 
     function readGlobalNoteEditorDraft() {
@@ -15452,6 +15258,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         deletedAt: null
       };
       await putEncrypted('globalPosts', post, 'postId');
+      invalidateGlobalFeedReadModel();
       knownGlobalPostIds.add(post.postId);
       if (sharedFolderHandle) {
         await writeGlobalFeedPostToSharedFolder(post);
@@ -15465,6 +15272,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       existing.deletedAt = Date.now();
       existing.updatedAt = Date.now();
       await putEncrypted('globalPosts', existing, 'postId');
+      invalidateGlobalFeedReadModel();
       if (sharedFolderHandle) {
         await writeGlobalFeedPostToSharedFolder(existing);
       }
@@ -15547,7 +15355,6 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       if (attachInput) attachInput.value = '';
       pendingLinkedGlobalNoteDocs = [];
       refreshLinkedPendingSummaries();
-      refreshLinkedPendingSummaries();
       updateGlobalNoteAttachmentFilesSummary();
       if (attachBtn) attachBtn.disabled = false;
       [titleInput, themeInput, themeKnownSelect, tagsInput, tagsKnownSelect, linkedTaskSelect, transverseInput, shareInput].forEach((el) => {
@@ -15564,7 +15371,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       if (!modal) return;
       const notesShared = window.TaskMDANotesShared;
       const nid = String(noteId || '').trim();
-      const notes = await getAllDecrypted('globalNotes', 'noteId');
+      const notes = await getAllGlobalNotesCached();
       const note = nid
         ? (notes || []).find((item) => String(item?.noteId || '').trim() === nid)
         : null;
@@ -15631,13 +15438,13 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       [titleInput, themeInput, themeKnownSelect, tagsInput, tagsKnownSelect, linkedTaskSelect, transverseInput, shareInput].forEach((el) => {
         if (el) el.disabled = !canManage;
       });
-      if (tagsKnownSelect && !tagsKnownSelect.dataset.bound) {
+      if (tagsKnownSelect && tagsKnownSelect.dataset.globalNoteTagsKnownBound !== '1') {
         tagsKnownSelect.addEventListener('change', appendGlobalNoteTagFromKnownList);
-        tagsKnownSelect.dataset.bound = '1';
+        tagsKnownSelect.dataset.globalNoteTagsKnownBound = '1';
       }
-      if (linkedTaskSelect && !linkedTaskSelect.dataset.bound) {
+      if (linkedTaskSelect && linkedTaskSelect.dataset.globalNoteLinkedTaskBound !== '1') {
         linkedTaskSelect.addEventListener('change', syncGlobalNoteKnownTagsVisibility);
-        linkedTaskSelect.dataset.bound = '1';
+        linkedTaskSelect.dataset.globalNoteLinkedTaskBound = '1';
       }
       syncGlobalNoteKnownTagsVisibility();
       setProjectDescriptionEditorContent(
@@ -15677,7 +15484,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         return;
       }
       const nowTs = Date.now();
-      const notes = await getAllDecrypted('globalNotes', 'noteId');
+      const notes = await getAllGlobalNotesCached();
       let existing = editingGlobalNoteId
         ? (notes || []).find((item) => String(item?.noteId || '').trim() === String(editingGlobalNoteId || '').trim())
         : null;
@@ -15727,6 +15534,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
               createdAt: nowTs,
               updatedAt: nowTs
             }, 'id');
+            invalidateGlobalDocsReadModel();
           }
         }
         const linkedDocIds = Array.from(new Set([...existingLinkedDocIds, ...createdDocIds]));
@@ -15760,7 +15568,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
           archivedAt: null
         };
         savedNote = note;
-        await putEncrypted('globalNotes', note, 'noteId');
+        await putGlobalNoteCached(note);
         await syncGlobalNoteLinkedDocuments(note.noteId, note.linkedDocIds);
         await syncGlobalNoteFeed(note);
       } catch (error) {
@@ -15769,7 +15577,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       }
       pendingLinkedGlobalNoteDocs = [];
       refreshLinkedPendingSummaries();
-      if (workspaceMode === 'global' && globalWorkspaceView === 'feed') {
+      if (isGlobalFeedViewActive()) {
         await renderGlobalFeed();
       }
       closeGlobalNoteEditor();
@@ -15786,7 +15594,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     async function deleteGlobalNote(noteId = '') {
       const nid = String(noteId || editingGlobalNoteId || '').trim();
       if (!nid) return;
-      const note = await getDecrypted('globalNotes', nid, 'noteId');
+      const note = await getGlobalNoteByIdCached(nid);
       if (!note) return;
       if (!canManageGlobalNote(note)) {
         showToast('Action non autorisee');
@@ -15794,10 +15602,10 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       }
       const noteTitle = String(note.title || '').trim() || 'cette note';
       if (!window.confirm(`Supprimer definitivement "${noteTitle}" ?`)) return;
-      await deleteFromStore('globalNotes', nid);
+      await deleteGlobalNoteByIdCached(nid);
       await syncGlobalNoteLinkedDocuments(nid, []);
       await removeGlobalNoteFromFeed(nid);
-      if (workspaceMode === 'global' && globalWorkspaceView === 'feed') {
+      if (isGlobalFeedViewActive()) {
         await renderGlobalFeed();
       }
       if (String(editingGlobalNoteId || '') === nid) {
@@ -15811,7 +15619,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       const nid = String(noteId || '').trim();
       const did = String(docId || '').trim();
       if (!nid || !did) return;
-      const note = await getDecrypted('globalNotes', nid, 'noteId');
+      const note = await getGlobalNoteByIdCached(nid);
       if (!note || !canManageGlobalNote(note)) {
         showToast('Action non autorisee');
         return;
@@ -15824,11 +15632,13 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       const nextLinked = linkedNoteIds.filter((id) => id !== nid);
       if (nextLinked.length > 0) {
         await putEncrypted('globalDocs', { ...doc, linkedNoteIds: nextLinked }, 'id');
+        invalidateGlobalDocsReadModel();
       } else {
         await deleteFromStore('globalDocs', did);
+        invalidateGlobalDocsReadModel();
       }
       if (String(editingGlobalNoteId || '').trim() === nid) {
-        const refreshed = await getDecrypted('globalNotes', nid, 'noteId');
+        const refreshed = await getGlobalNoteByIdCached(nid);
         if (refreshed) await syncGlobalNoteLinkedDocuments(nid, refreshed.linkedDocIds || []);
       }
       await openGlobalNoteReadModal(nid);
@@ -15836,232 +15646,43 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     async function toggleGlobalNoteFeedPublish(noteId) {
-      const nid = String(noteId || '').trim();
-      if (!nid) return;
-      const note = await getDecrypted('globalNotes', nid, 'noteId');
-      if (!note) return;
-      if (!canManageGlobalNote(note)) {
-        showToast('Action non autorisee');
-        return;
-      }
-      const next = {
-        ...note,
-        shareToGlobalFeed: !note.shareToGlobalFeed,
-        updatedAt: Date.now()
-      };
-      await putEncrypted('globalNotes', next, 'noteId');
-      await syncGlobalNoteFeed(next);
-      if (workspaceMode === 'global' && globalWorkspaceView === 'feed') {
-        await renderGlobalFeed();
-      }
-      await renderGlobalNotes();
-      showToast(next.shareToGlobalFeed ? 'Note publiee dans le fil' : 'Note retiree du fil');
+      await globalNotesRuntime?.toggleGlobalNoteFeedPublish?.(noteId);
     }
 
     function closeGlobalReadModal() {
-      cancelGlobalReadInlineEdit({ silent: true });
-      window.TaskMDANotesShared?.closeModal?.('modal-global-read');
-      const modal = document.getElementById('modal-global-read');
-      if (modal) {
-        modal.removeAttribute('data-inline-edit');
-        modal.removeAttribute('data-can-manage');
-      }
-      if (!window.TaskMDANotesShared?.closeModal && modal) {
-        modal.classList.add('hidden');
-        document.body.classList.remove('overflow-hidden');
-      }
-      globalReadModalNoteId = '';
-      const focusBack = globalReadModalLastFocusedElement;
-      globalReadModalLastFocusedElement = null;
-      if (focusBack && typeof focusBack.focus === 'function' && document.contains(focusBack)) {
-        requestAnimationFrame(() => {
-          try { focusBack.focus(); } catch (_) {}
-        });
-      }
+      globalNotesReadModalContentRuntime?.closeGlobalReadModal?.();
     }
 
     function ensureGlobalReadInlineQuillUi() {
-      const modal = document.getElementById('modal-global-read');
-      const contentEl = document.getElementById('global-read-content');
-      if (!modal || !contentEl) return null;
-      const displayWrap = contentEl.closest('.rounded-xl');
-      if (!displayWrap) return null;
-      let editWrap = document.getElementById('global-read-inline-editor-wrap');
-      let toolbarEl = document.getElementById('global-read-inline-toolbar');
-      let editorEl = document.getElementById('global-read-inline-editor');
-      if (!editWrap) {
-        editWrap = document.createElement('div');
-        editWrap.id = 'global-read-inline-editor-wrap';
-        editWrap.className = 'hidden rounded-xl border border-slate-200 bg-slate-50 p-3 mb-3';
-        editWrap.innerHTML = `
-          <div id="global-read-inline-toolbar" class="project-editor-toolbar">
-            <button type="button" class="ql-bold" title="Gras"></button>
-            <button type="button" class="ql-italic" title="Italique"></button>
-            <button type="button" class="ql-underline" title="Souligné"></button>
-            <button type="button" class="ql-strike" title="Barré"></button>
-            <button type="button" class="ql-list" value="ordered" title="Liste numérotée"></button>
-            <button type="button" class="ql-list" value="bullet" title="Liste à puces"></button>
-            <button type="button" class="ql-code" title="Code en ligne"></button>
-            <button type="button" class="ql-code-block" title="Bloc de code"></button>
-            <button type="button" class="ql-link" title="Lien"></button>
-            <button type="button" class="ql-clean" title="Nettoyer"></button>
-          </div>
-          <div id="global-read-inline-editor" class="project-description-editor task-description-editor bg-white rounded-b-lg" style="min-height: 180px;" aria-label="Édition inline de la note globale"></div>
-        `;
-        displayWrap.insertAdjacentElement('afterend', editWrap);
-        toolbarEl = document.getElementById('global-read-inline-toolbar');
-        editorEl = document.getElementById('global-read-inline-editor');
-      }
-      if (window.Quill && editorEl && !globalReadInlineQuill) {
-        globalReadInlineQuill = new window.Quill(editorEl, {
-          theme: 'snow',
-          modules: { toolbar: '#global-read-inline-toolbar' }
-        });
-      }
-      return { modal, contentEl, displayWrap, editWrap, toolbarEl, editorEl };
+      return globalNotesReadInlineEditRuntime?.ensureGlobalReadInlineQuillUi?.() || null;
     }
 
     function resetGlobalReadInlineEditState() {
-      const refs = ensureGlobalReadInlineQuillUi();
-      const titleEl = document.getElementById('global-read-title');
-      const modal = document.getElementById('modal-global-read');
-      globalReadInlineEditActive = false;
-      globalReadInlineEditSaving = false;
-      globalReadInlineOriginalTitle = '';
-      globalReadInlineOriginalContentHtml = '';
-      if (titleEl) {
-        titleEl.removeAttribute('contenteditable');
-        titleEl.removeAttribute('spellcheck');
-      }
-      if (refs?.editWrap) refs.editWrap.classList.add('hidden');
-      if (refs?.displayWrap) refs.displayWrap.classList.remove('hidden');
-      modal?.removeAttribute('data-inline-edit');
+      globalNotesReadInlineEditRuntime?.resetGlobalReadInlineEditState?.();
     }
 
     function canInlineEditGlobalReadModal() {
-      const modal = document.getElementById('modal-global-read');
-      if (!modal || modal.classList.contains('hidden')) return false;
-      if (String(modal.dataset.canManage || '0') !== '1') return false;
-      if (!String(globalReadModalNoteId || '').trim()) return false;
-      return true;
+      return !!globalNotesReadInlineEditRuntime?.canInlineEditGlobalReadModal?.();
     }
 
     function isElementInsideGlobalReadInlineEdit(el) {
-      if (!(el instanceof HTMLElement)) return false;
-      if (el.id === 'global-read-title') return true;
-      return !!el.closest('#global-read-inline-editor-wrap');
+      return !!globalNotesReadInlineEditRuntime?.isElementInsideGlobalReadInlineEdit?.(el);
     }
 
     function placeCaretAtEndOfElement(element) {
-      if (!element || typeof element.focus !== 'function') return;
-      element.focus();
-      try {
-        const selection = window.getSelection?.();
-        if (!selection) return;
-        const range = document.createRange();
-        range.selectNodeContents(element);
-        range.collapse(false);
-        selection.removeAllRanges();
-        selection.addRange(range);
-      } catch (_) {}
+      globalNotesReadInlineEditRuntime?.placeCaretAtEndOfElement?.(element);
     }
 
     function beginGlobalReadInlineEdit(target = 'content') {
-      if (!canInlineEditGlobalReadModal()) return;
-      const refs = ensureGlobalReadInlineQuillUi();
-      const titleEl = document.getElementById('global-read-title');
-      if (!refs || !titleEl) return;
-      if (!globalReadInlineEditActive) {
-        globalReadInlineOriginalTitle = String(titleEl.textContent || '').trim();
-        globalReadInlineOriginalContentHtml = String(refs.contentEl.innerHTML || '');
-      }
-      globalReadInlineEditActive = true;
-      refs.modal.dataset.inlineEdit = '1';
-      titleEl.setAttribute('contenteditable', 'true');
-      titleEl.setAttribute('spellcheck', 'true');
-      refs.displayWrap.classList.add('hidden');
-      refs.editWrap.classList.remove('hidden');
-      if (globalReadInlineQuill) {
-        globalReadInlineQuill.enable(true);
-        globalReadInlineQuill.clipboard.dangerouslyPasteHTML(globalReadInlineOriginalContentHtml || '<p><br></p>');
-      } else if (refs.editorEl) {
-        refs.editorEl.innerHTML = globalReadInlineOriginalContentHtml || '<p><br></p>';
-        refs.editorEl.setAttribute('contenteditable', 'true');
-      }
-      if (String(target || '') === 'title') {
-        placeCaretAtEndOfElement(titleEl);
-      } else if (globalReadInlineQuill) {
-        globalReadInlineQuill.focus();
-      } else {
-        placeCaretAtEndOfElement(refs.editorEl);
-      }
+      globalNotesReadInlineEditRuntime?.beginGlobalReadInlineEdit?.(target);
     }
 
     function cancelGlobalReadInlineEdit(options = {}) {
-      if (!globalReadInlineEditActive) return;
-      const titleEl = document.getElementById('global-read-title');
-      const contentEl = document.getElementById('global-read-content');
-      if (titleEl) titleEl.textContent = globalReadInlineOriginalTitle || 'Note sans titre';
-      if (contentEl) contentEl.innerHTML = globalReadInlineOriginalContentHtml || '<p>Aucun contenu.</p>';
-      resetGlobalReadInlineEditState();
-      if (!options?.silent) showToast('Édition annulée');
+      globalNotesReadInlineEditRuntime?.cancelGlobalReadInlineEdit?.(options);
     }
 
     async function saveGlobalReadInlineEdit(options = {}) {
-      if (!globalReadInlineEditActive || globalReadInlineEditSaving) return false;
-      const noteId = String(globalReadModalNoteId || '').trim();
-      if (!noteId) return false;
-      const titleEl = document.getElementById('global-read-title');
-      if (!titleEl) return false;
-      const note = await getDecrypted('globalNotes', noteId, 'noteId');
-      if (!note) return false;
-      if (!canManageGlobalNote(note)) {
-        showToast('Action non autorisee');
-        return false;
-      }
-
-      const nextTitle = String(titleEl.textContent || '').trim();
-      const rawHtml = globalReadInlineQuill
-        ? String(globalReadInlineQuill.root?.innerHTML || '').trim()
-        : String(document.getElementById('global-read-inline-editor')?.innerHTML || '').trim();
-      const nextContentHtml = sanitizeProjectDescriptionHtml(rawHtml || '<p><br></p>');
-      const nextContent = getProjectDescriptionPlainText(nextContentHtml).trim();
-      const prevTitle = String(note.title || '').trim();
-      const prevContentHtml = sanitizeProjectDescriptionHtml(String(note.contentHtml || '').trim() || plainTextToRichHtml(String(note.content || '').trim()));
-      const prevContent = getProjectDescriptionPlainText(prevContentHtml).trim();
-      const titleChanged = nextTitle !== prevTitle;
-      const contentChanged = nextContentHtml !== prevContentHtml || nextContent !== prevContent;
-      if (!titleChanged && !contentChanged) {
-        resetGlobalReadInlineEditState();
-        return false;
-      }
-
-      globalReadInlineEditSaving = true;
-      try {
-        const updated = {
-          ...note,
-          title: nextTitle,
-          content: nextContent,
-          contentHtml: nextContentHtml,
-          updatedAt: Date.now()
-        };
-        await putEncrypted('globalNotes', updated, 'noteId');
-        await syncGlobalNoteFeed(updated);
-        if (workspaceMode === 'global' && globalWorkspaceView === 'feed') {
-          await renderGlobalFeed();
-        }
-        globalNotesFocusNoteId = noteId;
-        await renderGlobalNotes();
-        await openGlobalNoteReadModal(noteId);
-        if (!options?.silent) showToast('Note mise a jour');
-        return true;
-      } catch (error) {
-        console.error('Erreur sauvegarde note globale inline:', error);
-        showToast(`Erreur de sauvegarde: ${error.message || 'inconnue'}`);
-        return false;
-      } finally {
-        globalReadInlineEditSaving = false;
-      }
+      return await globalNotesReadInlineEditRuntime?.saveGlobalReadInlineEdit?.(options);
     }
 
     async function migrateLegacyInlineGlobalNoteAttachmentsOnce() {
@@ -16070,7 +15691,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       try {
         if (localStorage.getItem(GLOBAL_NOTES_INLINE_DOCS_MIGRATION_KEY) === '1') return;
       } catch (_) {}
-      const notes = await getAllDecrypted('globalNotes', 'noteId');
+      const notes = await getAllGlobalNotesCached();
       if (!Array.isArray(notes) || notes.length === 0) {
         try { localStorage.setItem(GLOBAL_NOTES_INLINE_DOCS_MIGRATION_KEY, '1'); } catch (_) {}
         return;
@@ -16105,7 +15726,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
           content: cleanedContentText,
           linkedDocIds: mergedLinked
         };
-        await putEncrypted('globalNotes', updatedNote, 'noteId');
+        await putGlobalNoteCached(updatedNote);
         await syncGlobalNoteLinkedDocuments(noteId, mergedLinked);
         for (const docId of inlineDocIds) {
           const row = docsById.get(String(docId || '').trim());
@@ -16119,6 +15740,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
               linkedNoteIds: Array.from(new Set([...currentLinks, noteId])),
               updatedAt: Date.now()
             }, 'id');
+            invalidateGlobalDocsReadModel();
           }
         }
         changedCount += 1;
@@ -16130,759 +15752,25 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     async function openGlobalNoteReadModal(noteId = '') {
-      await migrateLegacyInlineGlobalNoteAttachmentsOnce();
-      const notesShared = window.TaskMDANotesShared;
-      const nid = String(noteId || '').trim();
-      if (!nid) return;
-      const note = await getDecrypted('globalNotes', nid, 'noteId');
-      if (!note) {
-        showToast('Note introuvable');
-        return;
-      }
-      const modal = document.getElementById('modal-global-read');
-      const titleEl = document.getElementById('global-read-title');
-      const metaEl = document.getElementById('global-read-meta');
-      const badgesEl = document.getElementById('global-read-badges');
-      const contentEl = document.getElementById('global-read-content');
-      const tagsEl = document.getElementById('global-read-tags');
-      const linksEl = document.getElementById('global-read-links');
-      const editBtn = document.getElementById('btn-global-read-edit');
-      const deleteBtn = document.getElementById('btn-global-read-delete');
-      if (!modal || !titleEl || !metaEl || !badgesEl || !contentEl || !linksEl) return;
-
-      const identity = resolveKnownUserIdentity(String(note.createdBy || ''), String(note.createdByName || fallbackDirectoryName(note.createdBy || '')));
-      const author = String(identity?.name || note.createdByName || fallbackDirectoryName(note.createdBy || '')).trim() || 'Auteur';
-      const visibility = normalizeGlobalNoteVisibility(note.visibility);
-      const theme = String(note.theme || '').trim();
-      const tags = Array.isArray(note.tags) ? note.tags.map((tag) => String(tag || '').trim()).filter(Boolean) : [];
-      const rawContentHtml = String(note.contentHtml || '').trim() || plainTextToRichHtml(String(note.content || '').trim());
-      const contentHtml = sanitizeRichTextHtmlPreserve(stripInlineAttachedDocumentBlocksFromHtml(rawContentHtml));
-      const inlineDocIds = new Set(extractLinkedGlobalDocIdsFromHtml(rawContentHtml));
-      const storedLinkedDocIds = new Set(
-        (Array.isArray(note.linkedDocIds) ? note.linkedDocIds : [])
-          .map((id) => String(id || '').trim())
-          .filter(Boolean)
-      );
-      const linkedDocs = (await getAllDecrypted('globalDocs', 'id') || [])
-        .filter((doc) => {
-          const docId = String(doc?.id || '').trim();
-          if (!docId) return false;
-          if (inlineDocIds.has(docId) || storedLinkedDocIds.has(docId)) return true;
-          return Array.isArray(doc?.linkedNoteIds) && doc.linkedNoteIds.map((id) => String(id || '').trim()).includes(nid);
-        })
-        .map((doc) => ({ id: String(doc?.id || '').trim(), name: String(doc?.name || 'Document').trim() || 'Document' }))
-        .filter((doc) => doc.id);
-
-      const titleText = String(note.title || '').trim() || 'Note sans titre';
-      const metaText = `${author} • ${new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR')}`;
-      const badgeItems = [
-        { label: visibility === 'transverse' ? 'Transverse' : 'Privee', className: visibility === 'transverse' ? 'bg-blue-100 text-blue-700' : 'bg-slate-100 text-slate-700' },
-        note.shareToGlobalFeed ? { label: 'Dans le fil', className: 'bg-indigo-100 text-indigo-700' } : null,
-        theme ? { label: theme, className: 'bg-emerald-100 text-emerald-700' } : null
-      ].filter(Boolean);
-      const badgesHtml = notesShared?.renderBadgeChips ? notesShared.renderBadgeChips(badgeItems) : '';
-      const tagsHtml = notesShared?.renderTagChips ? notesShared.renderTagChips(tags, 'Aucun tag') : '<span class="text-xs text-slate-500">Aucun tag</span>';
-      const docsHtml = linkedDocs.length
-        ? `<div class="mt-2 flex flex-col gap-2">${linkedDocs.map((doc) => {
-            const ref = encodeDocumentPreviewRef({
-              sourceType: 'standalone',
-              id: doc.id,
-              sourceProjectName: 'Hors projet'
-            });
-            if (notesShared?.renderInlineDocLinks) {
-              return notesShared.renderInlineDocLinks([{
-                name: doc.name,
-                previewPayload: { refPayload: ref },
-                downloadPayload: { refPayload: ref },
-                deletePayload: canManageGlobalNote(note) ? { noteId: nid, docId: doc.id } : null
-              }], { previewLabel: 'Ouvrir', downloadLabel: 'Télécharger' });
-            }
-            return `<div class="flex flex-wrap items-center gap-2"><span class="inline-flex text-xs px-2 py-1 rounded-full bg-slate-100 text-slate-700 font-semibold">${escapeHtml(doc.name)}</span></div>`;
-          }).join('')}</div>`
-        : '<p class="text-xs text-slate-500 mt-1">Aucun document lié</p>';
-      const linksHtml = `<p class="text-xs text-slate-500">Aucune tache liee</p>${docsHtml}`;
-      if (notesShared?.applyReadModalContent) {
-        notesShared.applyReadModalContent({
-          titleId: 'global-read-title',
-          titleText,
-          metaId: 'global-read-meta',
-          metaText,
-          badgesId: 'global-read-badges',
-          badgesHtml,
-          contentId: 'global-read-content',
-          contentHtml: contentHtml || '<p>Aucun contenu.</p>',
-          tagsId: 'global-read-tags',
-          tagsHtml,
-          linksId: 'global-read-links',
-          linksHtml
-        });
-        notesShared.bindInlineDocLinkActions?.('global-read-links', linkedDocs.map((doc) => {
-          const ref = encodeDocumentPreviewRef({
-            sourceType: 'standalone',
-            id: doc.id,
-            sourceProjectName: 'Hors projet'
-          });
-          return {
-            previewPayload: { refPayload: ref },
-            downloadPayload: { refPayload: ref },
-            deletePayload: canManageGlobalNote(note) ? { noteId: nid, docId: doc.id } : null
-          };
-        }), {
-          onPreview(payload) {
-            const ref = String(payload?.refPayload || '').trim();
-            if (!ref) return;
-            openDocumentPreviewByRef(ref);
-          },
-          onDownload(payload) {
-            const ref = String(payload?.refPayload || '').trim();
-            if (!ref) return;
-            downloadDocumentByRef(ref);
-          },
-          onDelete(payload) {
-            const noteId = String(payload?.noteId || '').trim();
-            const docId = String(payload?.docId || '').trim();
-            if (!noteId || !docId) return;
-            deleteGlobalNoteLinkedDocument(noteId, docId);
-          }
-        });
-      } else {
-        titleEl.textContent = titleText;
-        metaEl.textContent = metaText;
-        badgesEl.innerHTML = badgesHtml;
-        contentEl.innerHTML = contentHtml || '<p>Aucun contenu.</p>';
-        if (tagsEl) tagsEl.innerHTML = tagsHtml;
-        linksEl.innerHTML = linksHtml;
-      }
-      const canManage = canManageGlobalNote(note);
-      modal.dataset.canManage = canManage ? '1' : '0';
-      if (editBtn) {
-        editBtn.classList.toggle('hidden', !canManage);
-        editBtn.setAttribute('data-note-id', nid);
-      }
-      if (deleteBtn) {
-        deleteBtn.classList.toggle('hidden', !canManage);
-        deleteBtn.setAttribute('data-note-id', nid);
-      }
-      const exportButtons = ['btn-global-read-export-html', 'btn-global-read-export-pdf', 'btn-global-read-export-docx', 'btn-global-read-export-txt'];
-      exportButtons.forEach((id) => document.getElementById(id)?.setAttribute('data-note-id', nid));
-      globalReadModalLastFocusedElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-      globalReadModalNoteId = nid;
-      resetGlobalReadInlineEditState();
-
-      notesShared?.openModal?.('modal-global-read');
-      if (!notesShared) {
-        modal.classList.remove('hidden');
-        document.body.classList.add('overflow-hidden');
-      }
-    }
-
-    function getProjectNoteByIdForExport(noteId = '') {
-      const nid = String(noteId || '').trim();
-      if (!nid || !currentProjectState?.project) return null;
-      return getProjectNotesForState(currentProjectState).find((row) => String(row?.noteId || '').trim() === nid) || null;
+      await globalNotesReadModalContentRuntime?.openGlobalNoteReadModal?.(noteId);
     }
 
     async function exportProjectNote(noteId = '', format = 'html') {
-      const note = getProjectNoteByIdForExport(noteId);
-      if (!note) {
-        showToast('Note introuvable');
-        return;
-      }
-      const title = String(note.title || '').trim() || 'Note';
-      const safeTitle = sanitizeFilenameSegment(title);
-      const tag = formatExportDateTag();
-      const contentHtml = sanitizeRichTextHtmlPreserve(String(note.contentHtml || '').trim() || plainTextToRichHtml(String(note.content || '').trim()));
-      const tags = Array.isArray(note.tags) ? note.tags.map((entry) => String(entry || '').trim()).filter(Boolean) : [];
-      const author = resolveKnownUserIdentity(
-        String(note.createdBy || '').trim(),
-        String(note.createdByName || fallbackDirectoryName(note.createdBy || '') || 'Auteur').trim()
-      )?.name || String(note.createdByName || 'Auteur');
-      const dateFormatted = new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR');
-
-      const targetFormat = String(format || '').trim().toLowerCase();
-      if (targetFormat === 'txt') {
-        const plain = getProjectDescriptionPlainText(contentHtml);
-        const payload = `${title}\n\n${plain}\n`;
-        downloadBlobFile(payload, `note_projet_${safeTitle}_${tag}.txt`, 'text/plain;charset=utf-8');
-        showToast('Note projet exportee (TXT)');
-        return;
-      }
-      if (targetFormat === 'html') {
-        const html = `<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1e293b}h1{margin:0 0 8px}.meta{color:#64748b;font-size:13px;margin-bottom:12px}.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}.chip{font-size:11px;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;color:#334155}</style></head><body><h1>${escapeHtml(title)}</h1><p class="meta">${escapeHtml(author)} | ${escapeHtml(dateFormatted)}</p><div class="chips">${tags.map((entry) => `<span class="chip">#${escapeHtml(entry)}</span>`).join('')}</div><article>${contentHtml || '<p>Aucun contenu.</p>'}</article></body></html>`;
-        downloadBlobFile(html, `note_projet_${safeTitle}_${tag}.html`, 'text/html;charset=utf-8');
-        showToast('Note projet exportee (HTML)');
-        return;
-      }
-      if (targetFormat === 'pdf') {
-        const printHtml = `<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{font-family:'Segoe UI',Arial,sans-serif;padding:24px;color:#1e293b;max-width:800px;margin:0 auto}h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}.meta{color:#64748b;font-size:12px;margin-bottom:12px}.tags{margin-bottom:14px}.tag{display:inline-block;font-size:10px;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;color:#334155;margin-right:6px;margin-bottom:4px}.content{margin-top:20px;line-height:1.6;color:#1e293b}.content img{max-width:100%;height:auto}@media print{body{padding:0}}</style></head><body><h1>${escapeHtml(title)}</h1><p class="meta">${escapeHtml(author)} | ${escapeHtml(dateFormatted)}</p>${tags.length ? `<div class="tags">${tags.map(t => `<span class="tag">#${escapeHtml(t)}</span>`).join('')}</div>` : ''}<div class="content">${contentHtml || '<p>Cette note ne contient aucun contenu.</p>'}</div></body></html>`;
-        let popup = null;
-        try { popup = window.open('', '_blank', 'width=900,height=700'); } catch (_) { popup = null; }
-        if (popup && popup.document) {
-          popup.document.open();
-          popup.document.write(printHtml);
-          popup.document.close();
-          setTimeout(() => { try { popup.print(); } catch (_) {} }, 300);
-          showToast('Impression ouverte - choisissez Enregistrer en PDF');
-        } else {
-          showToast('Impossible d ouvrir la fenetre d impression');
-        }
-        return;
-      }
-      if (targetFormat === 'docx') {
-        const { wordML, images, relationships } = convertHtmlToWordML(contentHtml);
-        const files = [
-          { name: '[Content_Types].xml', data: generateContentTypesXml(images), mtime: Date.now() },
-          { name: '_rels/.rels', data: generateRootRelsXml(), mtime: Date.now() },
-          { name: 'word/document.xml', data: generateDocumentXml({ title, author, dateFormatted, tags }, wordML), mtime: Date.now() },
-          { name: 'word/styles.xml', data: generateStylesXml(), mtime: Date.now() }
-        ];
-        if (images.length > 0) {
-          files.push({ name: 'word/_rels/document.xml.rels', data: generateDocumentRelsXml(relationships), mtime: Date.now() });
-          images.forEach((img) => {
-            files.push({ name: `word/media/${img.filename}`, data: base64ToUint8Array(img.base64), mtime: Date.now() });
-          });
-        }
-        const zipBytes = buildZipStoreArchive(files);
-        downloadBlobFile(
-          new Blob([zipBytes], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }),
-          `note_projet_${safeTitle}_${tag}.docx`,
-          'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-        );
-        showToast('Note projet exportee (DOCX)');
-      }
+      await projectReadActionsUiRuntime?.exportProjectNote?.(noteId, format);
     }
 
     function toggleProjectNoteExportMenu(noteId, event) {
-      if (event) {
-        event.stopPropagation();
-        event.preventDefault();
-      }
-      const nid = String(noteId || '').trim();
-      if (!nid) return;
-      const menu = document.getElementById(`project-note-export-menu-${nid}`);
-      const btn = document.getElementById(`project-note-export-menu-btn-${nid}`);
-      if (!menu || !btn) return;
-      document.querySelectorAll('[id^="project-note-export-menu-"]').forEach((otherMenu) => {
-        if (otherMenu.id === menu.id || otherMenu.id.startsWith('project-note-export-menu-btn-')) return;
-        otherMenu.classList.add('hidden');
-        const otherId = otherMenu.id.replace('project-note-export-menu-', '');
-        const otherBtn = document.getElementById(`project-note-export-menu-btn-${otherId}`);
-        if (otherBtn) otherBtn.setAttribute('aria-expanded', 'false');
-      });
-      const isHidden = menu.classList.contains('hidden');
-      menu.classList.toggle('hidden', !isHidden);
-      btn.setAttribute('aria-expanded', isHidden ? 'true' : 'false');
+      projectReadActionsUiRuntime?.toggleProjectNoteExportMenu?.(noteId, event);
     }
 
     function closeProjectNoteExportMenu(noteId) {
-      const nid = String(noteId || '').trim();
-      if (!nid) return;
-      const menu = document.getElementById(`project-note-export-menu-${nid}`);
-      const btn = document.getElementById(`project-note-export-menu-btn-${nid}`);
-      if (menu) menu.classList.add('hidden');
-      if (btn) btn.setAttribute('aria-expanded', 'false');
-    }
-
-    async function openGlobalFeedPostReadModal(postId = '') {
-      const pid = String(postId || '').trim();
-      if (!pid) return;
-      const notesShared = window.TaskMDANotesShared;
-      const post = await getDecrypted('globalPosts', pid, 'postId');
-      if (!post || post.deletedAt) {
-        showToast('Post introuvable');
-        return;
-      }
-      const modal = document.getElementById('modal-global-read');
-      const titleEl = document.getElementById('global-read-title');
-      const metaEl = document.getElementById('global-read-meta');
-      const badgesEl = document.getElementById('global-read-badges');
-      const contentEl = document.getElementById('global-read-content');
-      const linksEl = document.getElementById('global-read-links');
-      if (!modal || !titleEl || !metaEl || !badgesEl || !contentEl || !linksEl) return;
-
-      let mentionCatalog = globalFeedMentionCatalogCache;
-      if (!mentionCatalog) {
-        mentionCatalog = await buildGlobalMentionCatalog();
-        globalFeedMentionCatalogCache = mentionCatalog;
-      }
-      const title = String(post.title || '').trim() || 'Information';
-      const author = String(post.authorName || fallbackDirectoryName(post.authorUserId || '')).trim() || 'Auteur';
-      const typeMeta = getDashboardNewsTypeMeta(post);
-      const refs = Array.isArray(post.refs) ? post.refs : [];
-      const allDocs = await getAllDecrypted('globalDocs', 'id');
-      const linkedDocs = await resolveLinkedDocsForFeedPost(post, allDocs);
-
-      titleEl.textContent = title;
-      metaEl.textContent = `${author} • ${new Date(Number(post.updatedAt || post.createdAt || Date.now())).toLocaleString('fr-FR')}`;
-      badgesEl.innerHTML = `<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-slate-100 text-slate-700 font-semibold">${escapeHtml(typeMeta.label)}</span>`;
-      contentEl.innerHTML = renderGlobalFeedContentHtml(post.content || '', mentionCatalog) || '<p>Aucun contenu.</p>';
-      const refsHtml = refs.map((ref) => `
-        <button type="button" class="workspace-action-inline" data-action-kind="open" data-action-label="Ouvrir la reference" data-doc-action="${DOC_ACTION.OPEN_REFERENCE}" data-doc-ref-type="${escapeHtml(String(ref?.type || ''))}" data-doc-ref-id="${encodeURIComponent(String(ref?.id || ''))}">
-          ${escapeHtml(String(ref?.label || 'Reference'))}
-        </button>
-      `).join('');
-      const docsHtml = linkedDocs.map((doc) => {
-        const ref = String(doc?.ref || '').trim();
-        if (!ref) return '';
-        if (notesShared?.renderInlineDocLinks) {
-          return notesShared.renderInlineDocLinks([{
-            name: doc.name,
-            previewPayload: { refPayload: ref },
-            downloadPayload: { refPayload: ref }
-          }], { previewLabel: 'Aperçu', downloadLabel: 'Télécharger' });
-        }
-        return `<div class="inline-flex items-center gap-1 mr-2 mb-1"><span class="inline-flex items-center text-xs text-slate-700">📎 ${escapeHtml(doc.name)}</span></div>`;
-      }).join('');
-      linksEl.innerHTML = `${refsHtml}${docsHtml}`;
-      notesShared?.bindInlineDocLinkActions?.('global-read-links', linkedDocs.map((doc) => {
-        const ref = String(doc?.ref || '').trim();
-        return {
-          previewPayload: ref ? { refPayload: ref } : null,
-          downloadPayload: ref ? { refPayload: ref } : null
-        };
-      }), {
-        onPreview(payload) {
-          const ref = String(payload?.refPayload || '').trim();
-          if (!ref) return;
-          openDocumentPreviewByRef(ref);
-        },
-        onDownload(payload) {
-          const ref = String(payload?.refPayload || '').trim();
-          if (!ref) return;
-          downloadDocumentByRef(ref);
-        }
-      });
-      if (!linksEl.__taskMdaFeedRefDelegationBound) {
-        linksEl.addEventListener('click', (event) => {
-          const btn = event.target instanceof Element ? event.target.closest(`[data-doc-action="${DOC_ACTION.OPEN_REFERENCE}"]`) : null;
-          if (!btn) return;
-          event.preventDefault();
-          event.stopPropagation();
-          const type = String(btn.getAttribute('data-doc-ref-type') || '').trim();
-          const id = String(btn.getAttribute('data-doc-ref-id') || '').trim();
-          if (!type || !id) return;
-          openGlobalFeedReference(type, id);
-        });
-        linksEl.__taskMdaFeedRefDelegationBound = true;
-      }
-
-      notesShared?.openModal?.('modal-global-read');
-      if (!notesShared) {
-        modal.classList.remove('hidden');
-        document.body.classList.add('overflow-hidden');
-      }
-    }
-
-    function buildGlobalNoteCardHtml(note, options = {}) {
-      const notesShared = window.TaskMDANotesShared;
-      const canManage = !!options.canManage;
-      const bulkSelectionMode = !!options.bulkSelectionMode;
-      const isSelectedForBulkDelete = !!options.isSelectedForBulkDelete;
-      const author = String(options.authorName || note.createdByName || fallbackDirectoryName(note.createdBy || '') || 'Auteur');
-      const visibility = normalizeGlobalNoteVisibility(note.visibility);
-      const theme = String(note.theme || '').trim();
-      const tags = Array.isArray(note.tags) ? note.tags.map((tag) => String(tag || '').trim()).filter(Boolean) : [];
-      const linkedDocs = Array.isArray(options.linkedDocs) ? options.linkedDocs : [];
-      const isFavorite = Number(note.favoriteAt || 0) > 0;
-      const rawContentHtml = String(note.contentHtml || '').trim() || plainTextToRichHtml(String(note.content || '').trim());
-      const cleanedContentHtml = sanitizeRichTextHtmlPreserve(stripInlineAttachedDocumentBlocksFromHtml(rawContentHtml));
-      const previewText = getProjectDescriptionPlainText(cleanedContentHtml || plainTextToRichHtml(String(note.content || '').trim()))
-        .replace(/\s+/g, ' ')
-        .trim();
-      const isFocused = String(globalNotesFocusNoteId || '').trim() === String(note.noteId || '').trim();
-      return `
-        <article id="global-note-${escapeHtml(note.noteId)}" class="global-note-card rounded-xl border ${isFocused ? 'border-blue-400 shadow-[0_0_0_2px_rgba(59,130,246,0.14)]' : 'border-slate-200'} bg-white p-4 cursor-pointer ${isSelectedForBulkDelete ? 'is-bulk-selected' : ''}" onclick="openGlobalNoteReadModal('${escapeHtml(note.noteId)}')">
-          <div class="flex items-start justify-between gap-3">
-            <div class="min-w-0 flex-1">
-              <div class="flex flex-wrap items-center gap-2">
-                ${bulkSelectionMode ? `
-                  <label class="taskmda-bulk-checkbox-wrap" onclick="event.stopPropagation()">
-                    <input type="checkbox" class="taskmda-bulk-checkbox-input" data-note-id="${escapeHtml(note.noteId)}" ${isSelectedForBulkDelete ? 'checked' : ''} ${canManage ? '' : 'disabled'} onchange="toggleGlobalNoteBulkSelection('${escapeHtml(note.noteId)}', this.checked)" aria-label="Selectionner la note ${escapeHtml(note.title || '')}">
-                    <span class="taskmda-bulk-checkbox-label">Selection</span>
-                  </label>
-                ` : ''}
-                <span class="inline-flex text-[10px] px-2 py-1 rounded-full ${visibility === 'transverse' ? 'bg-blue-100 text-blue-700' : 'bg-slate-100 text-slate-700'} font-semibold">${visibility === 'transverse' ? 'Transverse' : 'Privee'}</span>
-                ${note.shareToGlobalFeed ? '<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-indigo-100 text-indigo-700 font-semibold">Dans le fil</span>' : ''}
-                ${isFavorite ? '<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-amber-100 text-amber-700 font-semibold">Favori</span>' : ''}
-                ${linkedDocs.length > 0 ? `<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-indigo-100 text-indigo-700 font-semibold">${linkedDocs.length} document(s) lie(s)</span>` : ''}
-                ${theme ? `<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 font-semibold">${escapeHtml(theme)}</span>` : ''}
-              </div>
-              <h4 class="mt-2 text-base font-bold text-slate-800">${escapeHtml(note.title || 'Note sans titre')}</h4>
-              <p class="mt-1 text-xs text-slate-500">${escapeHtml(author)} • ${new Date(Number(note.createdAt || Date.now())).toLocaleString('fr-FR')}</p>
-
-              <div class="collapsible-wrapper">
-                <div class="collapsible-content is-collapsed">
-                  <div class="mt-3 ql-snow">
-                    <div class="ql-editor p-0 text-sm text-slate-600 markdown-content" style="min-height: auto; overflow-y: hidden; cursor: inherit;">
-                      ${cleanedContentHtml || plainTextToRichHtml(note.content || 'Aucun contenu.')}
-                    </div>
-                  </div>
-                </div>
-                <button type="button" class="collapsible-toggle hidden">
-                  <span class="label">Afficher le descriptif</span>
-                </button>
-              </div>
-
-              ${tags.length ? `<div class="mt-3 flex flex-wrap gap-1">${tags.map((tag) => `<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-slate-100 text-slate-700 font-semibold">#${escapeHtml(tag)}</span>`).join('')}</div>` : ''}
-              ${linkedDocs.length ? `
-                <div class="mt-3">
-                  <p class="text-xs font-semibold text-slate-600 mb-1">Documents lies (${linkedDocs.length})</p>
-                  <div class="flex flex-wrap items-center gap-2">
-                    ${linkedDocs.slice(0, 4).map((doc) => {
-                      const ref = encodeDocumentPreviewRef({
-                        sourceType: 'standalone',
-                        id: doc.id,
-                        sourceProjectName: 'Hors projet'
-                      });
-                      if (notesShared?.renderInlineDocLinks) {
-                        return notesShared.renderInlineDocLinks([{
-                          name: String(doc.name || 'Document'),
-                          previewPayload: { refPayload: ref },
-                          downloadPayload: { refPayload: ref }
-                        }]);
-                      }
-                      return `<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-slate-100 text-slate-700 font-semibold">${escapeHtml(String(doc.name || 'Document'))}</span>`;
-                    }).join('')}
-                    ${linkedDocs.length > 4 ? `<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-slate-100 text-slate-700 font-semibold">+${linkedDocs.length - 4}</span>` : ''}
-                  </div>
-                </div>
-              ` : ''}
-            </div>
-            ${canManage ? `
-              <div class="flex items-center gap-1" onclick="event.stopPropagation();">
-                <button type="button" class="task-action-btn" data-action-kind="edit" data-action-label="Modifier la note" aria-label="Modifier la note" title="Modifier" onclick="openGlobalNoteEditor('${escapeHtml(note.noteId)}')"><span class="material-symbols-outlined taskmda-action-icon" aria-hidden="true">edit</span></button>
-                <button type="button" class="task-action-btn task-action-btn-subtle" data-action-kind="manage" data-action-label="${isFavorite ? 'Retirer des favoris' : 'Ajouter aux favoris'}" aria-label="${isFavorite ? 'Retirer des favoris' : 'Ajouter aux favoris'}" title="${isFavorite ? 'Retirer des favoris' : 'Ajouter aux favoris'}" onclick="toggleGlobalNoteFavorite('${escapeHtml(note.noteId)}')"><span class="material-symbols-outlined taskmda-action-icon" aria-hidden="true">tune</span></button>
-                <button type="button" class="task-action-btn task-action-btn-subtle" data-action-kind="notify" data-action-label="Publier dans le fil" aria-label="Publier dans le fil" title="${note.shareToGlobalFeed ? 'Retirer du fil' : 'Publier dans le fil'}" onclick="toggleGlobalNoteFeedPublish('${escapeHtml(note.noteId)}')"><span class="material-symbols-outlined taskmda-action-icon" aria-hidden="true">mail</span></button>
-                <button type="button" class="task-action-btn task-action-btn-subtle" data-action-kind="export" data-action-label="Exporter TXT" aria-label="Exporter TXT" title="Exporter TXT" onclick="exportGlobalNote('${escapeHtml(note.noteId)}', 'txt')"><span class="material-symbols-outlined taskmda-action-icon" aria-hidden="true">download</span></button>
-                <button type="button" class="task-action-btn task-action-btn-subtle" data-action-kind="open" data-action-label="Ouvrir la note" aria-label="Ouvrir la note" title="Ouvrir" onclick="openGlobalNoteReadModal('${escapeHtml(note.noteId)}')"><span class="material-symbols-outlined taskmda-action-icon" aria-hidden="true">sync_alt</span></button>
-                <div class="relative inline-block">
-                  <button type="button" class="task-action-btn task-action-btn-subtle" data-action-kind="export" data-action-label="Menu d'export" aria-label="Menu d'export" title="Exporter (HTML/PDF/DOCX/TXT)" onclick="toggleGlobalNoteExportMenu('${escapeHtml(note.noteId)}', event)" aria-haspopup="true" aria-expanded="false" id="export-menu-btn-${escapeHtml(note.noteId)}"><span class="material-symbols-outlined taskmda-action-icon" aria-hidden="true">inventory_2</span></button>
-                  <div id="export-menu-${escapeHtml(note.noteId)}" class="hidden absolute right-0 mt-1 w-44 bg-white rounded-lg shadow-lg border border-slate-200 z-50 overflow-hidden" role="menu" onclick="event.stopPropagation();">
-                    <button type="button" class="export-menu-item w-full text-left px-3 py-2 text-sm hover:bg-slate-50 flex items-center gap-2" onclick="exportGlobalNote('${escapeHtml(note.noteId)}', 'html'); closeGlobalNoteExportMenu('${escapeHtml(note.noteId)}');" role="menuitem"><span class="material-symbols-outlined" style="font-size: 16px;">code</span>Exporter HTML</button>
-                    <button type="button" class="export-menu-item w-full text-left px-3 py-2 text-sm hover:bg-slate-50 flex items-center gap-2" onclick="exportGlobalNoteAsPdf('${escapeHtml(note.noteId)}'); closeGlobalNoteExportMenu('${escapeHtml(note.noteId)}');" role="menuitem"><span class="material-symbols-outlined" style="font-size: 16px;">picture_as_pdf</span>Exporter PDF</button>
-                    <button type="button" class="export-menu-item w-full text-left px-3 py-2 text-sm hover:bg-slate-50 flex items-center gap-2" onclick="exportGlobalNoteAsDocx('${escapeHtml(note.noteId)}'); closeGlobalNoteExportMenu('${escapeHtml(note.noteId)}');" role="menuitem"><span class="material-symbols-outlined" style="font-size: 16px;">description</span>Exporter DOCX</button>
-                    <button type="button" class="export-menu-item w-full text-left px-3 py-2 text-sm hover:bg-slate-50 flex items-center gap-2" onclick="exportGlobalNote('${escapeHtml(note.noteId)}', 'txt'); closeGlobalNoteExportMenu('${escapeHtml(note.noteId)}');" role="menuitem"><span class="material-symbols-outlined" style="font-size: 16px;">text_snippet</span>Exporter TXT</button>
-                  </div>
-                </div>
-                <button type="button" class="task-action-btn task-action-btn-danger" data-action-kind="danger" data-action-label="Supprimer la note" aria-label="Supprimer la note" title="Supprimer" onclick="deleteGlobalNote('${escapeHtml(note.noteId)}')"><span class="material-symbols-outlined taskmda-action-icon" aria-hidden="true">delete</span></button>
-              </div>
-            ` : ''}
-          </div>
-          </div>
-        </article>
-      `;
-    }
-
-    function buildGlobalHubProjectNoteRef(projectId, noteId) {
-      const pid = encodeURIComponent(String(projectId || '').trim());
-      const nid = encodeURIComponent(String(noteId || '').trim());
-      return `project:${pid}:${nid}`;
-    }
-
-    function parseGlobalHubProjectNoteRef(refValue) {
-      const source = String(refValue || '').trim();
-      if (!source.startsWith('project:')) return null;
-      const payload = source.slice('project:'.length);
-      const sepIndex = payload.indexOf(':');
-      if (sepIndex <= 0) return null;
-      const pid = decodeURIComponent(payload.slice(0, sepIndex));
-      const nid = decodeURIComponent(payload.slice(sepIndex + 1));
-      if (!pid || !nid) return null;
-      return { projectId: pid, noteId: nid };
-    }
-
-    async function openGlobalHubAggregatedNoteRead(noteRef) {
-      const parsed = parseGlobalHubProjectNoteRef(noteRef);
-      if (!parsed) {
-        openGlobalNoteReadModal(String(noteRef || '').trim());
-        return;
-      }
-      await showProjectDetail(parsed.projectId, { resetScroll: false });
-      if (!currentProjectState?.project) {
-        showToast('Projet introuvable');
-        return;
-      }
-      const noteExists = getProjectNotesForState(currentProjectState).some(
-        (item) => String(item?.noteId || '').trim() === String(parsed.noteId || '').trim()
-      );
-      if (!noteExists) {
-        showToast('Note projet introuvable');
-        return;
-      }
-      setProjectView('notes');
-      projectNotesFocusNoteId = String(parsed.noteId || '').trim();
-      renderProjectNotes(currentProjectState);
-      setTimeout(() => {
-        openProjectNoteReadModal(parsed.noteId);
-      }, 40);
+      projectReadActionsUiRuntime?.closeProjectNoteExportMenu?.(noteId);
     }
 
     async function renderGlobalNotes() {
       await migrateLegacyInlineGlobalNoteAttachmentsOnce();
       ensureGlobalNotesVerticalThemeLayout();
-      const host = document.getElementById('global-notes-list');
-      const countEl = document.getElementById('global-notes-count');
-      const paginationContainer = document.getElementById('global-notes-pagination');
-      if (!host) return;
-      const allNotesRaw = await getAllDecrypted('globalNotes', 'noteId');
-      const allGlobalDocsRaw = await getAllDecrypted('globalDocs', 'id');
-      const linkedDocsByNoteId = new Map();
-      const linkedDocCountByNoteId = new Map();
-      (Array.isArray(allGlobalDocsRaw) ? allGlobalDocsRaw : []).forEach((doc) => {
-        const docId = String(doc?.id || '').trim();
-        if (!docId) return;
-        const docName = String(doc?.name || 'Document').trim() || 'Document';
-        const linkedNoteIds = Array.isArray(doc?.linkedNoteIds) ? doc.linkedNoteIds : [];
-        linkedNoteIds.forEach((noteId) => {
-          const nid = String(noteId || '').trim();
-          if (!nid) return;
-          if (!linkedDocsByNoteId.has(nid)) linkedDocsByNoteId.set(nid, []);
-          linkedDocsByNoteId.get(nid).push({ id: docId, name: docName });
-          linkedDocCountByNoteId.set(nid, Number(linkedDocCountByNoteId.get(nid) || 0) + 1);
-        });
-      });
-      const notesGlobal = (Array.isArray(allNotesRaw) ? allNotesRaw : []).filter((note) => !Number(note?.archivedAt || 0));
-      const aggregatedProjectNotes = [];
-      const me = String(currentUser?.userId || '').trim();
-      if (me) {
-        const projects = await getAllProjects();
-        const ownProjects = (Array.isArray(projects) ? projects : [])
-          .filter((project) => String(project?.createdBy || '').trim() === me);
-        for (const project of ownProjects) {
-          const projectId = String(project?.projectId || '').trim();
-          if (!projectId) continue;
-          const state = await getProjectState(projectId);
-          if (!state?.project) continue;
-          const projectName = String(state.project?.name || 'Projet').trim() || 'Projet';
-          const projectNotes = getProjectNotesForState(state).filter((note) => !Number(note?.archivedAt || 0));
-          projectNotes.forEach((note) => {
-            const sourceNoteId = String(note?.noteId || '').trim();
-            if (!sourceNoteId) return;
-            aggregatedProjectNotes.push({
-              ...note,
-              noteId: buildGlobalHubProjectNoteRef(projectId, sourceNoteId),
-              __origin: 'project',
-              __originProjectId: projectId,
-              __originProjectName: projectName,
-              __originNoteId: sourceNoteId
-            });
-          });
-        }
-      }
-      const notes = [
-        ...notesGlobal.map((note) => ({ ...note, __origin: 'global' })),
-        ...aggregatedProjectNotes
-      ];
-      renderGlobalNotesThemeTabs(notes);
-      const queryNeedle = normalizeSearch(globalNotesSearchQuery);
-      const filtered = notes
-        .filter((note) => {
-          const noteOrigin = String(note?.__origin || 'global');
-          if (globalNotesOriginFilter === 'global' && noteOrigin !== 'global') return false;
-          if (globalNotesOriginFilter === 'project' && noteOrigin !== 'project') return false;
-          const isProjectOrigin = String(note?.__origin || '') === 'project';
-          if (isProjectOrigin) {
-            if (globalNotesScopeFilter !== 'all') return false;
-            if (globalNotesTabMode === 'private' || globalNotesTabMode === 'transverse') return false;
-            if (globalNotesTabMode === 'mine' && String(note.createdBy || '').trim() !== me) return false;
-            if (globalNotesTabMode === 'favorites' && Number(note.favoriteAt || 0) <= 0) return false;
-            if (globalNotesTabMode === 'published' && note.shareToGlobalFeed !== true) return false;
-          }
-          const visibility = normalizeGlobalNoteVisibility(note.visibility);
-          if (!isProjectOrigin) {
-            if (visibility === 'private' && !isAppAdmin(currentUser?.userId) && String(note.createdBy || '').trim() !== me) return false;
-            if (globalNotesScopeFilter === 'private' && visibility !== 'private') return false;
-            if (globalNotesScopeFilter === 'transverse' && visibility !== 'transverse') return false;
-            if (globalNotesTabMode === 'mine' && String(note.createdBy || '').trim() !== me) return false;
-            if (globalNotesTabMode === 'favorites' && Number(note.favoriteAt || 0) <= 0) return false;
-            if (globalNotesTabMode === 'private' && visibility !== 'private') return false;
-            if (globalNotesTabMode === 'transverse' && visibility !== 'transverse') return false;
-            if (globalNotesTabMode === 'published' && note.shareToGlobalFeed !== true) return false;
-          }
-          if (globalNotesThemeFilter !== 'all') {
-            const match = getGlobalNoteThemeLabels(note).some(
-              (label) => normalizeCatalogKey(label) === globalNotesThemeFilter
-            );
-            if (!match) return false;
-          }
-          if (!queryNeedle) return true;
-          const blob = normalizeSearch([
-            note.title,
-            note.content,
-            note.theme,
-            ...(Array.isArray(note.tags) ? note.tags : [])
-          ].join(' '));
-          return blob.includes(queryNeedle);
-        })
-        .sort((a, b) => {
-          if (globalNotesSortMode === 'oldest') return Number(a.updatedAt || a.createdAt || 0) - Number(b.updatedAt || b.createdAt || 0);
-          if (globalNotesSortMode === 'favorites') {
-            const af = Number(a.favoriteAt || 0);
-            const bf = Number(b.favoriteAt || 0);
-            if ((af > 0) !== (bf > 0)) return bf - af;
-            if (af !== bf) return bf - af;
-            return Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0);
-          }
-          if (globalNotesSortMode === 'alpha') return String(a.title || '').localeCompare(String(b.title || ''), 'fr');
-          return Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0);
-        });
-      if (countEl) {
-        const n = filtered.length;
-        const selected = selectedGlobalNoteIdsForBulkDelete.size;
-        countEl.textContent = globalNotesBulkSelectionMode
-          ? `${n} note${n > 1 ? 's' : ''} • ${selected} selectionnee${selected > 1 ? 's' : ''}`
-          : `${n} note${n > 1 ? 's' : ''}`;
-      }
-      if (!filtered.length) {
-        host.innerHTML = `
-          <div class="workspace-empty-state">
-            <span class="workspace-empty-icon material-symbols-outlined" aria-hidden="true">sticky_note_2</span>
-            <p class="workspace-empty-title">Aucune note pour ces criteres</p>
-            <p class="workspace-empty-text">Essayez un autre filtre ou creez une nouvelle note.</p>
-          </div>
-        `;
-        if (paginationContainer) paginationContainer.innerHTML = '';
-      } else {
-        const pagination = paginateItems(filtered, globalNotesPage, paginationConfig.globalNotesPerPage);
-        globalNotesPage = pagination.currentPage;
-        if (globalNotesBulkSelectionMode) {
-          host.innerHTML = pagination.pageItems
-            .filter((note) => String(note?.__origin || '') !== 'project')
-            .map((note) => {
-            const identity = resolveKnownUserIdentity(String(note.createdBy || ''), String(note.createdByName || fallbackDirectoryName(note.createdBy || '')));
-            return buildGlobalNoteCardHtml(note, {
-              canManage: canManageGlobalNote(note),
-              authorName: identity?.name || note.createdByName || fallbackDirectoryName(note.createdBy || ''),
-              bulkSelectionMode: globalNotesBulkSelectionMode,
-              isSelectedForBulkDelete: selectedGlobalNoteIdsForBulkDelete.has(String(note.noteId || '').trim()),
-              linkedDocs: linkedDocsByNoteId.get(String(note.noteId || '').trim()) || []
-            });
-            })
-            .join('');
-          if (!host.innerHTML) {
-            host.innerHTML = `
-              <div class="workspace-empty-state">
-                <span class="workspace-empty-icon material-symbols-outlined" aria-hidden="true">sticky_note_2</span>
-                <p class="workspace-empty-title">Aucune note globale sélectionnable</p>
-                <p class="workspace-empty-text">Les notes projet restent visibles hors mode sélection multiple.</p>
-              </div>
-            `;
-          }
-        } else {
-          const renderer = window.TaskMDAProjectNotes?.renderUnifiedNotesList;
-          if (typeof renderer === 'function') {
-            const authorById = new Map();
-            const canManageById = new Map();
-            pagination.pageItems.forEach((note) => {
-              const noteId = String(note?.noteId || '').trim();
-              if (!noteId) return;
-              const identity = resolveKnownUserIdentity(String(note.createdBy || ''), String(note.createdByName || fallbackDirectoryName(note.createdBy || '')));
-              authorById.set(noteId, identity?.name || note.createdByName || fallbackDirectoryName(note.createdBy || ''));
-              canManageById.set(noteId, canManageGlobalNote(note));
-            });
-            renderer(host, {
-              notes: pagination.pageItems,
-              mode: 'all',
-              query: '',
-              currentUserId: String(currentUser?.userId || ''),
-              taskTitleById: new Map(),
-              authorById,
-              canManageById,
-              noteDocsCountById: linkedDocCountByNoteId,
-              focusNoteId: String(globalNotesFocusNoteId || ''),
-              cardIdPrefix: 'global-note',
-              openFn: 'openGlobalHubAggregatedNoteRead',
-              showTaskLinks: false,
-              extraBadgesRenderer: (note) => {
-                if (String(note?.__origin || '') !== 'project') return '';
-                const label = `Projet: ${String(note?.__originProjectName || 'Projet')}`;
-                return `<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-violet-100 text-violet-700 font-semibold">${escapeHtml(label)}</span>`;
-              },
-              actionsRenderer: (note, actionCtx) => {
-                if (String(note?.__origin || '') === 'project') return '';
-                const noteId = escapeHtml(String(note?.noteId || ''));
-                if (!actionCtx?.canManage) return '';
-                return `
-                  <button type="button" class="task-action-btn" data-action-kind="edit" data-action-label="Modifier la note" aria-label="Modifier la note" title="Modifier" onclick="openGlobalNoteEditor('${noteId}')"><span class="material-symbols-outlined taskmda-action-icon" aria-hidden="true">edit</span></button>
-                  <button type="button" class="task-action-btn task-action-btn-subtle" data-action-kind="manage" data-action-label="${Number(note.favoriteAt || 0) > 0 ? 'Retirer des favoris' : 'Ajouter aux favoris'}" aria-label="${Number(note.favoriteAt || 0) > 0 ? 'Retirer des favoris' : 'Ajouter aux favoris'}" title="${Number(note.favoriteAt || 0) > 0 ? 'Retirer des favoris' : 'Ajouter aux favoris'}" onclick="toggleGlobalNoteFavorite('${noteId}')"><span class="material-symbols-outlined taskmda-action-icon" aria-hidden="true">tune</span></button>
-                  <button type="button" class="task-action-btn task-action-btn-subtle" data-action-kind="notify" data-action-label="Publier dans le fil" aria-label="Publier dans le fil" title="${note.shareToGlobalFeed ? 'Retirer du fil' : 'Publier dans le fil'}" onclick="toggleGlobalNoteFeedPublish('${noteId}')"><span class="material-symbols-outlined taskmda-action-icon" aria-hidden="true">mail</span></button>
-                  <button type="button" class="task-action-btn task-action-btn-subtle" data-action-kind="export" data-action-label="Exporter TXT" aria-label="Exporter TXT" title="Exporter TXT" onclick="exportGlobalNote('${noteId}', 'txt')"><span class="material-symbols-outlined taskmda-action-icon" aria-hidden="true">download</span></button>
-                  <button type="button" class="task-action-btn task-action-btn-subtle" data-action-kind="open" data-action-label="Ouvrir la note" aria-label="Ouvrir la note" title="Ouvrir" onclick="openGlobalNoteReadModal('${noteId}')"><span class="material-symbols-outlined taskmda-action-icon" aria-hidden="true">sync_alt</span></button>
-                  <div class="relative inline-block">
-                    <button type="button" class="task-action-btn task-action-btn-subtle" data-action-kind="export" data-action-label="Menu d'export" aria-label="Menu d'export" title="Exporter (HTML/PDF/DOCX/TXT)" onclick="toggleGlobalNoteExportMenu('${noteId}', event)" aria-haspopup="true" aria-expanded="false" id="export-menu-btn-${noteId}">
-                      <span class="material-symbols-outlined taskmda-action-icon" aria-hidden="true">inventory_2</span>
-                    </button>
-                    <div id="export-menu-${noteId}" class="hidden absolute right-0 mt-1 w-44 bg-white rounded-lg shadow-lg border border-slate-200 z-50 overflow-hidden" role="menu" onclick="event.stopPropagation();">
-                      <button type="button" class="export-menu-item w-full text-left px-3 py-2 text-sm hover:bg-slate-50 flex items-center gap-2" onclick="exportGlobalNote('${noteId}', 'html'); closeGlobalNoteExportMenu('${noteId}');" role="menuitem"><span class="material-symbols-outlined" style="font-size: 16px;">code</span>Exporter HTML</button>
-                      <button type="button" class="export-menu-item w-full text-left px-3 py-2 text-sm hover:bg-slate-50 flex items-center gap-2" onclick="exportGlobalNoteAsPdf('${noteId}'); closeGlobalNoteExportMenu('${noteId}');" role="menuitem"><span class="material-symbols-outlined" style="font-size: 16px;">picture_as_pdf</span>Exporter PDF</button>
-                      <button type="button" class="export-menu-item w-full text-left px-3 py-2 text-sm hover:bg-slate-50 flex items-center gap-2" onclick="exportGlobalNoteAsDocx('${noteId}'); closeGlobalNoteExportMenu('${noteId}');" role="menuitem"><span class="material-symbols-outlined" style="font-size: 16px;">description</span>Exporter DOCX</button>
-                      <button type="button" class="export-menu-item w-full text-left px-3 py-2 text-sm hover:bg-slate-50 flex items-center gap-2" onclick="exportGlobalNote('${noteId}', 'txt'); closeGlobalNoteExportMenu('${noteId}');" role="menuitem"><span class="material-symbols-outlined" style="font-size: 16px;">text_snippet</span>Exporter TXT</button>
-                    </div>
-                  </div>
-                  <button type="button" class="task-action-btn task-action-btn-danger" data-action-kind="danger" data-action-label="Supprimer la note" aria-label="Supprimer la note" title="Supprimer" onclick="deleteGlobalNote('${noteId}')"><span class="material-symbols-outlined taskmda-action-icon" aria-hidden="true">delete</span></button>
-                `;
-              }
-            });
-          } else {
-            host.innerHTML = pagination.pageItems.map((note) => {
-              if (String(note?.__origin || '') === 'project') {
-                const identity = resolveKnownUserIdentity(String(note.createdBy || ''), String(note.createdByName || fallbackDirectoryName(note.createdBy || '')));
-                return `
-                  <article id="global-note-${escapeHtml(String(note.noteId || ''))}" class="global-note-card rounded-xl border border-slate-200 bg-white p-4 cursor-pointer" onclick="openGlobalHubAggregatedNoteRead('${escapeHtml(String(note.noteId || ''))}')">
-                    <div class="flex flex-wrap items-center gap-2 mb-2">
-                      <span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-violet-100 text-violet-700 font-semibold">Projet: ${escapeHtml(String(note.__originProjectName || 'Projet'))}</span>
-                      ${note.shareToGlobalFeed ? '<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-indigo-100 text-indigo-700 font-semibold">Dans le fil</span>' : ''}
-                    </div>
-                    <h4 class="text-base font-bold text-slate-800">${escapeHtml(note.title || 'Note sans titre')}</h4>
-                    <p class="mt-1 text-xs text-slate-500">${escapeHtml(identity?.name || note.createdByName || fallbackDirectoryName(note.createdBy || ''))} • ${new Date(Number(note.createdAt || Date.now())).toLocaleString('fr-FR')}</p>
-                  </article>
-                `;
-              }
-              const identity = resolveKnownUserIdentity(String(note.createdBy || ''), String(note.createdByName || fallbackDirectoryName(note.createdBy || '')));
-              return buildGlobalNoteCardHtml(note, {
-                canManage: canManageGlobalNote(note),
-                authorName: identity?.name || note.createdByName || fallbackDirectoryName(note.createdBy || ''),
-                bulkSelectionMode: globalNotesBulkSelectionMode,
-                isSelectedForBulkDelete: selectedGlobalNoteIdsForBulkDelete.has(String(note.noteId || '').trim()),
-                linkedDocs: linkedDocsByNoteId.get(String(note.noteId || '').trim()) || []
-              });
-            }).join('');
-          }
-        }
-        renderPagination('global-notes-pagination', pagination, 'setGlobalNotesPage', 'notes');
-      }
-      const tabs = {
-        all: document.getElementById('global-notes-tab-all'),
-        mine: document.getElementById('global-notes-tab-mine'),
-        favorites: document.getElementById('global-notes-tab-favorites'),
-        private: document.getElementById('global-notes-tab-private'),
-        transverse: document.getElementById('global-notes-tab-transverse'),
-        published: document.getElementById('global-notes-tab-published')
-      };
-      Object.entries(tabs).forEach(([key, btn]) => {
-        if (!btn) return;
-        btn.classList.toggle('view-tab-active', key === globalNotesTabMode);
-      });
-      if (globalNotesFocusNoteId) {
-        const focusId = String(globalNotesFocusNoteId || '').trim();
-        globalNotesFocusNoteId = '';
-        setTimeout(() => {
-          document.getElementById(`global-note-${focusId}`)?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
-        }, 40);
-      }
-      updateGlobalNotesBulkDeleteUi();
-      window.TaskMDANotesShared?.bindInlineDocLinkActions?.('global-notes-list', null, {
-        onPreview(payload) {
-          const ref = String(payload?.refPayload || '').trim();
-          if (!ref) return;
-          openDocumentPreviewByRef(ref);
-        },
-        onDownload(payload) {
-          const ref = String(payload?.refPayload || '').trim();
-          if (!ref) return;
-          downloadDocumentByRef(ref);
-        }
-      });
+      await globalNotesRuntime?.renderGlobalNotes?.();
     }
 
     async function resolveUserRowsByIds(userIds = []) {
@@ -17095,198 +15983,6 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       await renderMemberSelectOptions(state, 'group-members-input');
     }
 
-    async function renderProjectUserGroups(state) {
-      const list = document.getElementById('project-user-groups-list');
-      const createBtn = document.getElementById('btn-create-user-group');
-      const updateBtn = document.getElementById('btn-update-user-group');
-      const membersSelect = document.getElementById('user-group-members-input');
-      if (!list || !createBtn || !updateBtn || !membersSelect) return;
-
-      const canManage = canManageProjectCollaboration(state);
-      createBtn.disabled = !canManage;
-      createBtn.classList.toggle('opacity-50', !canManage);
-      updateBtn.disabled = !canManage;
-      updateBtn.classList.toggle('opacity-50', !canManage);
-      membersSelect.disabled = !canManage;
-
-      await renderUserGroupMemberSelect(state);
-      const members = await getProjectMembersResolved(state);
-      const byId = new Map(members.map(m => [m.userId, m.displayNameResolved]));
-      const userGroups = state?.userGroups || [];
-
-      if (userGroups.length === 0) {
-        list.innerHTML = `
-          <div class="empty-state-card">
-            <p class="empty-state-title">Aucun groupe utilisateurs</p>
-            <p class="empty-state-text">Regroupez des membres pour assigner plus vite les tâches collaboratives.</p>
-            ${canManage ? '<button class="empty-state-cta" onclick="focusElementById(\'user-group-name-input\')">Créer un groupe utilisateurs</button>' : ''}
-          </div>
-        `;
-        selectedUserGroupId = null;
-        return;
-      }
-
-      if (!selectedUserGroupId || !userGroups.find(g => g.groupId === selectedUserGroupId)) {
-        selectedUserGroupId = userGroups[0].groupId;
-      }
-
-      list.innerHTML = userGroups.map(group => {
-        const active = group.groupId === selectedUserGroupId;
-        const memberNames = (group.memberUserIds || []).map(id => byId.get(id) || fallbackDirectoryName(id));
-        return `
-          <div class="rounded-lg border ${active ? 'border-primary bg-blue-50' : 'border-slate-200 bg-white'} p-3">
-            <div class="flex items-start justify-between gap-2">
-              <div>
-                <p class="text-sm font-semibold text-slate-800">${escapeHtml(group.name || 'Groupe')}</p>
-                <p class="text-xs text-slate-500 mt-1">${escapeHtml(memberNames.join(', ') || 'Aucun membre')}</p>
-              </div>
-              <div class="flex items-center gap-2 text-xs">
-                <button onclick="selectUserGroup('${group.groupId}')" class="task-action-btn task-action-btn-subtle" data-action-kind="open">Selectionner</button>
-                ${canManage ? `<button onclick="deleteUserGroup('${group.groupId}')" class="task-action-btn task-action-btn-danger" data-action-kind="danger">Supprimer</button>` : ''}
-              </div>
-            </div>
-          </div>
-        `;
-      }).join('');
-
-      const selected = userGroups.find(g => g.groupId === selectedUserGroupId);
-      const selectedIds = new Set(selected?.memberUserIds || []);
-      Array.from(membersSelect.options || []).forEach(opt => {
-        opt.selected = selectedIds.has(opt.value);
-      });
-    }
-
-    async function renderProjectMembers(state) {
-      const container = document.getElementById('project-members-list');
-      const addBtn = document.getElementById('btn-add-member');
-      const nameInput = document.getElementById('member-name-input');
-      const roleInput = document.getElementById('member-role-input');
-      if (!container || !addBtn || !nameInput || !roleInput) return;
-
-      const members = await getProjectMembersResolved(state);
-      const canManage = canManageProjectCollaboration(state);
-      const myRole = normalizeProjectRole(getMyProjectRole(state));
-      renderProjectRoleSelectors(state);
-
-      addBtn.disabled = !canManage;
-      addBtn.classList.toggle('opacity-50', !canManage);
-      nameInput.disabled = !canManage;
-      roleInput.disabled = !canManage;
-      await renderMemberDirectoryAutocomplete(state);
-
-      if (members.length === 0) {
-        container.innerHTML = '<p class="text-sm text-slate-500">Aucun membre dans ce projet.</p>';
-        return;
-      }
-
-      container.innerHTML = members.map(member => {
-        const displayName = escapeHtml(member.displayNameResolved || fallbackDirectoryName(member.userId));
-        const normalizedRole = normalizeProjectRole(member.role);
-        const role = escapeHtml(getProjectRoleLabel(member.role));
-        const canRemoveMember = canManage
-          && member.userId !== currentUser?.userId
-          && (myRole === 'owner' || normalizedRole === 'member');
-        const removeBtn = canRemoveMember
-          ? `<button onclick="removeProjectMember('${escapeHtml(member.userId)}')" class="task-action-btn task-action-btn-danger" data-action-kind="danger">Retirer</button>`
-          : '';
-        return `
-          <div class="flex items-center justify-between gap-3 rounded-lg border border-slate-200 px-3 py-2 bg-slate-50">
-            <div class="min-w-0">
-              <p class="text-sm font-semibold text-slate-800 truncate">${displayName}</p>
-              <p class="text-xs text-slate-500">Rôle: ${role}</p>
-            </div>
-            ${removeBtn}
-          </div>
-        `;
-      }).join('');
-    }
-
-    function renderProjectPermissionMatrix(state) {
-      const tbody = document.getElementById('project-permissions-matrix');
-      const roleBadge = document.getElementById('project-permission-role-badge');
-      const summary = document.getElementById('project-permission-summary');
-      const details = document.getElementById('project-permissions-details');
-      const toggle = document.getElementById('btn-toggle-permissions-details');
-      if (!tbody) return;
-
-      const roleRaw = getMyProjectRole(state);
-      const role = normalizeProjectRole(roleRaw);
-      const roleLabel = roleRaw ? getProjectRoleLabel(roleRaw) : 'Aucun';
-      if (roleBadge) {
-        roleBadge.textContent = `Role: ${roleLabel}`;
-        roleBadge.className = `text-xs font-semibold px-2 py-1 rounded-full ${
-          role === 'owner'
-            ? 'bg-amber-100 text-amber-800'
-            : role === 'manager'
-              ? 'bg-blue-100 text-blue-800'
-              : role === 'member'
-                ? 'bg-emerald-100 text-emerald-800'
-                : 'bg-slate-100 text-slate-700'
-        }`;
-      }
-
-      const rows = [
-        { action: 'Lire le projet (taches, docs, discussion)', owner: true, manager: true, member: true },
-        { action: 'Modifier les infos projet', owner: true, manager: true, member: false },
-        { action: 'Supprimer le projet', owner: true, manager: false, member: false },
-        { action: 'Creer une tache', owner: true, manager: true, member: true },
-        { action: 'Editer/supprimer ses taches', owner: true, manager: true, member: true },
-        { action: 'Editer/supprimer toutes les taches', owner: true, manager: true, member: false },
-        { action: 'Changer statut de toute tache', owner: true, manager: true, member: false },
-        { action: 'Envoyer un message', owner: true, manager: true, member: true },
-        { action: 'Editer/supprimer tous les messages', owner: true, manager: true, member: false },
-        { action: 'Consulter le journal activite', owner: true, manager: true, member: false },
-        { action: 'Invitations / Groupes sur-mesure (avec membres) / Thematiques', owner: true, manager: true, member: false },
-        { action: 'Gerer les membres du projet*', owner: true, manager: true, member: false }
-      ];
-
-      const roleRules = {
-        owner: { label: getProjectRoleLabel('owner'), description: 'Pilotage complet du projet', allowed: rows.filter(r => r.owner).length, total: rows.length, chip: 'bg-amber-100 text-amber-800' },
-        manager: { label: 'Manager', description: 'Gestion opérationnelle avancée', allowed: rows.filter(r => r.manager).length, total: rows.length, chip: 'bg-blue-100 text-blue-800' },
-        member: { label: 'Membre', description: 'Exécution et contribution', allowed: rows.filter(r => r.member).length, total: rows.length, chip: 'bg-emerald-100 text-emerald-800' }
-      };
-      if (summary) {
-        summary.innerHTML = ['owner', 'manager', 'member'].map((key) => {
-          const rr = roleRules[key];
-          const active = role === key ? ' ring-2 ring-indigo-200' : '';
-          return `
-            <div class="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2${active}">
-              <div class="flex items-center justify-between gap-2">
-                <p class="text-sm font-semibold text-slate-800">${rr.label}</p>
-                <span class="text-[11px] px-2 py-0.5 rounded-full font-semibold ${rr.chip}">${rr.allowed}/${rr.total}</span>
-              </div>
-              <p class="text-xs text-slate-500 mt-1">${rr.description}</p>
-            </div>
-          `;
-        }).join('');
-      }
-
-      const renderCell = (allowed, isCurrentCol) => {
-        const base = 'py-2 px-2 border-b border-slate-100';
-        const current = isCurrentCol ? ' bg-indigo-50' : '';
-        if (allowed) {
-          return `<td class="${base}${current}"><span class="inline-flex items-center text-emerald-700 font-semibold" title="Autorisé"><span class="material-symbols-outlined text-base">check_circle</span></span></td>`;
-        }
-        return `<td class="${base}${current}"><span class="inline-flex items-center text-slate-400 font-semibold" title="Non autorisé"><span class="material-symbols-outlined text-base">remove_circle</span></span></td>`;
-      };
-
-      tbody.innerHTML = rows.map((row) => `
-        <tr>
-          <td class="py-2 pr-3 border-b border-slate-100 text-slate-700">${escapeHtml(row.action)}</td>
-          ${renderCell(row.owner, role === 'owner')}
-          ${renderCell(row.manager, role === 'manager')}
-          ${renderCell(row.member, role === 'member')}
-        </tr>
-      `).join('');
-
-      if (details) {
-        details.classList.toggle('hidden', !projectPermissionDetailsOpen);
-      }
-      if (toggle) {
-        toggle.textContent = projectPermissionDetailsOpen ? 'Masquer le détail des droits' : 'Voir le détail des droits';
-      }
-    }
-
     function getMyProjectRole(state = currentProjectState) {
       if (!state?.project || !currentUser?.userId) return null;
       const member = (state?.members || []).find(m => m.userId === currentUser?.userId);
@@ -17318,40 +16014,6 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
 
     function canDeleteProjectMeta(state = currentProjectState) {
       return isProjectOwner(state);
-    }
-
-    function getAssignableProjectRolesForUser(state = currentProjectState) {
-      const myRole = normalizeProjectRole(getMyProjectRole(state));
-      const catalog = getProjectRoleCatalog();
-      if (myRole === 'owner') return catalog;
-      if (myRole === 'manager') return catalog.filter(item => normalizeProjectRoleBase(item.baseRole) === 'member');
-      return [];
-    }
-
-    function renderProjectRoleSelectors(state = currentProjectState) {
-      const roleInputs = [
-        document.getElementById('member-role-input'),
-        document.getElementById('invite-role-input')
-      ].filter(Boolean);
-      if (roleInputs.length === 0) return;
-      const options = getAssignableProjectRolesForUser(state);
-      roleInputs.forEach((input) => {
-        const previous = String(input.value || '').trim();
-        input.innerHTML = options.length === 0
-          ? ''
-          : options.map((item) => {
-            const baseLabel = getBaseProjectRoleLabel(item.baseRole);
-            const label = item.isSystem ? item.label : `${item.label} (${baseLabel})`;
-            return `<option value="${escapeHtml(item.roleKey)}">${escapeHtml(label)}</option>`;
-          }).join('');
-        if (options.length === 0) {
-          input.disabled = true;
-          return;
-        }
-        input.disabled = false;
-        const hasPrev = options.some(item => item.roleKey === previous);
-        input.value = hasPrev ? previous : options[0].roleKey;
-      });
     }
 
     function canCreateTaskInProject(state = currentProjectState) {
@@ -17940,7 +16602,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         taskDetailWorkspaceRefreshTimer = null;
         taskDetailWorkspaceRefreshQueue = taskDetailWorkspaceRefreshQueue
           .then(async () => {
-            if (workspaceMode === 'global' && globalWorkspaceView === 'tasks') {
+            if (isGlobalTasksViewActive()) {
               await renderGlobalTasks();
               return;
             }
@@ -19105,17 +17767,11 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function closeTaskConvertModal() {
-      if (taskLifecycleDomainRuntime?.closeTaskConvertModal) {
-        taskLifecycleDomainRuntime.closeTaskConvertModal();
-        return;
-      }
+      taskLifecycleDomainRuntime?.closeTaskConvertModal?.();
     }
 
     async function openTaskConvertModal(taskRef, prefill = {}) {
-      if (taskLifecycleDomainRuntime?.openTaskConvertModal) {
-        await taskLifecycleDomainRuntime.openTaskConvertModal(taskRef, prefill);
-        return;
-      }
+      await taskLifecycleDomainRuntime?.openTaskConvertModal?.(taskRef, prefill);
     }
 
     async function convertTaskToProject(taskRef, options = {}) {
@@ -19288,8 +17944,10 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
 
         await closeGlobalTaskDetails();
         await refreshStats();
-        await renderProjects();
-        if (workspaceMode === 'global') {
+        if (isProjectsListViewActive()) {
+          await renderProjects();
+        }
+        if (isGlobalTasksViewActive()) {
           await renderGlobalTasks();
         }
         if (resolved.sourceType === 'project' && currentProjectId === resolved.projectId) {
@@ -19877,263 +18535,21 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       showToast(`Email prepare (${recipients.length} destinataire(s) en BCC)`);
     }
 
-    async function sendInvitationEmail(inviteId) {
-      if (projectMembersDomainRuntime?.sendInvitationEmail) {
-        await projectMembersDomainRuntime.sendInvitationEmail(inviteId);
-        return;
-      }
-    }
-
-    async function updateInviteStatus(inviteId, status) {
-      if (projectMembersDomainRuntime?.updateInviteStatus) {
-        await projectMembersDomainRuntime.updateInviteStatus(inviteId, status);
-        return;
-      }
-    }
-
-    async function addProjectInvite() {
-      if (projectMembersDomainRuntime?.addProjectInvite) {
-        await projectMembersDomainRuntime.addProjectInvite();
-        return;
-      }
-    }
-
-    function renderProjectInvitations(state) {
-      const container = document.getElementById('project-invites-list');
-      const btn = document.getElementById('btn-send-invite');
-      if (!container || !btn) return;
-      const canManage = canManageProjectCollaboration(state);
-      const myRole = normalizeProjectRole(getMyProjectRole(state));
-      btn.disabled = !canManage;
-      btn.classList.toggle('opacity-50', !canManage);
-
-      const invites = state?.invites || [];
-      if (invites.length === 0) {
-        container.innerHTML = `
-          <div class="empty-state-card">
-            <p class="empty-state-title">Aucune invitation envoyée</p>
-            <p class="empty-state-text">Invitez un utilisateur ou un agent pour activer la collaboration.</p>
-            ${canManage ? '<button class="empty-state-cta" onclick="focusElementById(\'invite-email-input\')">Envoyer une invitation</button>' : ''}
-          </div>
-        `;
-        return;
-      }
-
-      const statusClass = {
-        pending: 'bg-amber-100 text-amber-700',
-        sent: 'bg-blue-100 text-blue-700',
-        accepted: 'bg-emerald-100 text-emerald-700',
-        declined: 'bg-rose-100 text-rose-700'
-      };
-
-      container.innerHTML = invites
-        .slice()
-        .sort((a, b) => (b.invitedAt || 0) - (a.invitedAt || 0))
-        .map(inv => `
-          <div class="rounded-lg border border-slate-200 bg-white p-3">
-            <div class="flex items-start justify-between gap-2">
-              <div>
-                <p class="text-sm font-semibold text-slate-800">${escapeHtml(inv.displayName || 'Invité')}</p>
-                <p class="text-xs text-slate-500">${escapeHtml(inv.email || '')} • ${(inv.inviteType === 'agent' ? 'Agent' : 'Utilisateur')} • ${escapeHtml(getProjectRoleLabel(inv.role || 'member'))}</p>
-              </div>
-              <span class="text-[10px] px-2 py-1 rounded-full font-semibold ${statusClass[inv.status] || statusClass.pending}">${escapeHtml(inv.status || 'pending')}</span>
-            </div>
-            <div class="mt-2 flex flex-wrap gap-2 text-xs">
-              ${canManage ? `<button onclick="sendInvitationEmail('${inv.inviteId}')" class="task-action-btn task-action-btn-subtle" data-action-kind="notify">Email</button>` : ''}
-              ${canManage && (myRole === 'owner' || normalizeProjectRole(inv.role) === 'member') ? `<button onclick="updateInviteStatus('${inv.inviteId}','accepted')" class="task-action-btn" data-action-kind="success">Accepté</button>` : ''}
-              ${canManage ? `<button onclick="updateInviteStatus('${inv.inviteId}','declined')" class="task-action-btn task-action-btn-danger" data-action-kind="danger">Refusé</button>` : ''}
-            </div>
-          </div>
-        `).join('');
-    }
-
-    async function createProjectGroup() {
-      if (projectMembersDomainRuntime?.createProjectGroup) {
-        await projectMembersDomainRuntime.createProjectGroup();
-        return;
-      }
-    }
-
-    async function deleteProjectGroup(groupId) {
-      if (projectMembersDomainRuntime?.deleteProjectGroup) {
-        await projectMembersDomainRuntime.deleteProjectGroup(groupId);
-        return;
-      }
-    }
-
-    function renderProjectGroups(state) {
-      const container = document.getElementById('project-groups-list');
-      const btn = document.getElementById('btn-create-group');
-      if (!container || !btn) return;
-      const canManage = canManageProjectCollaboration(state);
-      btn.disabled = !canManage;
-      btn.classList.toggle('opacity-50', !canManage);
-
-      const groups = state?.groups || [];
-      if (groups.length === 0) {
-        container.innerHTML = `
-          <div class="empty-state-card">
-            <p class="empty-state-title">Aucun groupe configuré</p>
-            <p class="empty-state-text">Créez des groupes métier pour structurer les tâches et les documents.</p>
-            ${canManage ? '<button class="empty-state-cta" onclick="focusElementById(\'group-name-input\')">Créer un groupe</button>' : ''}
-          </div>
-        `;
-        return;
-      }
-
-      container.innerHTML = groups.map(group => {
-        const assignedCount = (state?.tasks || []).filter(t => t.groupId === group.groupId).length;
-        return `
-          <div class="rounded-lg border border-slate-200 bg-white p-3 flex items-center justify-between gap-3">
-            <div class="min-w-0">
-              <p class="text-sm font-semibold text-slate-800 truncate">${escapeHtml(group.name)}</p>
-              <p class="text-xs text-slate-500 truncate">${escapeHtml(group.description || 'Sans description')}</p>
-              <p class="text-[11px] text-slate-500 mt-1">${assignedCount} tâche(s)</p>
-            </div>
-            ${canManage ? `<button onclick="deleteProjectGroup('${group.groupId}')" class="task-action-btn task-action-btn-danger" data-action-kind="danger">Supprimer</button>` : ''}
-          </div>
-        `;
-      }).join('');
-    }
-
-    async function renderProjectGroups(state) {
-      const container = document.getElementById('project-groups-list');
-      const createBtn = document.getElementById('btn-create-group');
-      const membersSelect = document.getElementById('group-members-input');
-      if (!container || !createBtn || !membersSelect) return;
-      const canManage = canManageProjectCollaboration(state);
-      createBtn.disabled = !canManage;
-      createBtn.classList.toggle('opacity-50', !canManage);
-      membersSelect.disabled = !canManage;
-
-      await renderProjectGroupMemberSelect(state);
-      const members = await getProjectMembersResolved(state);
-      const byId = new Map(members.map(m => [m.userId, m.displayNameResolved]));
-
-      const groups = state?.groups || [];
-      if (groups.length === 0) {
-        container.innerHTML = `
-          <div class="empty-state-card">
-            <p class="empty-state-title">Aucun groupe configuré</p>
-            <p class="empty-state-text">Créez des groupes et assignez des membres pour faciliter la répartition.</p>
-            ${canManage ? '<button class="empty-state-cta" onclick="focusElementById(\'group-name-input\')">Créer un groupe</button>' : ''}
-          </div>
-        `;
-        selectedProjectGroupId = null;
-        createBtn.textContent = 'Créer groupe';
-        const groupNameInput = document.getElementById('group-name-input');
-        const groupDescriptionInput = document.getElementById('group-description-input');
-        if (groupNameInput) groupNameInput.value = '';
-        if (groupDescriptionInput) groupDescriptionInput.value = '';
-        Array.from(membersSelect.options || []).forEach(opt => { opt.selected = false; });
-        return;
-      }
-
-      if (selectedProjectGroupId && !groups.find(g => g.groupId === selectedProjectGroupId)) {
-        selectedProjectGroupId = null;
-      }
-
-      container.innerHTML = groups.map(group => {
-        const active = group.groupId === selectedProjectGroupId;
-        const assignedCount = (state?.tasks || []).filter(t => t.groupId === group.groupId).length;
-        const linkedUserGroup = (state?.userGroups || []).find(ug =>
-          ug.groupId === group.groupId || normalizeSearch(ug.name) === normalizeSearch(group.name)
-        );
-        const memberNames = (linkedUserGroup?.memberUserIds || []).map(id => byId.get(id) || fallbackDirectoryName(id));
-        return `
-          <div class="rounded-lg border ${active ? 'border-primary bg-blue-50' : 'border-slate-200 bg-white'} p-3">
-            <div class="flex items-start justify-between gap-2">
-              <div class="min-w-0">
-                <p class="text-sm font-semibold text-slate-800 truncate">${escapeHtml(group.name)}</p>
-                <p class="text-xs text-slate-500 truncate">${escapeHtml(group.description || 'Sans description')}</p>
-                <p class="text-[11px] text-slate-500 mt-1">${assignedCount} tâche(s) • ${(linkedUserGroup?.memberUserIds || []).length} membre(s)</p>
-                <p class="text-[11px] text-slate-500 truncate">${escapeHtml(memberNames.join(', ') || 'Aucun membre')}</p>
-              </div>
-              <div class="flex items-center gap-2 text-xs">
-                <button onclick="selectProjectGroup('${group.groupId}')" class="task-action-btn task-action-btn-subtle" data-action-kind="edit">Modifier</button>
-                ${canManage ? `<button onclick="deleteProjectGroup('${group.groupId}')" class="task-action-btn task-action-btn-danger" data-action-kind="danger">Supprimer</button>` : ''}
-              </div>
-            </div>
-          </div>
-        `;
-      }).join('');
-
-      const selectedGroup = selectedProjectGroupId
-        ? (groups.find(g => g.groupId === selectedProjectGroupId) || null)
-        : null;
-      const linkedSelectedUserGroup = selectedGroup
-        ? (state?.userGroups || []).find(ug =>
-            ug.groupId === selectedGroup.groupId || normalizeSearch(ug.name) === normalizeSearch(selectedGroup.name)
-          )
-        : null;
-      const selectedIds = new Set(linkedSelectedUserGroup?.memberUserIds || []);
-      Array.from(membersSelect.options || []).forEach(opt => {
-        opt.selected = selectedIds.has(opt.value);
-      });
-      const groupNameInput = document.getElementById('group-name-input');
-      const groupDescriptionInput = document.getElementById('group-description-input');
-      if (selectedGroup) {
-        if (groupNameInput) groupNameInput.value = selectedGroup.name || '';
-        if (groupDescriptionInput) groupDescriptionInput.value = selectedGroup.description || '';
-      }
-      createBtn.textContent = selectedGroup ? 'Enregistrer modifications' : 'Créer groupe';
-    }
-
-    function selectProjectGroup(groupId) {
-      if (projectMembersDomainRuntime?.selectProjectGroup) {
-        projectMembersDomainRuntime.selectProjectGroup(groupId);
-        return;
-      }
-    }
-
-    async function updateProjectGroupMembers() {
-      if (projectMembersDomainRuntime?.updateProjectGroupMembers) {
-        await projectMembersDomainRuntime.updateProjectGroupMembers();
-        return;
-      }
-    }
-
-    window.selectProjectGroup = selectProjectGroup;
-
-    async function addProjectTheme() {
-      if (projectMembersDomainRuntime?.addProjectTheme) {
-        await projectMembersDomainRuntime.addProjectTheme();
-        return;
-      }
-    }
-
-    async function removeProjectTheme(theme) {
-      if (projectMembersDomainRuntime?.removeProjectTheme) {
-        await projectMembersDomainRuntime.removeProjectTheme(theme);
-        return;
-      }
-    }
-
-    function renderProjectThemes(state) {
-      const container = document.getElementById('project-themes-list');
-      const btn = document.getElementById('btn-add-theme');
-      if (!container || !btn) return;
-      const canManage = canManageProjectCollaboration(state);
-      btn.disabled = !canManage;
-      btn.classList.toggle('opacity-50', !canManage);
-      const themes = state?.themes || [];
-      if (themes.length === 0) {
-        container.innerHTML = `
-          <div class="empty-state-card">
-            <p class="empty-state-title">Aucune thématique définie</p>
-            <p class="empty-state-text">Ajoutez des thématiques pour faciliter la recherche transverse.</p>
-            ${canManage ? '<button class="empty-state-cta" onclick="focusElementById(\'theme-name-input\')">Ajouter une thématique</button>' : ''}
-          </div>
-        `;
-        return;
-      }
-      container.innerHTML = themes.map(theme => `
-        <span class="inline-flex items-center gap-2 text-xs px-2 py-1 rounded-full bg-slate-200 text-slate-700">
-          ${escapeHtml(theme)}
-          ${canManage ? `<button onclick="removeProjectTheme(decodeURIComponent('${encodeURIComponent(theme)}'))" class="text-slate-600 hover:text-rose-700">x</button>` : ''}
-        </span>
-      `).join('');
-    }
+    window.sendInvitationEmail = async (inviteId) => {
+      await projectMembersDomainRuntime?.sendInvitationEmail?.(inviteId);
+    };
+    window.updateInviteStatus = async (inviteId, status) => {
+      await projectMembersDomainRuntime?.updateInviteStatus?.(inviteId, status);
+    };
+    window.selectProjectGroup = (groupId) => {
+      projectMembersDomainRuntime?.selectProjectGroup?.(groupId);
+    };
+    window.deleteProjectGroup = async (groupId) => {
+      await projectMembersDomainRuntime?.deleteProjectGroup?.(groupId);
+    };
+    window.removeProjectTheme = async (theme) => {
+      await projectMembersDomainRuntime?.removeProjectTheme?.(theme);
+    };
 
     function renderProjectHierarchy(state) {
       const container = document.getElementById('project-hierarchy-panel');
@@ -20886,6 +19302,26 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       fillThemePicker('global-note-theme-known', 'global-note-theme', themes, 'Thématiques existantes...');
     }
 
+    async function refreshProjectNoteThemePicker(state = currentProjectState) {
+      const select = document.getElementById('project-note-theme-known');
+      const input = document.getElementById('project-note-theme');
+      if (!select || !input) return;
+      let fromNotes = [];
+      try {
+        fromNotes = getProjectNotesForState(state)
+          .map((note) => String(note?.theme || '').trim())
+          .filter(Boolean);
+      } catch (_) {
+        fromNotes = [];
+      }
+      const fromProjectThemes = Array.isArray(state?.themes)
+        ? state.themes.map((theme) => String(theme || '').trim()).filter(Boolean)
+        : [];
+      const fromCatalog = (globalThemeCatalog || []).map((theme) => String(theme?.name || '').trim());
+      const themes = [...fromNotes, ...fromProjectThemes, ...fromCatalog];
+      fillThemePicker('project-note-theme-known', 'project-note-theme', themes, 'Thématiques existantes...');
+    }
+
     async function refreshGlobalNoteKnownTagsPicker() {
       const select = document.getElementById('global-note-tags-known');
       if (!select) return;
@@ -20946,7 +19382,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       const select = document.getElementById('project-doc-task-links');
       if (!select) return;
 
-      if (!select.dataset.toggleClickBound) {
+      if (!select.dataset.projectDocToggleClickBound) {
         select.addEventListener('mousedown', (e) => {
           const option = e.target?.closest?.('option');
           if (!option || select.disabled) return;
@@ -20954,12 +19390,12 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
           option.selected = !option.selected;
           select.dispatchEvent(new Event('change', { bubbles: true }));
         });
-        select.dataset.toggleClickBound = '1';
+        select.dataset.projectDocToggleClickBound = '1';
       }
 
       const btnSelectAll = document.getElementById('btn-project-doc-select-all');
       const btnClear = document.getElementById('btn-project-doc-clear-selection');
-      if (btnSelectAll && !btnSelectAll.dataset.bound) {
+      if (btnSelectAll && !btnSelectAll.dataset.projectDocSelectAllBound) {
         btnSelectAll.addEventListener('click', () => {
           if (select.disabled) return;
           Array.from(select.options || []).forEach(opt => {
@@ -20967,14 +19403,14 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
           });
           select.dispatchEvent(new Event('change', { bubbles: true }));
         });
-        btnSelectAll.dataset.bound = '1';
+        btnSelectAll.dataset.projectDocSelectAllBound = '1';
       }
-      if (btnClear && !btnClear.dataset.bound) {
+      if (btnClear && !btnClear.dataset.projectDocClearSelectionBound) {
         btnClear.addEventListener('click', () => {
           Array.from(select.options || []).forEach(opt => { opt.selected = false; });
           select.dispatchEvent(new Event('change', { bubbles: true }));
         });
-        btnClear.dataset.bound = '1';
+        btnClear.dataset.projectDocClearSelectionBound = '1';
       }
     }
 
@@ -21041,21 +19477,21 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       if (!select) return;
       const taskOptionsContainer = document.getElementById('project-doc-task-options');
       const taskFilterInput = document.getElementById('project-doc-task-filter');
-      if (taskOptionsContainer && !taskOptionsContainer.dataset.bound) {
+      if (taskOptionsContainer && !taskOptionsContainer.dataset.projectDocTaskOptionsBound) {
         taskOptionsContainer.addEventListener('click', (e) => {
           const btn = e.target?.closest?.('.project-doc-task-option');
           if (!btn || select.disabled) return;
           toggleProjectDocTaskSelection(btn.dataset.taskId || '');
         });
-        taskOptionsContainer.dataset.bound = '1';
+        taskOptionsContainer.dataset.projectDocTaskOptionsBound = '1';
       }
-      if (taskFilterInput && !taskFilterInput.dataset.bound) {
+      if (taskFilterInput && !taskFilterInput.dataset.projectDocTaskFilterBound) {
         taskFilterInput.addEventListener('input', () => renderProjectDocTaskSelector());
-        taskFilterInput.dataset.bound = '1';
+        taskFilterInput.dataset.projectDocTaskFilterBound = '1';
       }
-      if (!select.dataset.changeBound) {
+      if (!select.dataset.projectDocTaskChangeBound) {
         select.addEventListener('change', () => renderProjectDocTaskSelector());
-        select.dataset.changeBound = '1';
+        select.dataset.projectDocTaskChangeBound = '1';
       }
       renderProjectDocTaskSelector();
     };
@@ -21066,21 +19502,9 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       renderProjectDocTaskSelector();
     };
 
-    async function addProjectMember() {
-      if (projectMembersDomainRuntime?.addProjectMember) {
-        await projectMembersDomainRuntime.addProjectMember();
-        return;
-      }
-    }
-
-    async function removeProjectMember(userId) {
-      if (projectMembersDomainRuntime?.removeProjectMember) {
-        await projectMembersDomainRuntime.removeProjectMember(userId);
-        return;
-      }
-    }
-
-    window.removeProjectMember = removeProjectMember;
+    window.removeProjectMember = async (userId) => {
+      await projectMembersDomainRuntime?.removeProjectMember?.(userId);
+    };
     window.focusElementById = focusElementById;
     window.editGlobalTheme = editGlobalTheme;
     window.deleteGlobalTheme = deleteGlobalTheme;
@@ -21109,47 +19533,15 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     window.deleteProjectFeature = deleteProjectFeature;
     window.toggleProjectBulkSelection = toggleProjectBulkSelection;
 
-    async function createUserGroup() {
-      if (projectMembersDomainRuntime?.createUserGroup) {
-        await projectMembersDomainRuntime.createUserGroup();
-        return;
-      }
-    }
-
-    async function updateUserGroupSelection() {
-      if (projectMembersDomainRuntime?.updateUserGroupSelection) {
-        await projectMembersDomainRuntime.updateUserGroupSelection();
-        return;
-      }
-    }
-
-    async function deleteUserGroup(groupId) {
-      if (projectMembersDomainRuntime?.deleteUserGroup) {
-        await projectMembersDomainRuntime.deleteUserGroup(groupId);
-        return;
-      }
-    }
-
-    function selectUserGroup(groupId) {
-      if (projectMembersDomainRuntime?.selectUserGroup) {
-        projectMembersDomainRuntime.selectUserGroup(groupId);
-        return;
-      }
-    }
-
-    window.selectUserGroup = selectUserGroup;
-    window.deleteUserGroup = deleteUserGroup;
+    window.selectUserGroup = (groupId) => {
+      projectMembersDomainRuntime?.selectUserGroup?.(groupId);
+    };
+    window.deleteUserGroup = async (groupId) => {
+      await projectMembersDomainRuntime?.deleteUserGroup?.(groupId);
+    };
 
     function parseSubtasks(textValue) {
-      if (window.TaskMDATasks?.parseSubtasks) {
-        return window.TaskMDATasks.parseSubtasks(textValue, uuidv4);
-      }
-      if (!textValue) return [];
-      return textValue
-        .split('\n')
-        .map(line => line.trim())
-        .filter(Boolean)
-        .map(label => ({ id: uuidv4(), label, done: false }));
+      return window.TaskMDATasks?.parseSubtasks?.(textValue, uuidv4) || [];
     }
 
     function normalizeTaskStatusValue(rawStatus) {
@@ -21161,26 +19553,17 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function openProjectTaskCreateModalWithStatus(status = 'todo') {
-      if (taskLifecycleDomainRuntime?.openProjectTaskCreateModalWithStatus) {
-        void taskLifecycleDomainRuntime.openProjectTaskCreateModalWithStatus(status);
-        return;
-      }
+      void taskLifecycleDomainRuntime?.openProjectTaskCreateModalWithStatus?.(status);
     }
 
     function openGlobalTaskCreateModalWithStatus(status = 'todo') {
-      if (taskLifecycleDomainRuntime?.openGlobalTaskCreateModalWithStatus) {
-        void taskLifecycleDomainRuntime.openGlobalTaskCreateModalWithStatus(status);
-        return;
-      }
+      void taskLifecycleDomainRuntime?.openGlobalTaskCreateModalWithStatus?.(status);
     }
 
     function openTaskModal(task = null) {
       pendingLinkedTaskDocs = [];
       refreshLinkedPendingSummaries();
-      if (taskLifecycleDomainRuntime?.openTaskModal) {
-        taskLifecycleDomainRuntime.openTaskModal(task);
-        return;
-      }
+      taskLifecycleDomainRuntime?.openTaskModal?.(task);
     }
 
     async function renderProjectSequentialNav(currentId) {
@@ -21735,12 +20118,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       await renderProjectRgpdImpactCard(effectiveState.project);
       bindProjectKpiActions();
       await renderProjectSequentialNav(projectId);
-      await renderProjectMembers(effectiveState);
-      await renderProjectUserGroups(effectiveState);
-      renderProjectPermissionMatrix(effectiveState);
-      renderProjectInvitations(effectiveState);
-      await renderProjectGroups(effectiveState);
-      renderProjectThemes(effectiveState);
+      await renderProjectCollaborationPanels(effectiveState, { includeExtended: true });
       renderProjectHierarchy(effectiveState);
       await syncProjectTaxonomyToGlobal(effectiveState);
       refreshTaskMetadataOptions(effectiveState);
@@ -21893,7 +20271,6 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     async function openEditProjectModal(projectId = currentProjectId, fromDashboard = false) {
       pendingLinkedEditProjectDocs = [];
       refreshLinkedPendingSummaries();
-      refreshLinkedPendingSummaries();
       projectId = resolveProjectIdInput(projectId, currentProjectId);
       if (!projectId) return;
       const state = await getProjectState(projectId);
@@ -21980,6 +20357,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         : 'private';
       const modePassphrase = String(document.getElementById('edit-project-passphrase')?.value || '').trim();
       const projectDeadline = readProjectDeadlineFromForm('edit-project');
+      const previousProjectStatus = String(state.project?.status || 'en-cours');
       const changes = {
         name,
         internalReference: String(document.getElementById('edit-project-internal-reference')?.value || '').trim() || null,
@@ -22000,6 +20378,8 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
           : null
       };
       let sharedKeyHex = null;
+      const nextProjectStatus = String(changes.status || 'en-cours');
+      const projectStatusChanged = previousProjectStatus !== nextProjectStatus;
       const switchedToShared = previousSharingMode !== 'shared' && nextSharingMode === 'shared';
       if (nextSharingMode === 'shared') {
         let sharedKeyData = await getDecrypted('sharedKeys', currentProjectId, 'projectId');
@@ -22103,14 +20483,28 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       if (editProjectFromDashboard) {
         editProjectFromDashboard = false;
         await refreshStats();
-        await renderProjects();
+        if (isProjectsListViewActive()) {
+          const patched = projectStatusChanged
+            ? tryPatchProjectCardStatusIncremental(currentProjectId, nextProjectStatus)
+            : false;
+          if (!patched) {
+            await renderProjects();
+          }
+        }
         applyLiveSearchFilter();
         return;
       }
       editProjectFromDashboard = false;
       await showProjectDetail(currentProjectId);
       await refreshStats();
-      await renderProjects();
+      if (isProjectsListViewActive()) {
+        const patched = projectStatusChanged
+          ? tryPatchProjectCardStatusIncremental(currentProjectId, nextProjectStatus)
+          : false;
+        if (!patched) {
+          await renderProjects();
+        }
+      }
       } catch (error) {
         console.error('Error saving project edits:', error);
         showToast('Erreur lors de la mise a jour du projet');
@@ -22149,13 +20543,20 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         currentProjectId = null;
         currentProjectState = null;
         await refreshStats();
-        await renderProjects();
+        if (isProjectsListViewActive()) {
+          const patched = tryRemoveProjectCardIncremental(projectId);
+          if (!patched) {
+            await renderProjects();
+          }
+        }
         applyLiveSearchFilter();
         return;
       }
       showDashboard();
       await refreshStats();
-      await renderProjects();
+      if (isProjectsListViewActive()) {
+        await renderProjects();
+      }
     }
 
     async function deleteProjectFromDashboard(projectId) {
@@ -22195,7 +20596,12 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         await showProjectDetail(targetProjectId);
       }
       await refreshStats();
-      await renderProjects();
+      if (isProjectsListViewActive()) {
+        const patched = tryPatchProjectCardStatusIncremental(targetProjectId, 'termine');
+        if (!patched) {
+          await renderProjects();
+        }
+      }
       applyLiveSearchFilter();
     }
 
@@ -22757,20 +21163,6 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       applyLiveSearchFilter();
     }
 
-    function triggerWorkspaceRevealAnimation(elementIds = []) {
-      (Array.isArray(elementIds) ? elementIds : []).forEach((id) => {
-        const el = document.getElementById(String(id || '').trim());
-        if (!el || el.classList.contains('hidden')) return;
-        el.classList.remove('workspace-reveal-enter');
-        // Force reflow so animation can replay on repeated switches.
-        void el.offsetWidth;
-        el.classList.add('workspace-reveal-enter');
-        setTimeout(() => {
-          el.classList.remove('workspace-reveal-enter');
-        }, 150);
-      });
-    }
-
     async function getAllProjectStates() {
       const states = await getAllDecrypted('localState', 'projectId');
       const validStates = (states || [])
@@ -22884,7 +21276,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         });
       });
 
-      const standaloneDocs = await getAllDecrypted('globalDocs', 'id');
+      const standaloneDocs = await getAllGlobalDocsCached();
       (standaloneDocs || []).forEach(doc => {
         docs.push({
           ...doc,
@@ -23556,7 +21948,16 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
      */
     const renderGlobalTasksBase = renderGlobalTasks;
     renderGlobalTasks = async function renderGlobalTasksWithEmptyState() {
+      const renderGlobalTasksStartedAt = (typeof performance !== 'undefined' && typeof performance.now === 'function')
+        ? performance.now()
+        : Date.now();
       await renderGlobalTasksBase();
+      const renderGlobalTasksBaseFinishedAt = (typeof performance !== 'undefined' && typeof performance.now === 'function')
+        ? performance.now()
+        : Date.now();
+      debugLog('[perf] renderGlobalTasksBase(ms)=', Math.round((renderGlobalTasksBaseFinishedAt - renderGlobalTasksStartedAt) * 100) / 100, {
+        viewMode: globalTasksViewMode
+      });
       const container = document.getElementById('global-tasks-container');
       if (!container) return;
       if (globalTasksViewMode === 'calendar' || globalTasksViewMode === 'archives') return;
@@ -24120,7 +22521,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       await publishEvent(event);
       if (sharedFolderHandle) void syncProjectEventsToSharedSpace(resolved.projectId, [event]);
       showToast('Tâche archivée');
-      if (workspaceMode === 'global') {
+      if (isGlobalTasksViewActive()) {
         await renderGlobalTasks();
         await refreshStats();
       } else {
@@ -24155,7 +22556,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       await publishEvent(event);
       if (sharedFolderHandle) void syncProjectEventsToSharedSpace(resolved.projectId, [event]);
       showToast('Tache restauree');
-      if (workspaceMode === 'global') {
+      if (isGlobalTasksViewActive()) {
         await renderGlobalTasks();
         await refreshStats();
       } else {
@@ -24192,7 +22593,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       await publishEvent(event);
       if (sharedFolderHandle) void syncProjectEventsToSharedSpace(resolved.projectId, [event]);
       showToast('Tache supprimee');
-      if (workspaceMode === 'global') {
+      if (isGlobalTasksViewActive()) {
         await renderGlobalTasks();
         await refreshStats();
       } else {
@@ -24204,7 +22605,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       const updated = await updateGlobalTaskStatusFromRef(taskRef, 'termine');
       if (!updated) return;
       showToast('✅ Tâche marquée comme réalisée');
-      if (workspaceMode === 'global') {
+      if (isGlobalTasksViewActive()) {
         await renderGlobalTasks();
         await refreshStats();
       } else {
@@ -24717,13 +23118,11 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function openGlobalDocUploadModal() {
-      if (!globalDocsRuntime?.openGlobalDocUploadModal) return;
-      globalDocsRuntime.openGlobalDocUploadModal();
+      globalDocsRuntime?.openGlobalDocUploadModal?.();
     }
 
     function closeGlobalDocUploadModal() {
-      if (!globalDocsRuntime?.closeGlobalDocUploadModal) return;
-      globalDocsRuntime.closeGlobalDocUploadModal();
+      globalDocsRuntime?.closeGlobalDocUploadModal?.();
     }
 
     function openProjectDocUploadModal() {
@@ -24748,16 +23147,14 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
      * Façade orchestrateur vers la preview document du module global-docs.
      */
     async function openDocumentPreviewByRef(refEncoded = '') {
-      if (!globalDocsRuntime?.openDocumentPreviewByRef) return;
-      await globalDocsRuntime.openDocumentPreviewByRef(refEncoded);
+      await globalDocsRuntime?.openDocumentPreviewByRef?.(refEncoded);
     }
 
     /**
      * Façade orchestrateur vers le téléchargement document du module global-docs.
      */
     async function downloadDocumentByRef(refEncoded = '') {
-      if (!globalDocsRuntime?.downloadDocumentByRef) return;
-      await globalDocsRuntime.downloadDocumentByRef(refEncoded);
+      await globalDocsRuntime?.downloadDocumentByRef?.(refEncoded);
     }
 
     /**
@@ -24765,11 +23162,12 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
      * Fallback: état vide explicite si le module n'est pas chargé.
      */
     async function renderGlobalDocs() {
-      if (globalDocsRuntime?.renderGlobalDocs) {
+      const renderDocs = globalDocsRuntime?.renderGlobalDocs;
+      if (renderDocs) {
         if (delegatingRenderGlobalDocs) return;
         delegatingRenderGlobalDocs = true;
         try {
-          await globalDocsRuntime.renderGlobalDocs();
+          await renderDocs();
         } finally {
           delegatingRenderGlobalDocs = false;
         }
@@ -24818,73 +23216,68 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
      * Résout un document pour la modale de rattachement (binding).
      */
     async function resolveDocumentForBinding(docId) {
-      if (!globalDocsRuntime?.resolveDocumentForBinding) return null;
-      return globalDocsRuntime.resolveDocumentForBinding(docId);
+      return await globalDocsRuntime?.resolveDocumentForBinding?.(docId) || null;
     }
 
     function resetDocumentBindingInlineEditingState() {
-      if (!globalDocsRuntime?.resetDocumentBindingInlineEditingState) return;
-      globalDocsRuntime.resetDocumentBindingInlineEditingState();
+      globalDocsRuntime?.resetDocumentBindingInlineEditingState?.();
     }
 
     function setDocumentBindingFieldReadMode(fieldKey, enabled = true) {
-      if (!globalDocsRuntime?.setDocumentBindingFieldReadMode) return;
-      globalDocsRuntime.setDocumentBindingFieldReadMode(fieldKey, enabled);
+      globalDocsRuntime?.setDocumentBindingFieldReadMode?.(fieldKey, enabled);
     }
 
     function setDocumentBindingReadModeAll(enabled = true) {
-      if (!globalDocsRuntime?.setDocumentBindingReadModeAll) return;
-      globalDocsRuntime.setDocumentBindingReadModeAll(enabled);
+      globalDocsRuntime?.setDocumentBindingReadModeAll?.(enabled);
     }
 
     function initDocumentBindingInlineEditing(canEdit = false) {
-      if (!globalDocsRuntime?.initDocumentBindingInlineEditing) return;
-      globalDocsRuntime.initDocumentBindingInlineEditing(canEdit);
+      globalDocsRuntime?.initDocumentBindingInlineEditing?.(canEdit);
     }
 
     /**
      * Ouvre la modale de rattachement document (projet/tâche/visibilité).
      */
     async function openDocumentBindingModal(docId) {
-      if (!globalDocsRuntime?.openDocumentBindingModal) return;
-      await globalDocsRuntime.openDocumentBindingModal(docId);
+      await globalDocsRuntime?.openDocumentBindingModal?.(docId);
     }
 
     function closeDocumentBindingModal() {
-      if (!globalDocsRuntime?.closeDocumentBindingModal) return;
-      globalDocsRuntime.closeDocumentBindingModal();
+      globalDocsRuntime?.closeDocumentBindingModal?.();
     }
 
     /**
      * Persiste les changements de rattachement document.
      */
     async function saveDocumentBindingChanges(options = {}) {
-      if (!globalDocsRuntime?.saveDocumentBindingChanges) return;
-      await globalDocsRuntime.saveDocumentBindingChanges(options);
+      await globalDocsRuntime?.saveDocumentBindingChanges?.(options);
     }
 
     async function copyDocumentBindingStoragePath() {
-      if (!globalDocsRuntime?.copyDocumentBindingStoragePath) return;
-      await globalDocsRuntime.copyDocumentBindingStoragePath();
+      await globalDocsRuntime?.copyDocumentBindingStoragePath?.();
     }
 
     /**
      * Supprime un document depuis la vue transverse.
      */
     async function deleteGlobalDocument(docId) {
-      if (!globalDocsRuntime?.deleteGlobalDocument) {
+      const deleteDoc = globalDocsRuntime?.deleteGlobalDocument;
+      if (!deleteDoc) {
         showToast('Module documents indisponible');
         return;
       }
-      await globalDocsRuntime.deleteGlobalDocument(docId);
+      await deleteDoc(docId);
+      invalidateGlobalDocsReadModel();
     }
 
     async function addStandaloneDocuments() {
-      if (!globalDocsRuntime?.addStandaloneDocuments) {
+      const addDocs = globalDocsRuntime?.addStandaloneDocuments;
+      if (!addDocs) {
         showToast('Module documents indisponible');
         return;
       }
-      await globalDocsRuntime.addStandaloneDocuments();
+      await addDocs();
+      invalidateGlobalDocsReadModel();
     }
 
     function loadGlobalMessageReadMap() {
@@ -24968,10 +23361,6 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       } catch {
         // ignore quota/storage errors
       }
-    }
-
-    function refreshGlobalMessageHiddenPeersForCurrentUser() {
-      globalMessageHiddenPeerConversations = loadGlobalMessageHiddenPeerConversations();
     }
 
     function getGlobalConversationLastRead(conversationId) {
@@ -25138,18 +23527,59 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       }
     }
 
+    async function writeGlobalMessageToSharedFolderWithRetry(message, maxAttempts = 3) {
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const ok = await writeGlobalMessageToSharedFolder(message);
+        if (ok) return true;
+        if (attempt < maxAttempts) {
+          globalMessageSharedQueueMetrics.retried += 1;
+          await new Promise((resolve) => setTimeout(resolve, getSharedWriteBackoffDelayMs(attempt)));
+        }
+      }
+      return false;
+    }
+
+    function logAuxSharedQueueMetrics(queueName, metrics) {
+      if (!APP_DEBUG) return;
+      debugLog(`[sync-queue:${queueName}]`, {
+        enqueued: Number(metrics?.enqueued || 0),
+        synced: Number(metrics?.synced || 0),
+        retried: Number(metrics?.retried || 0),
+        dropped: Number(metrics?.dropped || 0)
+      });
+    }
+
     function enqueueGlobalMessageSharedDeletes(messages = []) {
       if (!sharedFolderHandle) return;
-      const rows = Array.isArray(messages) ? messages.filter((row) => row?.messageId) : [];
+      const rows = (Array.isArray(messages) ? messages : [])
+        .filter((row) => row?.messageId)
+        .filter((row) => {
+          const messageId = String(row.messageId || '').trim();
+          if (!messageId) return false;
+          if (globalMessageSharedQueuedIds.has(messageId)) return false;
+          globalMessageSharedQueuedIds.add(messageId);
+          return true;
+        });
       if (rows.length === 0) return;
+      globalMessageSharedQueueMetrics.enqueued += rows.length;
+      logAuxSharedQueueMetrics('global-messages', globalMessageSharedQueueMetrics);
       globalMessageSharedDeleteQueue = globalMessageSharedDeleteQueue
         .then(async () => {
           for (const row of rows) {
-            await writeGlobalMessageToSharedFolder(row);
+            const synced = await writeGlobalMessageToSharedFolderWithRetry(row, 3);
+            if (synced) globalMessageSharedQueueMetrics.synced += 1;
+            else globalMessageSharedQueueMetrics.dropped += 1;
+            globalMessageSharedQueuedIds.delete(String(row?.messageId || '').trim());
           }
+          logAuxSharedQueueMetrics('global-messages', globalMessageSharedQueueMetrics);
         })
         .catch((error) => {
           console.warn('Global message shared delete queue failed:', error);
+          globalMessageSharedQueueMetrics.dropped += rows.length;
+          rows.forEach((row) => {
+            globalMessageSharedQueuedIds.delete(String(row?.messageId || '').trim());
+          });
+          logAuxSharedQueueMetrics('global-messages', globalMessageSharedQueueMetrics);
         });
     }
 
@@ -25971,6 +24401,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
             autoKind: String(post.autoKind || '').trim(),
             sourceEventId: String(post.sourceEventId || '').trim()
           }, 'postId');
+          invalidateGlobalFeedReadModel();
           knownGlobalPostIds.add(postId);
           loaded += 1;
 
@@ -25993,7 +24424,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
           console.warn('Global feed shared sync failed:', error);
         }
       }
-      if (loaded > 0 && workspaceMode === 'global' && globalWorkspaceView === 'feed') {
+      if (loaded > 0 && isGlobalFeedViewActive()) {
         await renderGlobalFeed();
       }
       return { loaded };
@@ -26091,12 +24522,40 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       }
     }
 
+    async function writeWorkflowChangeToSharedFolderWithRetry(change, maxAttempts = 3) {
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const ok = await writeWorkflowChangeToSharedFolder(change);
+        if (ok) return true;
+        if (attempt < maxAttempts) {
+          workflowSharedQueueMetrics.retried += 1;
+          await new Promise((resolve) => setTimeout(resolve, getSharedWriteBackoffDelayMs(attempt)));
+        }
+      }
+      return false;
+    }
+
     function enqueueWorkflowSharedFolderWrite(change) {
       if (!sharedFolderHandle || !change?.changeId) return;
+      const changeId = String(change.changeId || '').trim();
+      if (!changeId) return;
+      if (workflowSharedQueuedChangeIds.has(changeId)) return;
+      workflowSharedQueuedChangeIds.add(changeId);
+      workflowSharedQueueMetrics.enqueued += 1;
+      logAuxSharedQueueMetrics('workflow', workflowSharedQueueMetrics);
       workflowSharedWriteQueue = workflowSharedWriteQueue
-        .then(() => writeWorkflowChangeToSharedFolder(change))
+        .then(async () => {
+          const synced = await writeWorkflowChangeToSharedFolderWithRetry(change, 3);
+          if (synced) workflowSharedQueueMetrics.synced += 1;
+          else workflowSharedQueueMetrics.dropped += 1;
+          workflowSharedQueuedChangeIds.delete(changeId);
+          logAuxSharedQueueMetrics('workflow', workflowSharedQueueMetrics);
+          return synced;
+        })
         .catch((error) => {
           console.warn('Workflow shared async queue failed:', error);
+          workflowSharedQueueMetrics.dropped += 1;
+          workflowSharedQueuedChangeIds.delete(changeId);
+          logAuxSharedQueueMetrics('workflow', workflowSharedQueueMetrics);
           return false;
         });
     }
@@ -26339,6 +24798,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
           } catch (_) {}
         }
         await deleteFromStore('globalDocs', docId);
+        invalidateGlobalDocsReadModel();
       }
     }
 
@@ -26436,6 +24896,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       }
       existing.deletedAt = Date.now();
       await putEncrypted('globalPosts', existing, 'postId');
+      invalidateGlobalFeedReadModel();
       if (sharedFolderHandle) {
         writeGlobalFeedPostToSharedFolder(existing);
       }
@@ -26443,7 +24904,41 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         cancelEditGlobalFeedPost();
       }
       showToast('Post supprimé');
-      await renderGlobalFeed();
+      if (isGlobalFeedViewActive()) {
+        const patched = await tryPatchGlobalFeedPostDeleteIncremental(postId);
+        if (!patched) {
+          await renderGlobalFeed();
+        }
+      }
+    }
+
+    async function tryPatchGlobalFeedPostDeleteIncremental(postId = '') {
+      const pid = String(postId || '').trim();
+      if (!pid) return false;
+      if (!isGlobalFeedViewActive()) return false;
+      const list = document.getElementById('global-feed-list');
+      if (!list) return false;
+      const card = document.getElementById(`global-feed-post-${pid}`);
+      if (!card) return false;
+
+      const prepareScope = globalFeedRuntime?.prepareGlobalFeedRenderScope;
+      if (typeof prepareScope !== 'function') return false;
+      const scope = await getGlobalFeedRenderScopeCached(prepareScope);
+      const posts = Array.isArray(scope?.posts) ? scope.posts : [];
+      const mentionCatalog = scope?.mentionCatalog || globalFeedMentionCatalogCache;
+
+      card.remove();
+      if (globalFeedFocusPostId === pid) {
+        globalFeedFocusPostId = '';
+      }
+
+      if (posts.length === 0 || !list.querySelector('.feed-item')) {
+        await renderGlobalFeed();
+        return true;
+      }
+
+      globalFeedRuntime?.renderGlobalFeedSummary?.(posts, mentionCatalog);
+      return true;
     }
 
     function getFeedDigestFileExtension(fileName) {
@@ -26741,10 +25236,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function sanitizeDigestHtmlFragment(html) {
-      const source = String(html || '').trim();
-      if (!source) return '';
-      const sanitized = sanitizeProjectDescriptionHtml(source);
-      return applyProfanityFilterToHtml(sanitized);
+      return feedDigestContentRuntime?.sanitizeDigestHtmlFragment?.(html) || '';
     }
 
     function stringifyMimeHeaders(headers) {
@@ -26755,449 +25247,20 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       return rows.join('\n').trim();
     }
 
-    function normalizeEmailAddressField(value) {
-      if (!value) return '';
-      if (typeof value === 'string') return decodeMimeEncodedWords(value);
-      if (Array.isArray(value)) {
-        return value
-          .map((entry) => normalizeEmailAddressField(entry))
-          .filter(Boolean)
-          .join(', ');
-      }
-      if (typeof value === 'object') {
-        const singleName = String(value?.name || '').trim();
-        const singleAddress = String(value?.address || '').trim();
-        if (singleAddress) {
-          return singleName ? `${singleName} <${singleAddress}>` : singleAddress;
-        }
-        if (Array.isArray(value?.value)) {
-          return value.value
-            .map((entry) => normalizeEmailAddressField(entry))
-            .filter(Boolean)
-            .join(', ');
-        }
-      }
-      return '';
-    }
-
-    function stringifyPostalMimeHeaders(headers) {
-      const rows = [];
-      if (headers instanceof Map) {
-        headers.forEach((value, key) => {
-          rows.push(`${String(key || '')}: ${decodeMimeEncodedWords(String(value || ''))}`);
-        });
-      } else if (Array.isArray(headers)) {
-        headers.forEach((entry) => {
-          const key = String(entry?.key || entry?.name || '').trim().toLowerCase();
-          const value = entry?.value ?? entry?.line ?? '';
-          if (!key) return;
-          rows.push(`${key}: ${decodeMimeEncodedWords(String(value || ''))}`);
-        });
-      }
-      return rows.join('\n').trim();
-    }
-
-    const POSTAL_MIME_CDN_URL = 'https://esm.sh/postal-mime@2.4.4?bundle';
-    let postalMimeModulePromise = null;
-
-    async function ensurePostalMimeModule() {
-      if (postalMimeModulePromise) return postalMimeModulePromise;
-      postalMimeModulePromise = import(POSTAL_MIME_CDN_URL)
-        .then((mod) => mod?.default || mod)
-        .catch((error) => {
-          console.warn('postal-mime CDN unavailable, fallback parser used:', error);
-          return null;
-        });
-      return postalMimeModulePromise;
-    }
-
-    async function parseEmlDigestWithPostalMime(rawBytesOrText) {
-      try {
-        const PostalMime = await ensurePostalMimeModule();
-        if (!PostalMime || typeof PostalMime.parse !== 'function') return null;
-        const parsed = await PostalMime.parse(rawBytesOrText);
-        if (!parsed || typeof parsed !== 'object') return null;
-        const sourceHtml = String(parsed.html || '').trim();
-        const plainText = normalizeDigestText(String(parsed.text || '').trim());
-        const htmlText = sourceHtml ? normalizeDigestText(stripHtmlTagsForDigest(sourceHtml)) : '';
-        const text = plainText || htmlText;
-        const subject = decodeMimeEncodedWords(String(parsed.subject || '').trim());
-        const author = normalizeEmailAddressField(parsed.from);
-        const recipients = [
-          normalizeEmailAddressField(parsed.to),
-          normalizeEmailAddressField(parsed.cc)
-        ].filter(Boolean).join(', ');
-        const date = String(parsed.date || parsed.headers?.get?.('date') || '').trim();
-        const headersDump = stringifyPostalMimeHeaders(parsed.headers);
-        const attachments = Array.isArray(parsed.attachments)
-          ? parsed.attachments.map((att) => ({
-              mimeType: String(att?.mimeType || att?.contentType || 'application/octet-stream').trim(),
-              fileName: String(att?.filename || '').trim(),
-              disposition: String(att?.disposition || '').trim(),
-              transferEncoding: String(att?.encoding || '').trim().toLowerCase(),
-              payloadChars: Number(att?.content?.byteLength || att?.content?.length || 0) || 0
-            }))
-          : [];
-        return {
-          title: subject,
-          author,
-          recipients,
-          date,
-          text,
-          sourceHtml,
-          headersDump,
-          attachments
-        };
-      } catch (error) {
-        console.warn('postal-mime parse failed, fallback parser used:', error);
-        return null;
-      }
-    }
-
     function extractRfc822CandidateFromMsgRaw(raw) {
-      const source = String(raw || '').replace(/\0+/g, '');
-      if (!source.trim()) return '';
-      const starters = ['\nFrom:', '\nDate:', '\nSubject:', '\nReturn-Path:', '\nMIME-Version:', '\nContent-Type:'];
-      let startIdx = -1;
-      for (const marker of starters) {
-        const idx = source.indexOf(marker);
-        if (idx >= 0 && (startIdx < 0 || idx < startIdx)) startIdx = idx;
-      }
-      if (startIdx < 0) {
-        const alt = source.match(/(?:^|\n)(From|Date|Subject|Return-Path|MIME-Version|Content-Type):/i);
-        startIdx = alt && typeof alt.index === 'number' ? alt.index : -1;
-      }
-      if (startIdx < 0) return '';
-      let candidate = source.slice(Math.max(0, startIdx)).replace(/\r\n/g, '\n');
-      const eofMarkers = ['\nFrom ???@???', '\n--__', '\n------=_Part_'];
-      for (const marker of eofMarkers) {
-        const idx = candidate.indexOf(marker);
-        if (idx > 0 && idx > 1024) {
-          candidate = candidate.slice(0, idx);
-          break;
-        }
-      }
-      if (!/\nContent-Type:/i.test(candidate) && !/\nMIME-Version:/i.test(candidate)) return '';
-      if (!/\n\n/.test(candidate)) return '';
-      return candidate.trim();
+      return feedDigestMimeRuntime?.extractRfc822CandidateFromMsgRaw?.(raw) || '';
     }
 
     function extractHtmlFragmentFromMsgRaw(raw) {
-      const source = String(raw || '').replace(/\0+/g, '');
-      const lower = source.toLowerCase();
-      let start = lower.indexOf('<html');
-      if (start < 0) start = lower.indexOf('<!doctype html');
-      if (start < 0) return '';
-      let end = lower.indexOf('</html>', start);
-      if (end >= 0) end += '</html>'.length;
-      if (end < 0) end = Math.min(source.length, start + 400000);
-      return String(source.slice(start, end) || '').trim();
+      return feedDigestMimeRuntime?.extractHtmlFragmentFromMsgRaw?.(raw) || '';
     }
 
     function extractMsgHeaderField(raw, fieldName) {
-      const source = String(raw || '').replace(/\0+/g, '');
-      const re = new RegExp(`(?:^|\\n)${String(fieldName || '').replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\s*:\\s*([^\\n\\r]+)`, 'i');
-      const match = source.match(re);
-      return match ? decodeMimeEncodedWords(String(match[1] || '').trim()) : '';
+      return feedDigestMimeRuntime?.extractMsgHeaderField?.(raw, fieldName) || '';
     }
 
     function buildPdfStructuredPage(pageItems, options = {}) {
-      const items = Array.isArray(pageItems) ? pageItems : [];
-      const pageHeight = Number(options?.pageHeight || 0);
-      const tokens = items
-        .map((item) => {
-          const text = String(item?.str || '');
-          const transform = Array.isArray(item?.transform) ? item.transform : [];
-          const x = Number(transform[4] || 0);
-          const y = Number(transform[5] || 0);
-          const width = Math.max(0, Number(item?.width || 0));
-          const height = Math.max(0.5, Number(item?.height || Math.abs(transform[0] || 0) || 0));
-          const fontName = String(item?.fontName || '');
-          return { text, x, y, width, height, fontName };
-        })
-        .filter((token) => token.text.trim().length > 0);
-      if (!tokens.length) return { text: '', html: '' };
-
-      function toFootnoteMarker(value) {
-        const digits = String(value || '').replace(/\s+/g, '');
-        return digits ? `[${digits}]` : '';
-      }
-
-      function isNumericMarker(value) {
-        return /^\d{1,3}$/.test(String(value || '').trim());
-      }
-
-      function isMarkerOnlyLine(value) {
-        const txt = String(value || '').trim();
-        if (!txt) return false;
-        return /^(\[?\d{1,3}\]?)([\s,;]+(\[?\d{1,3}\]?))*$/.test(txt);
-      }
-
-      function normalizeMarkerSequence(value) {
-        const nums = String(value || '')
-          .match(/\d{1,3}/g);
-        if (!nums || !nums.length) return '';
-        const unique = nums.filter((n, idx) => nums.indexOf(n) === idx);
-        return unique.map((n) => `[${n}]`).join(' ');
-      }
-
-      const heights = tokens
-        .map((t) => t.height)
-        .filter((h) => Number.isFinite(h) && h > 0)
-        .sort((a, b) => a - b);
-      const medianHeight = heights.length ? heights[Math.floor(heights.length / 2)] : 11;
-      const lineTolerance = Math.max(1.8, medianHeight * 0.42);
-
-      const rawLines = [];
-      tokens.forEach((token) => {
-        let best = null;
-        let bestDist = Number.POSITIVE_INFINITY;
-        for (const line of rawLines) {
-          const dist = Math.abs(line.y - token.y);
-          if (dist <= lineTolerance && dist < bestDist) {
-            best = line;
-            bestDist = dist;
-          }
-        }
-        if (!best) {
-          best = { y: token.y, tokens: [] };
-          rawLines.push(best);
-        }
-        best.tokens.push(token);
-      });
-
-      const lines = rawLines.map((line) => {
-        const row = [...line.tokens].sort((a, b) => a.x - b.x);
-        let text = '';
-        let prev = null;
-        row.forEach((token) => {
-          const currentText = String(token.text || '');
-          if (!currentText) return;
-          if (!prev) {
-            text += currentText;
-            prev = token;
-            return;
-          }
-          const prevEndX = Number(prev.x || 0) + Number(prev.width || 0);
-          const gap = Number(token.x || 0) - prevEndX;
-          const noLeadingSpace = /^[,.;:!?%)\]\}]/.test(currentText);
-          const superscriptLike = isNumericMarker(currentText)
-            && Number(token.height || 0) < Number(prev.height || 0) * 0.86
-            && Number(token.y || 0) > Number(prev.y || 0) + Math.max(0.6, Number(prev.height || 0) * 0.16)
-            && gap < Math.max(10, Number(prev.height || 0));
-          if (superscriptLike) {
-            text += toFootnoteMarker(currentText);
-          } else if (gap > Math.max(1.2, Number(prev.height || 0) * 0.12) && !noLeadingSpace) {
-            text += ` ${currentText}`;
-          } else {
-            text += currentText;
-          }
-          prev = token;
-        });
-        const normalizedText = text.replace(/\s{2,}/g, ' ').trim();
-        const startX = Math.min(...row.map((t) => Number(t.x || 0)));
-        const endX = Math.max(...row.map((t) => Number(t.x || 0) + Number(t.width || 0)));
-        const avgHeight = row.reduce((sum, t) => sum + Number(t.height || 0), 0) / Math.max(1, row.length);
-        const boldishCount = row.filter((t) => /bold|black|heavy|demi/i.test(String(t.fontName || ''))).length;
-        const boldRatio = boldishCount / Math.max(1, row.length);
-        return {
-          text: normalizedText,
-          y: Number(line.y || 0),
-          startX,
-          endX,
-          avgHeight,
-          boldRatio
-        };
-      }).filter((line) => line.text.length > 0);
-
-      if (!lines.length) return { text: '', html: '' };
-
-      const startXs = lines.map((line) => line.startX).sort((a, b) => a - b);
-      const minX = startXs[0];
-      const maxX = startXs[startXs.length - 1];
-      const xSpan = maxX - minX;
-      let useTwoColumns = false;
-      let splitX = 0;
-      if (lines.length >= 9 && xSpan >= 180) {
-        const q1 = startXs[Math.floor(startXs.length * 0.25)];
-        const q3 = startXs[Math.floor(startXs.length * 0.75)];
-        const gap = q3 - q1;
-        if (gap >= Math.max(95, xSpan * 0.22)) {
-          const leftCount = lines.filter((line) => line.startX <= (q1 + q3) / 2).length;
-          const rightCount = lines.length - leftCount;
-          if (leftCount >= 3 && rightCount >= 3) {
-            useTwoColumns = true;
-            splitX = (q1 + q3) / 2;
-          }
-        }
-      }
-
-      const ordered = [...lines].sort((a, b) => {
-        const colA = useTwoColumns ? (a.startX <= splitX ? 0 : 1) : 0;
-        const colB = useTwoColumns ? (b.startX <= splitX ? 0 : 1) : 0;
-        if (colA !== colB) return colA - colB;
-        if (Math.abs(a.y - b.y) > lineTolerance) return b.y - a.y;
-        return a.startX - b.startX;
-      });
-
-      const orderedWithMarkers = [];
-      for (const line of ordered) {
-        const txt = String(line?.text || '').trim();
-        if (!isMarkerOnlyLine(txt)) {
-          orderedWithMarkers.push({ ...line, markerOnly: false });
-          continue;
-        }
-        const markers = normalizeMarkerSequence(txt);
-        if (!markers) continue;
-        const last = orderedWithMarkers.length ? orderedWithMarkers[orderedWithMarkers.length - 1] : null;
-        const nearPrevious = last
-          && Math.abs(Number(last.y || 0) - Number(line.y || 0)) <= Math.max(42, medianHeight * 4)
-          && Math.abs(Number(last.startX || 0) - Number(line.startX || 0)) <= Math.max(40, medianHeight * 3);
-        if (nearPrevious && !last.markerOnly) {
-          last.text = `${String(last.text || '').trim()} ${markers}`.replace(/\s{2,}/g, ' ').trim();
-        } else {
-          orderedWithMarkers.push({ ...line, text: markers, markerOnly: true });
-        }
-      }
-
-      const topY = Math.max(...orderedWithMarkers.map((l) => l.y));
-      const bottomY = Math.min(...orderedWithMarkers.map((l) => l.y));
-      const pageSpanY = Math.max(1, topY - bottomY);
-      const bottomBandY = bottomY + pageSpanY * 0.2;
-      const effectivePageHeight = pageHeight > 0 ? pageHeight : topY + (medianHeight * 2);
-
-      function isPotentialFootnoteLine(line) {
-        const txt = String(line.text || '').trim();
-        if (!txt) return false;
-        if (line.markerOnly) return false;
-        const lowerArea = line.y <= bottomBandY || line.y <= effectivePageHeight * 0.2;
-        const smallFont = line.avgHeight <= medianHeight * 0.9;
-        const startsMarker = /^\[?\d{1,3}\]?[\s.).-]/.test(txt) || /^\d{1,3}$/.test(txt);
-        return smallFont && lowerArea && (startsMarker || txt.length <= 90);
-      }
-
-      const footnotes = [];
-      const bodyLines = [];
-      orderedWithMarkers.forEach((line) => {
-        if (isPotentialFootnoteLine(line)) {
-          footnotes.push(line);
-        } else {
-          bodyLines.push(line);
-        }
-      });
-
-      function lineLooksLikeHeading(line) {
-        const txt = String(line?.text || '').trim();
-        if (!txt || txt.length > 140) return false;
-        if (/^[\u2022\-*]\s/u.test(txt) || /^\d+\./.test(txt)) return false;
-        const letters = txt.replace(/[^\p{L}]/gu, '');
-        const upper = txt.replace(/[^\p{Lu}]/gu, '');
-        const upperRatio = letters.length ? upper.length / letters.length : 0;
-        const bigFont = Number(line.avgHeight || 0) >= medianHeight * 1.24;
-        const boldish = Number(line.boldRatio || 0) >= 0.5;
-        const shortish = txt.length <= 95;
-        const endsLikeSentence = /[.!?;:]$/.test(txt);
-        return ((bigFont && shortish) || (boldish && shortish) || (upperRatio > 0.7 && txt.length <= 80)) && !endsLikeSentence;
-      }
-
-      const blocks = [];
-      let pendingBullet = false;
-      for (const line of bodyLines) {
-        let txt = String(line.text || '').trim();
-        if (!txt) continue;
-        if (line.markerOnly) {
-          const previous = blocks.length ? blocks[blocks.length - 1] : null;
-          if (previous && (previous.type === 'paragraph' || previous.type === 'list-item')) {
-            previous.text = `${String(previous.text || '').trim()} ${txt}`.replace(/\s{2,}/g, ' ').trim();
-            previous.lastY = line.y;
-          } else {
-            blocks.push({ type: 'paragraph', text: txt, startX: line.startX, lastY: line.y });
-          }
-          continue;
-        }
-        if (txt === '•' || txt === '.') {
-          pendingBullet = true;
-          continue;
-        }
-        if (pendingBullet) {
-          txt = `• ${txt}`;
-          pendingBullet = false;
-        }
-
-        const isHeading = lineLooksLikeHeading({ ...line, text: txt });
-        const isListItem = /^[•\-–]\s+/.test(txt) || /^\d+\.\s+/.test(txt);
-        const previous = blocks.length ? blocks[blocks.length - 1] : null;
-        const verticalGap = previous ? Math.max(0, Number(previous.lastY || 0) - Number(line.y || 0)) : 0;
-        const similarIndent = previous ? Math.abs(Number(previous.startX || 0) - Number(line.startX || 0)) <= Math.max(12, medianHeight * 1.6) : false;
-        const canMerge = previous
-          && previous.type === 'paragraph'
-          && !isHeading
-          && !isListItem
-          && similarIndent
-          && verticalGap <= Math.max(16, medianHeight * 1.7);
-
-        if (isHeading) {
-          const level = Number(line.avgHeight || 0) >= medianHeight * 1.45 ? 'h2' : 'h3';
-          blocks.push({ type: 'heading', level, text: txt, startX: line.startX, lastY: line.y });
-          continue;
-        }
-
-        if (isListItem) {
-          blocks.push({ type: 'list-item', text: txt, startX: line.startX, lastY: line.y });
-          continue;
-        }
-
-        if (canMerge) {
-          const current = String(txt || '');
-          const previousText = String(previous.text || '');
-          const hyphenJoin = /-$/.test(previousText) && /^[a-zà-öø-ÿ]/i.test(current);
-          previous.text = hyphenJoin
-            ? `${previousText.slice(0, -1)}${current}`
-            : `${previousText} ${current}`.replace(/\s{2,}/g, ' ').trim();
-          previous.lastY = line.y;
-        } else {
-          blocks.push({ type: 'paragraph', text: txt, startX: line.startX, lastY: line.y });
-        }
-      }
-
-      const textParts = [];
-      const htmlParts = [];
-      blocks.forEach((block) => {
-        const value = String(block.text || '').trim();
-        if (!value) return;
-        textParts.push(value);
-        if (block.type === 'heading') {
-          const safeLevel = block.level === 'h2' ? 'h2' : 'h3';
-          htmlParts.push(`<${safeLevel}>${escapeHtml(value)}</${safeLevel}>`);
-        } else if (block.type === 'list-item') {
-          htmlParts.push(`<p>${escapeHtml(value)}</p>`);
-        } else {
-          htmlParts.push(`<p>${escapeHtml(value)}</p>`);
-        }
-      });
-
-      if (footnotes.length > 0) {
-        const footRows = footnotes
-          .map((line) => String(line.text || '').trim())
-          .filter(Boolean)
-          .map((line) => line.replace(/^(\d{1,3})(?=\s)/, '[$1]'));
-        if (footRows.length) {
-          textParts.push('');
-          textParts.push('Notes de bas de page:');
-          footRows.forEach((row) => textParts.push(row));
-          htmlParts.push(`
-            <details class="feed-digest-pdf-footnotes">
-              <summary>Notes de bas de page (${footRows.length})</summary>
-              <ul>${footRows.map((row) => `<li>${escapeHtml(row)}</li>`).join('')}</ul>
-            </details>
-          `);
-        }
-      }
-
-      return {
-        text: normalizeDigestText(textParts.join('\n')),
-        html: htmlParts.join('')
-      };
+      return feedDigestPdfRuntime?.buildPdfStructuredPage?.(pageItems, options) || { text: '', html: '' };
     }
 
     async function extractPdfPageLinks(page) {
@@ -27213,17 +25276,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function renderPdfPageLinksHtml(links = [], pageNo = 1, anchorPrefix = 'feed-digest-pdf') {
-      const list = Array.isArray(links) ? links.filter(Boolean) : [];
-      if (!list.length) return '';
-      const sectionId = `${anchorPrefix}-links-page-${Number(pageNo || 1)}`;
-      return `
-        <details id="${escapeHtml(sectionId)}" class="feed-digest-pdf-links">
-          <summary>Liens detectes (${list.length})</summary>
-          <ul>
-            ${list.map((href, idx) => `<li id="${escapeHtml(`${sectionId}-ref-${idx + 1}`)}"><a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(href)}</a></li>`).join('')}
-          </ul>
-        </details>
-      `;
+      return feedDigestPdfRuntime?.renderPdfPageLinksHtml?.(links, pageNo, anchorPrefix) || '';
     }
 
     function updateTaskCardsLayoutLabel(elementId, cardsCount) {
@@ -27235,267 +25288,47 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function linkifyPdfMarkersToPageLinksSection(html, links = [], pageNo = 1, anchorPrefix = 'feed-digest-pdf') {
-      const source = String(html || '');
-      const list = Array.isArray(links) ? links.filter(Boolean) : [];
-      if (!source || !list.length) return source;
-      const sectionId = `${anchorPrefix}-links-page-${Number(pageNo || 1)}`;
-      return source.replace(/\[(\d{1,3})\]/g, (_full, n) => {
-        const idx = Number(n);
-        if (!Number.isFinite(idx) || idx < 1 || idx > list.length) return `[${n}]`;
-        return `<a href="#${escapeHtml(sectionId)}" class="feed-digest-marker-link" title="Aller aux liens detectes de la page">[${escapeHtml(String(n))}]</a>`;
-      });
-    }
-
-    const PDF2MD_CDN_URL = 'https://esm.sh/@opendocsg/pdf2md@0.2.2?bundle';
-    let pdf2MdModulePromise = null;
-
-    async function ensurePdf2MdModule() {
-      if (pdf2MdModulePromise) return pdf2MdModulePromise;
-      pdf2MdModulePromise = import(PDF2MD_CDN_URL)
-        .then((mod) => mod?.default || mod)
-        .catch((error) => {
-          console.warn('pdf2md CDN unavailable, fallback to PDF.js extraction:', error);
-          return null;
-        });
-      return pdf2MdModulePromise;
+      return feedDigestPdfRuntime?.linkifyPdfMarkersToPageLinksSection?.(html, links, pageNo, anchorPrefix) || String(html || '');
     }
 
     async function extractPdfMarkdownWithCdn(buffer) {
-      try {
-        const pdf2md = await ensurePdf2MdModule();
-        if (typeof pdf2md !== 'function') return '';
-        const markdown = await pdf2md(buffer);
-        return normalizeDigestText(String(markdown || ''));
-      } catch (error) {
-        console.warn('pdf2md extraction failed, fallback to PDF.js extraction:', error);
-        return '';
-      }
+      return await feedDigestPdfRuntime?.extractPdfMarkdownWithCdn?.(buffer) || '';
     }
 
     function renderDigestDetailsList(details = []) {
-      if (!Array.isArray(details) || !details.length) return '';
-      return `<p>${details.map((item) => escapeHtml(item)).join(' • ')}</p>`;
+      return feedDigestPdfRuntime?.renderDigestDetailsList?.(details) || '';
     }
 
     function trimDigestTextForCompact(text, maxChars = 2600, maxLines = 28) {
-      const source = normalizeDigestText(text);
-      if (!source) return { text: '', truncated: false };
-      const lines = source.split('\n');
-      const clippedLines = lines.slice(0, maxLines);
-      let joined = clippedLines.join('\n');
-      let truncated = lines.length > maxLines;
-      if (joined.length > maxChars) {
-        joined = `${joined.slice(0, maxChars)}...`;
-        truncated = true;
-      }
-      return { text: joined.trim(), truncated };
+      return feedDigestPdfRuntime?.trimDigestTextForCompact?.(text, maxChars, maxLines) || { text: '', truncated: false };
     }
 
     function renderDigestMarkdownHtml(markdownText) {
-      const source = String(markdownText || '');
-      if (!source.trim()) return '';
-      try {
-        if (globalThis.marked && typeof globalThis.marked.parse === 'function') {
-          const parsed = globalThis.marked.parse(source, {
-            gfm: true,
-            breaks: true,
-            headerIds: false,
-            mangle: false
-          });
-          return sanitizeProjectDescriptionHtml(String(parsed || ''));
-        }
-      } catch (error) {
-        console.warn('Markdown parse failed, fallback used:', error);
-      }
-      return sanitizeProjectDescriptionHtml(renderSafeMarkdown(source));
+      return feedDigestPdfRuntime?.renderDigestMarkdownHtml?.(markdownText) || '';
     }
 
     function splitEmailBodyAndSignatureFromText(text) {
-      const source = normalizeDigestText(text);
-      if (!source) return { bodyText: '', signatureText: '' };
-      const lines = source.split('\n');
-      const markerPatterns = [
-        /^--\s*$/,
-        /^--\s+/,
-        /^cordialement[,.\s]*$/i,
-        /^bien cordialement[,.\s]*$/i,
-        /^merci[,.\s]*$/i,
-        /^thanks[,.\s]*$/i,
-        /^best regards[,.\s]*$/i,
-        /^kind regards[,.\s]*$/i,
-        /^sent from my/i
-      ];
-      let markerIndex = -1;
-      for (let i = Math.max(0, lines.length - 14); i < lines.length; i += 1) {
-        const line = String(lines[i] || '').trim();
-        if (!line) continue;
-        if (markerPatterns.some((re) => re.test(line))) {
-          markerIndex = i;
-          break;
-        }
-      }
-      if (markerIndex < 0) return { bodyText: source, signatureText: '' };
-      const bodyText = normalizeDigestText(lines.slice(0, markerIndex).join('\n'));
-      const signatureText = normalizeDigestText(lines.slice(markerIndex).join('\n'));
-      return { bodyText, signatureText };
+      return feedDigestContentRuntime?.splitEmailBodyAndSignatureFromText?.(text) || { bodyText: '', signatureText: '' };
     }
 
     function splitEmailBodyAndSignatureFromHtml(html) {
-      const source = String(html || '').trim();
-      if (!source) return { bodyHtml: '', signatureHtml: '' };
-      const root = document.createElement('div');
-      root.innerHTML = source;
-      const signatureNode = root.querySelector('.gmail_signature, .moz-signature, [data-smartmail="gmail_signature"], blockquote[type="cite"]');
-      if (!signatureNode) {
-        const plain = splitEmailBodyAndSignatureFromText(stripHtmlTagsForDigest(source));
-        return {
-          bodyHtml: source,
-          signatureHtml: plain.signatureText ? `<p>${escapeHtml(plain.signatureText).replace(/\n/g, '<br>')}</p>` : ''
-        };
-      }
-      const signatureHtml = String(signatureNode.outerHTML || '').trim();
-      signatureNode.remove();
-      const bodyHtml = String(root.innerHTML || '').trim();
-      return { bodyHtml, signatureHtml };
+      return feedDigestContentRuntime?.splitEmailBodyAndSignatureFromHtml?.(html) || { bodyHtml: '', signatureHtml: '' };
     }
 
     function buildDigestContentHtml(digest, file, displayMode = 'compact') {
-      const effectiveMode = normalizeGlobalFeedDigestView(displayMode, 'compact');
-      const sourceLabel = digest.kind === 'email'
-        ? 'Email'
-        : (digest.kind === 'pdf' ? 'PDF' : (digest.kind === 'office' ? 'DOCX/Office' : 'Document'));
-      const createdLabel = new Date().toLocaleString('fr-FR');
-      const title = String(digest.title || file?.name || 'Document').trim();
-      const details = [];
-      if (digest.sourceAuthor) details.push(`Expediteur: ${digest.sourceAuthor}`);
-      if (digest.sourceDate) details.push(`Date source: ${digest.sourceDate}`);
-      if (digest.degraded && !digest.unavailableReason) details.push('Extraction partielle (fallback binaire)');
-      if (digest.unavailableReason) details.push(`Parser manquant: ${digest.unavailableReason}`);
-
-      let compactPanelHtml = '';
-      let fullPanelHtml = '';
-      if (digest.kind === 'email') {
-        const htmlFragment = String(digest.sourceHtml || '').trim();
-        const subject = String(digest.title || file?.name || 'Sans objet').trim();
-        const sender = String(digest.sourceAuthor || '').trim() || '-';
-        const recipients = String(digest.sourceRecipients || '').trim() || '-';
-        const splitText = splitEmailBodyAndSignatureFromText(String(digest.text || ''));
-        const splitHtml = splitEmailBodyAndSignatureFromHtml(htmlFragment);
-        const bodyHtmlRaw = String(splitHtml.bodyHtml || '').trim();
-        const signatureHtmlRaw = String(splitHtml.signatureHtml || '').trim();
-        const bodyHtml = sanitizeDigestHtmlFragment(bodyHtmlRaw) || (splitText.bodyText ? `<p>${escapeHtml(splitText.bodyText).replace(/\n/g, '<br>')}</p>` : '');
-        const signatureHtml = sanitizeDigestHtmlFragment(signatureHtmlRaw) || (splitText.signatureText ? `<p>${escapeHtml(splitText.signatureText).replace(/\n/g, '<br>')}</p>` : '');
-        const compactBody = trimDigestTextForCompact(splitText.bodyText || digest.text || '', FEED_DIGEST_COMPACT_TEXT_MAX_CHARS, FEED_DIGEST_COMPACT_TEXT_MAX_LINES);
-        const compactSig = trimDigestTextForCompact(splitText.signatureText || '', 420, 8);
-        compactPanelHtml = `
-          <p><strong>Expediteur:</strong> ${escapeHtml(sender)}</p>
-          <p><strong>Destinataires:</strong> ${escapeHtml(recipients)}</p>
-          <p><strong>Objet:</strong> ${escapeHtml(subject || '-')}</p>
-          <p><strong>Message:</strong></p>
-          ${compactBody.text ? `<pre class="feed-digest-excerpt">${escapeHtml(compactBody.text)}</pre>` : '<p>Aucun message detecte.</p>'}
-          <p><strong>Signature:</strong></p>
-          ${compactSig.text ? `<pre class="feed-digest-excerpt">${escapeHtml(compactSig.text)}</pre>` : '<p>-</p>'}
-          ${compactBody.truncated ? '<p class="feed-digest-compact-note">Mode compact: message complet en mode "Complet".</p>' : ''}
-        `;
-        fullPanelHtml = `
-          <p><strong>Expediteur:</strong> ${escapeHtml(sender)}</p>
-          <p><strong>Destinataires:</strong> ${escapeHtml(recipients)}</p>
-          <p><strong>Objet:</strong> ${escapeHtml(subject || '-')}</p>
-          <p><strong>Message:</strong></p>
-          ${bodyHtml || (splitText.bodyText ? `<pre class="feed-digest-excerpt">${escapeHtml(splitText.bodyText)}</pre>` : '<p>Aucun message detecte.</p>')}
-          <p><strong>Signature:</strong></p>
-          ${signatureHtml || (splitText.signatureText ? `<pre class="feed-digest-excerpt">${escapeHtml(splitText.signatureText)}</pre>` : '<p>-</p>')}
-        `;
-      } else if (digest.kind === 'pdf') {
-        const metadataLines = Array.isArray(digest.metadataLines) ? digest.metadataLines.filter(Boolean) : [];
-        const pagesHtml = String(digest.pagesHtml || '').trim();
-        const pagesPreviewHtml = String(digest.pagesPreviewHtml || '').trim();
-        const markdownSource = String(digest.markdownSource || '').trim();
-        const compactText = trimDigestTextForCompact(digest.text || '', FEED_DIGEST_COMPACT_TEXT_MAX_CHARS, FEED_DIGEST_COMPACT_TEXT_MAX_LINES);
-        const compactMarkdown = markdownSource
-          ? renderDigestMarkdownHtml(trimDigestTextForCompact(markdownSource, FEED_DIGEST_COMPACT_TEXT_MAX_CHARS, FEED_DIGEST_COMPACT_TEXT_MAX_LINES).text)
-          : '';
-        const fullMarkdown = markdownSource ? renderDigestMarkdownHtml(markdownSource) : '';
-        compactPanelHtml = `
-          ${renderDigestDetailsList(details)}
-          ${metadataLines.length ? `<pre class="feed-digest-excerpt">${escapeHtml(metadataLines.join('\n'))}</pre>` : ''}
-          ${compactMarkdown ? `<section class="feed-digest-plain-content">${compactMarkdown}</section>` : ''}
-          ${pagesPreviewHtml ? `<section class="feed-digest-pdf-pages">${pagesPreviewHtml}</section>` : ''}
-          ${!compactMarkdown && compactText.text ? `<details><summary>Texte</summary><pre class="feed-digest-excerpt">${escapeHtml(compactText.text)}</pre></details>` : ''}
-          ${compactText.truncated ? '<p class="feed-digest-compact-note">Mode compact: pages et texte complets disponibles en mode "Complet".</p>' : ''}
-        `;
-        fullPanelHtml = `
-          ${renderDigestDetailsList(details)}
-          ${metadataLines.length ? `<details open><summary>Metadonnees PDF</summary><pre class="feed-digest-excerpt">${escapeHtml(metadataLines.join('\n'))}</pre></details>` : ''}
-          ${fullMarkdown ? `<details open><summary>Contenu reconstruit (Markdown)</summary><section class="feed-digest-plain-content">${fullMarkdown}</section></details>` : ''}
-          ${pagesHtml ? `<details open><summary>Contenu structure par pages</summary><section class="feed-digest-pdf-pages">${pagesHtml}</section></details>` : ''}
-          ${!fullMarkdown && digest.text ? `<details><summary>Texte complet</summary><pre class="feed-digest-excerpt">${escapeHtml(String(digest.text || ''))}</pre></details>` : ''}
-          ${!fullMarkdown && !digest.text ? `<p>Aucun texte exploitable detecte.</p>` : ''}
-        `;
-      } else {
-        const sourceText = String(digest.text || '').trim();
-        const compactText = trimDigestTextForCompact(sourceText, FEED_DIGEST_COMPACT_TEXT_MAX_CHARS, FEED_DIGEST_COMPACT_TEXT_MAX_LINES);
-        const compactRendered = digest.kind === 'markdown'
-          ? renderDigestMarkdownHtml(compactText.text)
-          : escapeHtml(compactText.text).replace(/\n/g, '<br>');
-        const fullRendered = digest.kind === 'markdown'
-          ? renderDigestMarkdownHtml(sourceText)
-          : escapeHtml(sourceText).replace(/\n/g, '<br>');
-        const compactBody = compactText.text
-          ? `<section class="feed-digest-plain-content">${compactRendered}</section>`
-          : `<p>Aucun contenu exploitable detecte.</p>`;
-        const fullBody = sourceText
-          ? `<section class="feed-digest-plain-content">${fullRendered}</section>`
-          : `<p>Aucun contenu exploitable detecte.</p>`;
-        compactPanelHtml = `
-          ${renderDigestDetailsList(details)}
-          ${compactBody}
-          ${compactText.truncated ? '<p class="feed-digest-compact-note">Mode compact: contenu complet disponible en mode "Complet".</p>' : ''}
-        `;
-        fullPanelHtml = `
-          ${renderDigestDetailsList(details)}
-          ${fullBody}
-        `;
-      }
-
-      const selectedPanelHtml = effectiveMode === 'full' ? fullPanelHtml : compactPanelHtml;
-      const modeLabel = effectiveMode === 'full' ? 'Complet' : 'Compact';
-      return applyProfanityFilterToHtml(`
-        <div class="feed-digest-block" data-feed-digest-kind="${escapeHtml(String(digest.kind || 'document'))}" data-feed-digest-view="${escapeHtml(effectiveMode)}">
-          <h3>Actualite extraite - ${escapeHtml(title)}</h3>
-          <div class="feed-digest-panels">
-            <section class="feed-digest-panel-${escapeHtml(effectiveMode)}">${selectedPanelHtml}</section>
-          </div>
-          <div class="feed-digest-meta-box">
-            <p><strong>Source:</strong> ${escapeHtml(sourceLabel)} • <strong>Digest:</strong> ${escapeHtml(createdLabel)} • <strong>Mode:</strong> ${escapeHtml(modeLabel)}</p>
-          </div>
-        </div>
-      `);
+      return feedDigestContentRuntime?.buildDigestContentHtml?.(digest, file, displayMode) || '';
     }
 
     async function parseEmlDigest(raw, options = {}) {
-      const rawBytes = options?.rawBytes;
-      const postalParsed = await parseEmlDigestWithPostalMime(rawBytes instanceof Uint8Array ? rawBytes : String(raw || ''));
-      if (postalParsed && (postalParsed.text || postalParsed.sourceHtml || postalParsed.title || postalParsed.author)) {
-        return postalParsed;
-      }
-      const source = String(raw || '');
-      const { headerText } = splitMimeHeaderAndBody(source);
-      const headers = parseMimeHeaders(headerText);
-      const entity = parseMimeEntity(source, 'utf-8');
-      const plainText = normalizeDigestText(entity.plainParts.join('\n\n'));
-      const sourceHtml = String(entity.htmlParts.join('\n\n') || '').trim();
-      const htmlText = normalizeDigestText(stripHtmlTagsForDigest(sourceHtml));
-      const text = plainText || htmlText;
-      return {
-        title: decodeMimeEncodedWords(headers.get('subject') || ''),
-        author: decodeMimeEncodedWords(headers.get('from') || ''),
-        recipients: decodeMimeEncodedWords(headers.get('to') || ''),
-        date: decodeMimeEncodedWords(headers.get('date') || ''),
-        text: normalizeDigestText(text),
-        sourceHtml,
-        headersDump: stringifyMimeHeaders(headers),
-        attachments: Array.isArray(entity.attachments) ? entity.attachments : []
+      return await feedDigestMimeRuntime?.parseEmlDigest?.(raw, options) || {
+        title: '',
+        author: '',
+        recipients: '',
+        date: '',
+        text: '',
+        sourceHtml: '',
+        headersDump: '',
+        attachments: []
       };
     }
 
@@ -27683,267 +25516,54 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       };
     }
 
-    const FEED_DIGEST_BULLET_MAX_CHARS = 900;
-    const FEED_DIGEST_EXCERPT_MAX_CHARS = 50000;
     const FEED_DIGEST_COMPACT_TEXT_MAX_CHARS = 3200;
     const FEED_DIGEST_COMPACT_TEXT_MAX_LINES = 34;
     const FEED_DIGEST_COMPACT_PDF_PAGES = 2;
 
     function normalizeGlobalFeedDigestView(value, fallback = 'compact') {
-      const v = String(value || '').trim().toLowerCase();
-      if (v === 'full' || v === 'complet') return 'full';
-      if (v === 'compact') return 'compact';
-      return fallback === 'full' ? 'full' : 'compact';
+      return feedDigestUiRuntime?.normalizeGlobalFeedDigestView?.(value, fallback)
+        || (String(fallback || '').trim().toLowerCase() === 'full' ? 'full' : 'compact');
     }
 
     function pickGlobalFeedDigestImportMode() {
-      const isFull = window.confirm(
-        'Mode de digest pour cet import:\n\nOK = complet\nAnnuler = compact'
-      );
-      const normalized = isFull ? 'full' : 'compact';
+      const picked = feedDigestUiRuntime?.pickGlobalFeedDigestImportMode?.();
+      if (picked === 'full' || picked === 'compact') return picked;
+      const normalized = 'compact';
       globalFeedDigestViewMode = normalized;
       localStorage.setItem(GLOBAL_FEED_DIGEST_VIEW_STORAGE_KEY, normalized);
       return normalized;
     }
 
     function summarizeDigestText(text, maxBullets = 12) {
-      const source = normalizeDigestText(text);
-      if (!source) return { bullets: [], excerpt: '' };
-      const lines = source
-        .split(/\n+/)
-        .map((line) => line.replace(/^[\s\-•*]+/, '').trim())
-        .filter((line) => line.length >= 20);
-      const sentences = source
-        .split(/(?<=[.!?])\s+/)
-        .map((line) => line.trim())
-        .filter((line) => line.length >= 30);
-      const candidates = lines.length >= maxBullets ? lines : lines.concat(sentences);
-      const unique = [];
-      const seen = new Set();
-      candidates.forEach((item) => {
-        const key = normalizeSearch(item).slice(0, 120);
-        if (!key || seen.has(key)) return;
-        seen.add(key);
-        unique.push(item);
-      });
-      const bullets = unique
-        .slice(0, maxBullets)
-        .map((item) => item.length > FEED_DIGEST_BULLET_MAX_CHARS ? `${item.slice(0, FEED_DIGEST_BULLET_MAX_CHARS)}...` : item);
-      return { bullets, excerpt: source.slice(0, FEED_DIGEST_EXCERPT_MAX_CHARS) };
+      return feedDigestUiRuntime?.summarizeDigestText?.(text, maxBullets) || { bullets: [], excerpt: '' };
     }
 
     function appendDigestBlocksToRichEditor(editorId, fallbackInputId, digestBlocksHtml = []) {
-      const blocks = Array.isArray(digestBlocksHtml) ? digestBlocksHtml.filter(Boolean) : [];
-      if (!blocks.length) return false;
-      const importedHtml = blocks.join('<p><br></p><hr><p><br></p>');
-      const quill = projectDescriptionQuillEditors.get(editorId);
-      const fallbackInput = document.getElementById(fallbackInputId);
-      if (quill) {
-        const currentHtml = String(quill.root.innerHTML || '').trim();
-        const hasExistingDraft = !!currentHtml && currentHtml !== '<p><br></p>';
-        const nextHtml = hasExistingDraft
-          ? `${currentHtml}<p><br></p><hr><p><br></p>${importedHtml}`
-          : importedHtml;
-        quill.clipboard.dangerouslyPasteHTML(nextHtml || '<p><br></p>');
-        const len = Math.max(0, quill.getLength() - 1);
-        quill.setSelection(len, 0, 'user');
-        quill.focus();
-        if (fallbackInput) {
-          fallbackInput.value = sanitizeProjectDescriptionHtml(String(quill.root.innerHTML || ''));
-        }
-        return true;
-      }
-      if (fallbackInput) {
-        const currentValue = String(fallbackInput.value || '').trim();
-        fallbackInput.value = currentValue
-          ? `${currentValue}\n\n--------------------\n\n${stripHtmlTagsForDigest(importedHtml)}`
-          : stripHtmlTagsForDigest(importedHtml);
-        fallbackInput.focus();
-        return true;
-      }
-      return false;
-    }
-
-    async function publishGlobalFeedDigestFromFiles(fileList, options = {}) {
-      if (globalFeedRuntime?.publishGlobalFeedDigestFromFiles) {
-        return globalFeedRuntime.publishGlobalFeedDigestFromFiles(fileList, options);
-      }
+      return feedDigestEditorRuntime?.appendDigestBlocksToRichEditor?.(editorId, fallbackInputId, digestBlocksHtml) || false;
     }
 
     async function importProjectNoteDigestFromFiles(fileList, options = {}) {
-      const files = Array.from(fileList || []).filter(Boolean);
-      if (!files.length) return;
-      const digestViewMode = normalizeGlobalFeedDigestView(options?.digestView || globalFeedDigestViewMode, globalFeedDigestViewMode);
-      const digestBlocks = [];
-      for (const file of files) {
-        try {
-          const digest = await extractFeedDigestFromFile(file);
-          digestBlocks.push(buildDigestContentHtml(digest, file, digestViewMode));
-        } catch (error) {
-          console.warn('Note digest import failed:', error);
-          showToast(`Digest impossible pour ${file?.name || 'fichier'}`);
-        }
-      }
-      if (!digestBlocks.length) return;
-      const inserted = appendDigestBlocksToRichEditor('project-note-content-editor', 'project-note-content', digestBlocks);
-      if (!inserted) return;
-      scheduleProjectNoteDraftSave();
-      showToast(`${digestBlocks.length} digest importe(s) dans la note.`);
+      await feedDigestEditorRuntime?.importProjectNoteDigestFromFiles?.(fileList, options);
     }
 
     function appendDigestBlocksToEditorById(editorId, fallbackInputId, digestBlocks = []) {
-      const safeEditorId = String(editorId || '').trim();
-      if (!safeEditorId) return false;
-      const safeFallbackId = String(fallbackInputId || '').trim();
-      const blocks = Array.isArray(digestBlocks) ? digestBlocks.filter(Boolean) : [];
-      if (!blocks.length) return false;
-
-      const inserted = appendDigestBlocksToRichEditor(safeEditorId, safeFallbackId, blocks);
-      if (inserted) return true;
-
-      const host = document.getElementById(safeEditorId);
-      if (!host) return false;
-      const importedHtml = blocks.join('<p><br></p><hr><p><br></p>');
-      const quillRoot = host.classList.contains('ql-editor')
-        ? host
-        : host.querySelector('.ql-editor');
-      const quillFromDom = quillRoot && window.Quill && typeof window.Quill.find === 'function'
-        ? window.Quill.find(quillRoot)
-        : null;
-      if (quillFromDom && quillFromDom.clipboard) {
-        const currentHtml = String(quillFromDom.root?.innerHTML || '').trim();
-        const hasExistingDraft = !!currentHtml && currentHtml !== '<p><br></p>';
-        const nextHtml = hasExistingDraft
-          ? `${currentHtml}<p><br></p><hr><p><br></p>${importedHtml}`
-          : importedHtml;
-        quillFromDom.clipboard.dangerouslyPasteHTML(nextHtml || '<p><br></p>');
-        const len = Math.max(0, quillFromDom.getLength() - 1);
-        quillFromDom.setSelection(len, 0, 'user');
-        quillFromDom.focus();
-        return true;
-      }
-
-      if (host.isContentEditable || host.getAttribute('contenteditable') === 'true') {
-        host.focus();
-        if (typeof insertHtmlAtCursor === 'function') {
-          const ok = insertHtmlAtCursor(importedHtml);
-          if (ok) return true;
-        }
-        host.insertAdjacentHTML('beforeend', importedHtml);
-        host.dispatchEvent(new Event('input', { bubbles: true }));
-        return true;
-      }
-      return false;
+      return editorInteropRuntime?.appendDigestBlocksToEditorById?.(editorId, fallbackInputId, digestBlocks) || false;
     }
 
     async function requestDigestImportForEditor(editorId, fallbackInputId = '', options = {}) {
-      const safeEditorId = String(editorId || '').trim();
-      if (!safeEditorId) return false;
-      const digestViewMode = normalizeGlobalFeedDigestView(options?.digestView || pickGlobalFeedDigestImportMode(), globalFeedDigestViewMode);
-      const picker = document.createElement('input');
-      picker.type = 'file';
-      picker.multiple = true;
-      picker.accept = '.eml,.msg,.txt,.md,.html,.htm,.pdf,.doc,.docx,.odt,.rtf';
-      picker.className = 'hidden';
-      document.body.appendChild(picker);
-
-      const files = await new Promise((resolve) => {
-        picker.addEventListener('change', () => {
-          const selected = Array.from(picker.files || []).filter(Boolean);
-          resolve(selected);
-        }, { once: true });
-        picker.click();
-      });
-      picker.remove();
-      if (!Array.isArray(files) || files.length === 0) return false;
-
-      const digestBlocks = [];
-      for (const file of files) {
-        try {
-          const digest = await extractFeedDigestFromFile(file);
-          digestBlocks.push(buildDigestContentHtml(digest, file, digestViewMode));
-        } catch (error) {
-          console.warn('Editor digest import failed:', error);
-          showToast(`Digest impossible pour ${file?.name || 'fichier'}`);
-        }
-      }
-      if (!digestBlocks.length) return false;
-      const inserted = appendDigestBlocksToEditorById(safeEditorId, fallbackInputId, digestBlocks);
-      if (!inserted) {
-        showToast('Impossible d inserer le digest dans cet editeur');
-        return false;
-      }
-
-      if (safeEditorId === 'global-feed-editor') {
-        await updateGlobalFeedMentionCounter();
-      }
-      if (safeEditorId === 'project-note-content-editor') {
-        scheduleProjectNoteDraftSave();
-      }
-      showToast(`${digestBlocks.length} digest importe(s) dans l editeur.`);
-      return true;
+      return await editorInteropRuntime?.requestDigestImportForEditor?.(editorId, fallbackInputId, options) || false;
     }
 
     function buildInlineAttachedDocumentHtml(doc = {}) {
-      const docId = String(doc?.id || '').trim();
-      if (!docId) return '';
-      const ref = encodeDocumentPreviewRef({
-        sourceType: 'standalone',
-        id: docId,
-        sourceProjectName: 'Hors projet'
-      });
-      const label = escapeHtml(String(doc?.name || 'Document').trim() || 'Document');
-      const safeRef = escapeHtml(ref);
-      const safeDocId = escapeHtml(docId);
-      return `
-        <p data-doc-id="${safeDocId}">
-          <span class="inline-flex items-center gap-2 flex-wrap">
-            <span>📎 ${label}</span>
-            <a href="#" data-open-doc-ref="${safeRef}" data-doc-id="${safeDocId}" class="workspace-action-inline" data-action-kind="preview" data-action-label="Aperçu">Aperçu</a>
-            <a href="#" data-download-doc-ref="${safeRef}" data-doc-id="${safeDocId}" class="workspace-action-inline" data-action-kind="export" data-action-label="Télécharger">Télécharger</a>
-          </span>
-        </p>
-      `;
+      return globalDocRefUtilsRuntime?.buildInlineAttachedDocumentHtml?.(doc) || '';
     }
 
     function extractLinkedGlobalDocIdsFromHtml(html = '') {
-      const source = String(html || '').trim();
-      if (!source) return [];
-      const wrapper = document.createElement('div');
-      wrapper.innerHTML = source;
-      const ids = new Set();
-      wrapper.querySelectorAll('[data-doc-id]').forEach((node) => {
-        const id = String(node.getAttribute('data-doc-id') || '').trim();
-        if (id) ids.add(id);
-      });
-      return Array.from(ids);
+      return globalDocRefUtilsRuntime?.extractLinkedGlobalDocIdsFromHtml?.(html) || [];
     }
 
     function stripInlineAttachedDocumentBlocksFromHtml(html = '') {
-      const source = String(html || '').trim();
-      if (!source) return '';
-      const wrapper = document.createElement('div');
-      wrapper.innerHTML = source;
-      wrapper.querySelectorAll('[data-doc-id]').forEach((node) => node.remove());
-      wrapper.querySelectorAll('[data-open-doc-ref],[data-download-doc-ref]').forEach((node) => {
-        const block = node.closest('p,div,li');
-        if (block) block.remove();
-      });
-      wrapper.querySelectorAll('p,div,li').forEach((node) => {
-        const txt = String(node.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-        if (!txt) return;
-        if (txt.includes('aperçu') && txt.includes('télécharger') && txt.includes('📎'.toLowerCase())) {
-          node.remove();
-        }
-      });
-      return String(wrapper.innerHTML || '').trim();
-    }
-
-    async function resolveLinkedDocsForFeedPost(post = {}, allGlobalDocs = []) {
-      if (globalFeedRuntime?.resolveLinkedDocsForFeedPost) {
-        return globalFeedRuntime.resolveLinkedDocsForFeedPost(post, allGlobalDocs);
-      }
-      return [];
+      return globalDocRefUtilsRuntime?.stripInlineAttachedDocumentBlocksFromHtml?.(html) || '';
     }
 
     async function syncGlobalNoteLinkedDocuments(noteId = '', linkedDocIdsInput = []) {
@@ -27972,6 +25592,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
           linkedNoteIds: Array.from(prevSet),
           updatedAt: Date.now()
         }, 'id');
+        invalidateGlobalDocsReadModel();
       }
     }
 
@@ -28010,6 +25631,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
             createdAt: Date.now()
           };
           await putEncrypted('globalDocs', row, 'id');
+          invalidateGlobalDocsReadModel();
           createdDocIds.push(String(row.id || '').trim());
         }
       } catch (error) {
@@ -28062,36 +25684,6 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       return false;
     }
 
-    async function publishGlobalFeedPost() {
-      if (globalFeedRuntime?.publishGlobalFeedPost) {
-        return globalFeedRuntime.publishGlobalFeedPost();
-      }
-    }
-
-    async function openGlobalFeedReference(type, refId) {
-      if (globalFeedRuntime?.openGlobalFeedReference) {
-        return globalFeedRuntime.openGlobalFeedReference(type, refId);
-      }
-    }
-
-    async function openGlobalFeedPost(postId) {
-      if (globalFeedRuntime?.openGlobalFeedPost) {
-        return globalFeedRuntime.openGlobalFeedPost(postId);
-      }
-    }
-
-    function refreshGlobalFeedFilterButtons() {
-      if (globalFeedRuntime?.refreshGlobalFeedFilterButtons) {
-        return globalFeedRuntime.refreshGlobalFeedFilterButtons();
-      }
-    }
-
-    function renderGlobalFeedSummary(posts, mentionCatalog) {
-      if (globalFeedRuntime?.renderGlobalFeedSummary) {
-        return globalFeedRuntime.renderGlobalFeedSummary(posts, mentionCatalog);
-      }
-    }
-
     async function renderGlobalFeed() {
       const list = document.getElementById('global-feed-list');
       if (!list) return;
@@ -28100,52 +25692,23 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       } else {
         setGlobalFeedComposerCollapsed(globalFeedComposerCollapsed);
       }
-      let mentionCatalog = globalFeedMentionCatalogCache;
-      let posts = [];
-      let allDocs = [];
-      if (globalFeedRuntime?.prepareGlobalFeedRenderScope) {
-        const scope = await globalFeedRuntime.prepareGlobalFeedRenderScope();
-        mentionCatalog = scope?.mentionCatalog || mentionCatalog;
-        posts = Array.isArray(scope?.posts) ? scope.posts : [];
-        allDocs = Array.isArray(scope?.allDocs) ? scope.allDocs : [];
-      } else {
-        mentionCatalog = await populateGlobalFeedComposerContext();
-        if (mentionCatalog) globalFeedMentionCatalogCache = mentionCatalog;
-        const searchInput = document.getElementById('global-feed-search');
-        const query = String(searchInput?.value || '').trim();
-        const postsAll = (await getAllDecrypted('globalPosts', 'postId') || [])
-          .filter((p) => !p.deletedAt)
-          .filter((p) => matchesQuery([
-            p.title,
-            p.content,
-            p.authorName,
-            ...(Array.isArray(p.refs) ? p.refs.map((r) => r?.label) : []),
-            ...(Array.isArray(p.mentions) ? p.mentions.map((id) => mentionCatalog?.byUserId?.get(id)?.name || '') : [])
-          ], query));
-        const me = String(currentUser?.userId || '');
-        renderGlobalFeedSummary(postsAll, mentionCatalog);
-        refreshGlobalFeedFilterButtons();
-
-        const postsFilteredByType = postsAll.filter((post) => {
-          const isAuto = Boolean(post.isAuto || post.sourceEventId);
-          const isMention = Array.isArray(post.mentions) && post.mentions.map((id) => String(id || '')).includes(me);
-          const refs = Array.isArray(post.refs) ? post.refs : [];
-          const hasProjectRef = refs.some((ref) => String(ref?.type || '') === 'project');
-          const hasTaskRef = refs.some((ref) => String(ref?.type || '') === 'task');
-          if (globalFeedFilterMode === 'auto') return isAuto;
-          if (globalFeedFilterMode === 'manual') return !isAuto;
-          if (globalFeedFilterMode === 'mentions') return isMention;
-          if (globalFeedFilterMode === 'project-refs') return hasProjectRef;
-          if (globalFeedFilterMode === 'task-refs') return hasTaskRef;
-          return true;
+      const prepareScope = globalFeedRuntime?.prepareGlobalFeedRenderScope;
+      const buildCards = globalFeedRuntime?.buildGlobalFeedCardsHtml;
+      if (!prepareScope || !buildCards) {
+        list.innerHTML = buildWorkspaceEmptyState({
+          icon: 'warning',
+          title: 'Module Fil d info indisponible',
+          text: 'Le rendu du fil d info n a pas pu etre initialise.',
+          ctaLabel: '',
+          ctaOnclick: ''
         });
-        posts = postsFilteredByType.sort((a, b) => (
-          globalFeedSortMode === 'asc'
-            ? Number(a.createdAt || 0) - Number(b.createdAt || 0)
-            : Number(b.createdAt || 0) - Number(a.createdAt || 0)
-        ));
-        allDocs = await getAllDecrypted('globalDocs', 'id');
+        return;
       }
+
+      const scope = await getGlobalFeedRenderScopeCached(prepareScope);
+      const mentionCatalog = scope?.mentionCatalog || globalFeedMentionCatalogCache;
+      const posts = Array.isArray(scope?.posts) ? scope.posts : [];
+      const allDocs = Array.isArray(scope?.allDocs) ? scope.allDocs : [];
 
       if (posts.length === 0) {
         list.innerHTML = buildWorkspaceEmptyState({
@@ -28158,17 +25721,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         return;
       }
 
-      if (!globalFeedRuntime?.buildGlobalFeedCardsHtml) {
-        list.innerHTML = buildWorkspaceEmptyState({
-          icon: 'warning',
-          title: 'Module Fil d info indisponible',
-          text: 'Le rendu du fil d info n a pas pu etre initialise.',
-          ctaLabel: '',
-          ctaOnclick: ''
-        });
-        return;
-      }
-      list.innerHTML = await globalFeedRuntime.buildGlobalFeedCardsHtml(posts, allDocs, mentionCatalog);
+      list.innerHTML = await buildCards(posts, allDocs, mentionCatalog);
       if (globalFeedFocusPostId) {
         const target = document.getElementById(`global-feed-post-${globalFeedFocusPostId}`);
         if (target) {
@@ -28197,6 +25750,18 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       updateGlobalFeedMentionCounter();
     }
 
+    async function openGlobalFeedReference(type, refId) {
+      return await globalFeedRuntime?.openGlobalFeedReference?.(type, refId);
+    }
+    async function openGlobalFeedPost(postId) {
+      return await globalFeedRuntime?.openGlobalFeedPost?.(postId);
+    }
+    async function openGlobalFeedPostReadModal(postId = '') {
+      await globalFeedRuntime?.openGlobalFeedPostReadModal?.(postId);
+    }
+    async function openGlobalHubAggregatedNoteRead(noteRef) {
+      await globalNotesRuntime?.openGlobalHubAggregatedNoteRead?.(noteRef);
+    }
     window.openGlobalFeedReference = openGlobalFeedReference;
     window.openGlobalFeedPost = openGlobalFeedPost;
     window.toggleGlobalFeedComposerFullscreen = toggleGlobalFeedComposerFullscreen;
@@ -28210,14 +25775,6 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     window.openGlobalHubAggregatedNoteRead = openGlobalHubAggregatedNoteRead;
     window.deleteGlobalNoteLinkedDocument = deleteGlobalNoteLinkedDocument;
     window.closeGlobalReadModal = closeGlobalReadModal;
-    window.toggleGlobalFeedExportMenu = toggleGlobalFeedExportMenu;
-    window.closeGlobalFeedExportMenu = closeGlobalFeedExportMenu;
-    window.exportGlobalFeedPost = exportGlobalFeedPost;
-    window.exportGlobalFeedPostAsPdf = exportGlobalFeedPostAsPdf;
-    window.exportGlobalFeedPostAsDocx = exportGlobalFeedPostAsDocx;
-    window.exportProjectNote = exportProjectNote;
-    window.toggleProjectNoteExportMenu = toggleProjectNoteExportMenu;
-    window.closeProjectNoteExportMenu = closeProjectNoteExportMenu;
     window.openGlobalFeedComposerForNewPost = openGlobalFeedComposerForNewPost;
     window.TaskMDARequestDigestForEditor = requestDigestImportForEditor;
 
@@ -29764,9 +27321,15 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
           setActiveWorkflowSidebarGroup(getActiveWorkflowGroupFromDom());
         }
       }
-      if (view === 'calendar') await (globalCalendarRuntime?.renderGlobalCalendar?.() ?? renderGlobalCalendar());
+      if (view === 'calendar') {
+        const renderCalendar = globalCalendarRuntime?.renderGlobalCalendar;
+        await (renderCalendar ? renderCalendar() : renderGlobalCalendar());
+      }
       if (view === 'docs') await renderGlobalDocs();
-      if (view === 'notes') await (globalNotesRuntime?.renderGlobalNotes?.() ?? renderGlobalNotes());
+      if (view === 'notes') {
+        const renderNotes = globalNotesRuntime?.renderGlobalNotes;
+        await (renderNotes ? renderNotes() : renderGlobalNotes());
+      }
       if (view === 'messages') {
         resetGlobalMessageRenderLimits();
         await renderGlobalMessages();
@@ -29778,17 +27341,6 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         trackUxMetric('switchGlobalWorkspace');
       }
       shellUiRuntime?.closeMobileSidebar?.();
-    }
-
-    function getSubtaskProgress(task) {
-      if (window.TaskMDATasks?.getSubtaskProgress) {
-        return window.TaskMDATasks.getSubtaskProgress(task);
-      }
-      const subtasks = Array.isArray(task?.subtasks) ? task.subtasks : [];
-      const total = subtasks.length;
-      const done = subtasks.filter(st => Boolean(st?.done)).length;
-      const percent = total > 0 ? Math.round((done / total) * 100) : 0;
-      return { total, done, percent };
     }
 
     /**
@@ -29841,49 +27393,12 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function buildSubtaskProgressHtml(task, compact = false) {
-      if (window.TaskMDATasks?.buildSubtaskProgressHtml) {
-        return window.TaskMDATasks.buildSubtaskProgressHtml(task, compact);
-      }
-      const { total, done, percent } = getSubtaskProgress(task);
-      if (!total) return '';
-      const wrapperClass = compact ? 'subtask-progress subtask-progress-compact' : 'subtask-progress';
-      return `
-        <div class="${wrapperClass}">
-          <div class="subtask-progress-head">
-            <span class="subtask-progress-title">Sous-taches (${done}/${total})</span>
-            <span class="subtask-progress-percent">${percent}%</span>
-          </div>
-          <div class="subtask-progress-track">
-            <div class="subtask-progress-fill" style="width:${percent}%"></div>
-          </div>
-        </div>
-      `;
+      return window.TaskMDATasks?.buildSubtaskProgressHtml?.(task, compact) || '';
     }
 
     function mergeSubtasksWithExisting(existingSubtasks, subtasksParsed) {
-      if (window.TaskMDATasks?.mergeSubtasksWithExisting) {
-        return window.TaskMDATasks.mergeSubtasksWithExisting(existingSubtasks, subtasksParsed, normalizeSearch, uuidv4);
-      }
-      if (!Array.isArray(subtasksParsed)) return [];
-      const existing = Array.isArray(existingSubtasks) ? existingSubtasks : [];
-      const used = new Set();
-      return subtasksParsed.map((nextSt) => {
-        const matchIndex = existing.findIndex((oldSt, idx) => !used.has(idx) && normalizeSearch(oldSt?.label || '') === normalizeSearch(nextSt?.label || ''));
-        if (matchIndex >= 0) {
-          used.add(matchIndex);
-          const matched = existing[matchIndex];
-          return {
-            id: matched?.id || nextSt.id || uuidv4(),
-            label: nextSt.label || '',
-            done: Boolean(matched?.done)
-          };
-        }
-        return {
-          id: nextSt.id || uuidv4(),
-          label: nextSt.label || '',
-          done: false
-        };
-      });
+      return window.TaskMDATasks?.mergeSubtasksWithExisting?.(existingSubtasks, subtasksParsed, normalizeSearch, uuidv4)
+        || (Array.isArray(subtasksParsed) ? subtasksParsed : []);
     }
 
     function getTaskStatusMeta(status) {
@@ -29957,7 +27472,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       globalTaskCardsColumns = next;
       localStorage.setItem('taskmda_global_task_cards_cols', String(next));
       updateGlobalTaskLayoutButtons();
-      if (workspaceMode === 'global' && globalWorkspaceView === 'tasks' && globalTasksViewMode === 'cards') {
+      if (isGlobalTasksViewActive() && globalTasksViewMode === 'cards') {
         renderGlobalTasks();
       }
     }
@@ -30860,7 +28375,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       const updated = await updateGlobalTaskStatusFromRef(taskRef, targetStatus);
       if (!updated) return;
       showToast('✅ Tâche déplacée');
-      if (workspaceMode === 'global') {
+      if (isGlobalTasksViewActive()) {
         await renderGlobalTasks();
         await refreshStats();
       }
@@ -31028,9 +28543,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function resetDocumentPreviewInlineEditingState() {
-      if (docStorageBindingRuntime?.resetDocumentPreviewInlineEditingState) {
-        docStorageBindingRuntime.resetDocumentPreviewInlineEditingState();
-      }
+      docStorageBindingRuntime?.resetDocumentPreviewInlineEditingState?.();
     }
 
     function encodeDocumentPreviewRef(doc = {}, fallbackProjectId = '') {
@@ -31055,16 +28568,12 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function canUseSharedFilesystemDocumentStorage() {
-      if (docStorageBindingRuntime?.canUseSharedFilesystemDocumentStorage) {
-        return docStorageBindingRuntime.canUseSharedFilesystemDocumentStorage();
-      }
-      return false;
+      return !!docStorageBindingRuntime?.canUseSharedFilesystemDocumentStorage?.();
     }
 
     function formatDocumentStoragePathForDisplay(doc = {}) {
-      if (docPreviewModalUiRuntime?.formatDocumentStoragePathForDisplay) {
-        return docPreviewModalUiRuntime.formatDocumentStoragePathForDisplay(doc);
-      }
+      const formatStoragePath = docPreviewModalUiRuntime?.formatDocumentStoragePathForDisplay;
+      if (formatStoragePath) return formatStoragePath(doc);
       const path = String(doc?.storagePath || '').trim();
       if (path) return path;
       if (String(doc?.storageMode || '').trim() === 'fs') return 'Stockage disque (chemin non disponible)';
@@ -31072,51 +28581,35 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     async function resolveDocumentDataForRuntime(doc = {}) {
-      if (docStorageBindingRuntime?.resolveDocumentDataForRuntime) {
-        return docStorageBindingRuntime.resolveDocumentDataForRuntime(doc);
-      }
-      return '';
+      return await docStorageBindingRuntime?.resolveDocumentDataForRuntime?.(doc) || '';
     }
 
     async function hydrateDocumentDataForRuntime(doc = {}) {
-      if (docStorageBindingRuntime?.hydrateDocumentDataForRuntime) {
-        return docStorageBindingRuntime.hydrateDocumentDataForRuntime(doc);
-      }
-      return doc;
+      return await docStorageBindingRuntime?.hydrateDocumentDataForRuntime?.(doc) || doc;
     }
 
     function inferStorageRubricFromPath(storagePath = '', fallback = 'document-upload') {
-      if (docStorageBindingRuntime?.inferStorageRubricFromPath) {
-        return docStorageBindingRuntime.inferStorageRubricFromPath(storagePath, fallback);
-      }
-      return String(fallback || 'document-upload');
+      return docStorageBindingRuntime?.inferStorageRubricFromPath?.(storagePath, fallback)
+        || String(fallback || 'document-upload');
     }
 
     function inferStorageScopeFromPath(storagePath = '', fallback = 'project') {
-      if (docStorageBindingRuntime?.inferStorageScopeFromPath) {
-        return docStorageBindingRuntime.inferStorageScopeFromPath(storagePath, fallback);
-      }
-      return String(fallback || 'project');
+      return docStorageBindingRuntime?.inferStorageScopeFromPath?.(storagePath, fallback)
+        || String(fallback || 'project');
     }
 
     function inferStorageProjectFromPath(storagePath = '', fallback = 'global') {
-      if (docStorageBindingRuntime?.inferStorageProjectFromPath) {
-        return docStorageBindingRuntime.inferStorageProjectFromPath(storagePath, fallback);
-      }
-      return String(fallback || 'global');
+      return docStorageBindingRuntime?.inferStorageProjectFromPath?.(storagePath, fallback)
+        || String(fallback || 'global');
     }
 
     async function maybeRelocateStoredDocumentByTheme(doc = {}, nextTheme = '', context = {}) {
-      if (docStorageBindingRuntime?.maybeRelocateStoredDocumentByTheme) {
-        return docStorageBindingRuntime.maybeRelocateStoredDocumentByTheme(doc, nextTheme, context);
-      }
-      return {};
+      return await docStorageBindingRuntime?.maybeRelocateStoredDocumentByTheme?.(doc, nextTheme, context) || {};
     }
 
     function normalizeDocumentPreviewInlineFieldValue(field, rawValue) {
-      if (docPreviewInlineUiRuntime?.normalizeFieldValue) {
-        return docPreviewInlineUiRuntime.normalizeFieldValue(field, rawValue);
-      }
+      const normalizeFieldValue = docPreviewInlineUiRuntime?.normalizeFieldValue;
+      if (normalizeFieldValue) return normalizeFieldValue(field, rawValue);
       const value = rawValue == null ? '' : String(rawValue);
       if (field === 'name') return value.trim();
       if (field === 'theme') return value.trim() || 'General';
@@ -31126,9 +28619,8 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function getDocumentPreviewFieldValue(doc = {}, field = '') {
-      if (docPreviewInlineUiRuntime?.getFieldValue) {
-        return docPreviewInlineUiRuntime.getFieldValue(doc, field);
-      }
+      const getFieldValue = docPreviewInlineUiRuntime?.getFieldValue;
+      if (getFieldValue) return getFieldValue(doc, field);
       if (field === 'name') return String(doc?.name || '');
       if (field === 'theme') return String(doc?.theme || 'General');
       if (field === 'notes') return String(doc?.notes || '');
@@ -31143,9 +28635,8 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function mergeDocumentPreviewContextDoc(patch = {}, expectedContext = null) {
-      if (docPreviewInlineUiRuntime?.mergeContextDoc) {
-        return docPreviewInlineUiRuntime.mergeContextDoc(patch, expectedContext);
-      }
+      const mergeContextDoc = docPreviewInlineUiRuntime?.mergeContextDoc;
+      if (mergeContextDoc) return mergeContextDoc(patch, expectedContext);
       if (!canMutateDocumentPreviewContext(expectedContext)) return false;
       currentDocPreviewContext.doc = { ...(currentDocPreviewContext.doc || {}), ...(patch || {}) };
       return true;
@@ -31167,9 +28658,8 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function refreshDocumentPreviewInlineDisplay(field, value) {
-      if (docPreviewInlineUiRuntime?.refreshInlineDisplay) {
-        return docPreviewInlineUiRuntime.refreshInlineDisplay(field, value);
-      }
+      const refreshInlineDisplay = docPreviewInlineUiRuntime?.refreshInlineDisplay;
+      if (refreshInlineDisplay) return refreshInlineDisplay(field, value);
       const normalized = normalizeDocumentPreviewInlineFieldValue(field, value);
       const ctxDoc = currentDocPreviewContext?.doc || {};
       if (field === 'name') {
@@ -31246,8 +28736,9 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       if (!ctx?.doc) return;
       if (options.expectedContext && ctx !== options.expectedContext) return;
       const normalizedValue = normalizeDocumentPreviewInlineFieldValue(field, rawValue);
-      if (docStorageBindingRuntime?.persistDocumentPreviewInlineField) {
-        const result = await docStorageBindingRuntime.persistDocumentPreviewInlineField({
+      const persistInlineField = docStorageBindingRuntime?.persistDocumentPreviewInlineField;
+      if (persistInlineField) {
+        const result = await persistInlineField({
           field,
           rawValue: normalizedValue,
           force: options.force === true,
@@ -31264,8 +28755,9 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       if (!currentDocPreviewContext?.doc) return;
       const contextSnapshot = options.expectedContext || currentDocPreviewContext;
       const normalizedValue = normalizeDocumentPreviewInlineFieldValue(field, rawValue);
-      if (docStorageBindingRuntime?.scheduleDocumentPreviewInlineSave) {
-        return docStorageBindingRuntime.scheduleDocumentPreviewInlineSave({
+      const scheduleInlineSave = docStorageBindingRuntime?.scheduleDocumentPreviewInlineSave;
+      if (scheduleInlineSave) {
+        return scheduleInlineSave({
           field,
           rawValue: normalizedValue,
           context: contextSnapshot,
@@ -31275,9 +28767,8 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function startDocumentPreviewInlineEdit(triggerEl) {
-      if (docPreviewInlineUiRuntime?.startInlineEdit) {
-        return docPreviewInlineUiRuntime.startInlineEdit(triggerEl);
-      }
+      const startInlineEdit = docPreviewInlineUiRuntime?.startInlineEdit;
+      if (startInlineEdit) return startInlineEdit(triggerEl);
       if (!currentDocPreviewCanEdit || !triggerEl || triggerEl.dataset.inlineEditing === '1') return;
       const inlineContext = currentDocPreviewContext;
       const field = String(triggerEl.dataset.inlineDocPreviewField || '').trim();
@@ -31338,9 +28829,8 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function initDocumentPreviewInlineEditing(canEdit = false) {
-      if (docPreviewInlineUiRuntime?.initInlineEditing) {
-        return docPreviewInlineUiRuntime.initInlineEditing(canEdit);
-      }
+      const initInlineEditing = docPreviewInlineUiRuntime?.initInlineEditing;
+      if (initInlineEditing) return initInlineEditing(canEdit);
       currentDocPreviewCanEdit = !!canEdit;
       const editableFields = ['name', 'sharingMode', 'theme', 'notes'];
       editableFields.forEach((field) => {
@@ -31358,8 +28848,10 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         decorateDocumentPreviewEditableElement(el, field);
       });
       const modal = document.getElementById('modal-doc-preview');
-      if (!modal || modal.dataset.inlineDocPreviewBound === '1') return;
-      modal.dataset.inlineDocPreviewBound = '1';
+      // Guard partage avec taskmda-doc.js pour eviter le double-binding sur la meme modale.
+      const DOC_PREVIEW_SHARED_BIND_FLAG = 'inlineDocPreviewBound';
+      if (!modal || modal.dataset[DOC_PREVIEW_SHARED_BIND_FLAG] === '1') return;
+      modal.dataset[DOC_PREVIEW_SHARED_BIND_FLAG] = '1';
       modal.addEventListener('click', (event) => {
         const rawTarget = event.target;
         const clickTarget = rawTarget instanceof Element ? rawTarget : null;
@@ -31385,9 +28877,8 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
      * source, droits, métadonnées et payload utile au lecteur.
      */
     async function resolveDocumentPreviewContext(ref = null) {
-      if (docStorageBindingRuntime?.resolveDocumentPreviewContext) {
-        return docStorageBindingRuntime.resolveDocumentPreviewContext(ref);
-      }
+      const resolvePreviewContext = docStorageBindingRuntime?.resolveDocumentPreviewContext;
+      if (resolvePreviewContext) return resolvePreviewContext(ref);
       const sourceType = String(ref?.sourceType || '').trim();
       if (sourceType === 'standalone' && ref?.id) {
         const row = await getDecrypted('globalDocs', ref.id, 'id');
@@ -31590,9 +29081,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       const data = decodeURIComponent(dataEncoded || '');
       const name = decodeURIComponent(nameEncoded || '');
       const type = decodeURIComponent(typeEncoded || '');
-      const parsedRef = docPreviewModalUiRuntime?.parseDocumentPreviewRef
-        ? docPreviewModalUiRuntime.parseDocumentPreviewRef(refEncoded)
-        : null;
+      const parsedRef = docPreviewModalUiRuntime?.parseDocumentPreviewRef?.(refEncoded) || null;
       const resolvedContext = await resolveDocumentPreviewContext(parsedRef);
       currentDocPreviewContext = resolvedContext || {
         sourceType: '',
@@ -31611,8 +29100,9 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       title.textContent = `Aperçu: ${name || 'document'}`;
       content.innerHTML = '';
 
-      if (docPreviewModalUiRuntime?.renderPreviewContent) {
-        await docPreviewModalUiRuntime.renderPreviewContent(content, { data, type, name });
+      const renderPreviewContent = docPreviewModalUiRuntime?.renderPreviewContent;
+      if (renderPreviewContent) {
+        await renderPreviewContent(content, { data, type, name });
       } else {
         const p = document.createElement('p');
         p.className = 'text-sm text-slate-500';
@@ -31626,17 +29116,15 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     async function closeDocumentPreview() {
-      if (docPreviewModalUiRuntime?.closePreviewModal) {
-        await docPreviewModalUiRuntime.closePreviewModal();
-      } else {
-        const modal = document.getElementById('modal-doc-preview');
-        if (modal && !modal.classList.contains('hidden')) {
-          modal.classList.add('hidden');
-        }
-      }
+      const closePreviewModal = docPreviewModalUiRuntime?.closePreviewModal;
+      if (closePreviewModal) return await closePreviewModal();
+      const modal = document.getElementById('modal-doc-preview');
+      if (modal && !modal.classList.contains('hidden')) modal.classList.add('hidden');
     }
 
     window.openDocumentPreview = openDocumentPreview;
+    window.exportSharedQueueDebugSnapshot = exportSharedQueueDebugSnapshot;
+    window.runSharedQueueDebugProbe = runSharedQueueDebugProbe;
 
     function closeDocumentEditorModal() {
       currentDocEditorContext = null;
@@ -32290,6 +29778,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
             updatedAt: Date.now()
           };
           await putEncrypted('globalDocs', next, 'id');
+          invalidateGlobalDocsReadModel();
           showToast('Document mis à jour');
           closeDocumentEditorModal();
           await renderGlobalDocs();
@@ -33293,80 +30782,16 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         `;
       }).join('');
     }
-
-    function renderMessagesLegacy(messages) {
-      const container = document.getElementById('messages-container');
-      if (!container) return;
-
-      const allMessages = [...(messages || [])];
-      if (projectMessageReplyTarget?.messageId) {
-        const stillExists = allMessages.some((msg) => String(msg?.messageId || '') === String(projectMessageReplyTarget.messageId));
-        if (!stillExists) projectMessageReplyTarget = null;
-      }
-      if (projectReactionPickerMessageId) {
-        const stillExists = allMessages.some((msg) => String(msg?.messageId || '') === String(projectReactionPickerMessageId));
-        if (!stillExists) projectReactionPickerMessageId = '';
-      }
-      updateProjectReplyComposerUi();
-      let filtered = [...allMessages];
-      if (messageFilters.query.trim()) {
-        const q = messageFilters.query.trim().toLowerCase();
-        filtered = filtered.filter(msg => {
-          return [msg.content, msg.contentHtml, msg.authorName].some(v => String(v || '').toLowerCase().includes(q));
-        });
-      }
-      if (messageFilters.onlyMine && currentUser?.userId) {
-        filtered = filtered.filter(msg => msg.author === currentUser.userId);
-      }
-
-      renderDiscussionMembersPanel(allMessages);
-
-      if (filtered.length === 0) {
-        const emptyLabel = allMessages.length === 0
-          ? 'Aucun message'
-          : 'Aucun message ne correspond aux filtres';
-        container.innerHTML = `<p class="text-gray-500 text-center py-8">${emptyLabel}</p>`;
-        return;
-      }
-
-      container.innerHTML = filtered.map(msg => {
-        const contentHtml = sanitizeProjectDescriptionHtml(msg.contentHtml || '');
-        return `
-        <div id="message-item-${msg.messageId}" class="border-l-4 border-primary pl-4 py-2">
-          <div class="flex items-center gap-2 mb-1">
-            <span class="font-semibold text-sm">${escapeHtml(msg.authorName || 'Utilisateur')}</span>
-            <span class="text-xs text-gray-500">${new Date(msg.timestamp).toLocaleString('fr-FR')}</span>
-            ${msg.editedAt ? '<span class="text-[10px] text-gray-400">(modifié)</span>' : ''}
-          </div>
-          ${editingMessageId === msg.messageId ? `
-            <div class="space-y-2">
-              <textarea id="message-edit-input-${msg.messageId}" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm">${escapeHtml(editingMessageDraft)}</textarea>
-              <div class="flex items-center gap-2 text-xs">
-                <button onclick="saveEditedMessage('${msg.messageId}')" class="workspace-action-inline" data-action-kind="save">Enregistrer</button>
-                <button onclick="cancelEditMessage()" class="workspace-action-inline" data-action-kind="close">Annuler</button>
-              </div>
-            </div>
-          ` : `
-            <div class="markdown-content text-gray-700">${contentHtml || renderSafeMarkdown(msg.content)}</div>
-            ${renderMessageAttachments(msg.attachments)}
-            <div class="discussion-message-actions mt-1 flex items-center gap-2 text-xs">
-              ${canEditProjectMessage(msg, currentProjectState) ? `<button onclick="startEditMessage('${msg.messageId}')" class="workspace-action-inline" data-action-kind="edit">Éditer</button>` : ''}
-              ${canDeleteProjectMessage(msg, currentProjectState) ? `<button onclick="deleteMessage('${msg.messageId}')" class="workspace-action-inline" data-action-kind="danger">Supprimer</button>` : ''}
-            </div>
-          `}
-        </div>
-      `;
-      }).join('');
-
-      // Scroll to bottom
-      container.scrollTop = container.scrollHeight;
-    }
-
     function renderMessages(messages) {
       const container = document.getElementById('messages-container');
       if (!container) return;
 
       const allMessages = [...(messages || [])];
+      if (projectReactionPickerMessageId) {
+        const stillExists = allMessages.some((msg) => String(msg?.messageId || '') === String(projectReactionPickerMessageId));
+        if (!stillExists) projectReactionPickerMessageId = '';
+      }
+      updateProjectReplyComposerUi();
       let filtered = [...allMessages];
       if (messageFilters.query.trim()) {
         const q = messageFilters.query.trim().toLowerCase();
@@ -33467,79 +30892,52 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     async function toggleTaskStatus(taskId) {
-      if (taskLifecycleDomainRuntime?.toggleTaskStatus) {
-        await taskLifecycleDomainRuntime.toggleTaskStatus(taskId);
-        return;
-      }
+      await taskLifecycleDomainRuntime?.toggleTaskStatus?.(taskId);
     }
 
     async function markProjectTaskDone(taskId) {
-      if (taskLifecycleDomainRuntime?.markProjectTaskDone) {
-        await taskLifecycleDomainRuntime.markProjectTaskDone(taskId);
-        return;
-      }
+      await taskLifecycleDomainRuntime?.markProjectTaskDone?.(taskId);
     }
 
     async function editTask(taskId) {
-      if (taskLifecycleDomainRuntime?.editTask) {
-        await taskLifecycleDomainRuntime.editTask(taskId);
-        return;
-      }
+      await taskLifecycleDomainRuntime?.editTask?.(taskId);
     }
 
     async function deleteTask(taskId) {
-      if (taskLifecycleDomainRuntime?.deleteTask) {
-        await taskLifecycleDomainRuntime.deleteTask(taskId);
-        return;
-      }
+      await taskLifecycleDomainRuntime?.deleteTask?.(taskId);
     }
 
     async function archiveTask(taskId) {
-      if (taskLifecycleDomainRuntime?.archiveTask) {
-        await taskLifecycleDomainRuntime.archiveTask(taskId);
-        return;
-      }
+      await taskLifecycleDomainRuntime?.archiveTask?.(taskId);
     }
 
     async function toggleSubtask(taskId, subtaskId, done) {
-      if (taskLifecycleDomainRuntime?.toggleSubtask) {
-        await taskLifecycleDomainRuntime.toggleSubtask(taskId, subtaskId, done);
-        return;
-      }
+      await taskLifecycleDomainRuntime?.toggleSubtask?.(taskId, subtaskId, done);
     }
 
     async function removeAttachment(taskId, attachmentIndex) {
-      if (taskLifecycleDomainRuntime?.removeAttachment) {
-        await taskLifecycleDomainRuntime.removeAttachment(taskId, attachmentIndex);
-        return;
-      }
+      await taskLifecycleDomainRuntime?.removeAttachment?.(taskId, attachmentIndex);
     }
 
     async function readDocumentFilesFromInput(inputId, options = {}) {
-      if (docStorageBindingRuntime?.readDocumentFilesFromInput) {
-        return docStorageBindingRuntime.readDocumentFilesFromInput(inputId, options);
-      }
-      return [];
+      return await docStorageBindingRuntime?.readDocumentFilesFromInput?.(inputId, options) || [];
     }
 
     async function readProjectDocumentFiles(options = {}) {
-      if (docStorageBindingRuntime?.readProjectDocumentFiles) {
-        return docStorageBindingRuntime.readProjectDocumentFiles(options);
-      }
+      const readProjectDocs = docStorageBindingRuntime?.readProjectDocumentFiles;
+      if (readProjectDocs) return readProjectDocs(options);
       return readDocumentFilesFromInput('project-doc-files', options);
     }
 
     async function readCreateProjectDocumentFiles(options = {}) {
-      if (docStorageBindingRuntime?.readCreateProjectDocumentFiles) {
-        return docStorageBindingRuntime.readCreateProjectDocumentFiles(options);
-      }
+      const readCreateProjectDocs = docStorageBindingRuntime?.readCreateProjectDocumentFiles;
+      if (readCreateProjectDocs) return readCreateProjectDocs(options);
       return readDocumentFilesFromInput('project-create-doc-files', options);
     }
 
     async function readEditProjectDocumentFiles(options = {}) {
-      if (docStorageBindingRuntime?.readEditProjectDocumentFiles) {
-        return docStorageBindingRuntime.readEditProjectDocumentFiles(options);
-      }
+      const readEditProjectDocs = docStorageBindingRuntime?.readEditProjectDocumentFiles;
+      if (readEditProjectDocs) return readEditProjectDocs(options);
       return readDocumentFilesFromInput('edit-project-doc-files', options);
     }
 
@@ -34108,9 +31506,15 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
                 await renderGlobalTasks();
               }
               if (globalWorkspaceView === 'workflow') await renderWorkflowWorkspace();
-              if (globalWorkspaceView === 'calendar') await (globalCalendarRuntime?.renderGlobalCalendar?.() ?? renderGlobalCalendar());
+              if (globalWorkspaceView === 'calendar') {
+                const renderCalendar = globalCalendarRuntime?.renderGlobalCalendar;
+                await (renderCalendar ? renderCalendar() : renderGlobalCalendar());
+              }
               if (globalWorkspaceView === 'docs') await renderGlobalDocs();
-              if (globalWorkspaceView === 'notes') await (globalNotesRuntime?.renderGlobalNotes?.() ?? renderGlobalNotes());
+              if (globalWorkspaceView === 'notes') {
+                const renderNotes = globalNotesRuntime?.renderGlobalNotes;
+                await (renderNotes ? renderNotes() : renderGlobalNotes());
+              }
               if (globalWorkspaceView === 'messages') await renderGlobalMessages();
               if (globalWorkspaceView === 'rgpd') await renderRgpdWorkspace();
               if (globalWorkspaceView === 'settings') await renderGlobalSettings();
@@ -34311,6 +31715,78 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         })
       : null;
 
+    globalNotesReadModalContentRuntime = window.TaskMDAGlobalNotesReadModalContent?.createModule
+      ? window.TaskMDAGlobalNotesReadModalContent.createModule({
+          state: {
+            getGlobalReadModalLastFocusedElement: () => globalReadModalLastFocusedElement,
+            setGlobalReadModalLastFocusedElement: (value) => {
+              globalReadModalLastFocusedElement = value instanceof HTMLElement ? value : null;
+            },
+            setGlobalReadModalNoteId: (value) => {
+              globalReadModalNoteId = String(value || '').trim();
+            }
+          },
+          actions: {
+            migrateLegacyInlineGlobalNoteAttachmentsOnce,
+            getGlobalNoteById: (id) => getGlobalNoteByIdCached(id),
+            getAllGlobalDocs: () => getAllGlobalDocsCached(),
+            resolveKnownUserIdentity,
+            canManageGlobalNote,
+            extractLinkedGlobalDocIdsFromHtml,
+            encodeDocumentPreviewRef,
+            openDocumentPreviewByRef,
+            downloadDocumentByRef,
+            deleteGlobalNoteLinkedDocument,
+            resetGlobalReadInlineEditState,
+            cancelGlobalReadInlineEdit
+          },
+          helpers: {
+            showToast,
+            fallbackDirectoryName,
+            normalizeGlobalNoteVisibility,
+            plainTextToRichHtml,
+            sanitizeRichTextHtmlPreserve,
+            stripInlineAttachedDocumentBlocksFromHtml,
+            escapeHtml
+          }
+        })
+      : null;
+
+    globalNotesReadInlineEditRuntime = window.TaskMDAGlobalNotesReadInlineEdit?.createModule
+      ? window.TaskMDAGlobalNotesReadInlineEdit.createModule({
+          state: {
+            getInlineEditActive: () => !!globalReadInlineEditActive,
+            setInlineEditActive: (value) => { globalReadInlineEditActive = !!value; },
+            getInlineEditSaving: () => !!globalReadInlineEditSaving,
+            setInlineEditSaving: (value) => { globalReadInlineEditSaving = !!value; },
+            getInlineOriginalTitle: () => String(globalReadInlineOriginalTitle || ''),
+            setInlineOriginalTitle: (value) => { globalReadInlineOriginalTitle = String(value || ''); },
+            getInlineOriginalContentHtml: () => String(globalReadInlineOriginalContentHtml || ''),
+            setInlineOriginalContentHtml: (value) => { globalReadInlineOriginalContentHtml = String(value || ''); },
+            getInlineQuill: () => globalReadInlineQuill,
+            setInlineQuill: (value) => { globalReadInlineQuill = value || null; },
+            getGlobalReadModalNoteId: () => String(globalReadModalNoteId || '')
+          },
+          actions: {
+            getGlobalNoteById: (id) => getGlobalNoteByIdCached(id),
+            canManageGlobalNote,
+            saveGlobalNote: (note) => putGlobalNoteCached(note),
+            syncGlobalNoteFeed,
+            isGlobalFeedView: () => isGlobalFeedViewActive(),
+            renderGlobalFeed,
+            setGlobalNotesFocusNoteId: (value) => { globalNotesFocusNoteId = String(value || '').trim(); },
+            renderGlobalNotes,
+            openGlobalNoteReadModal
+          },
+          helpers: {
+            showToast,
+            sanitizeProjectDescriptionHtml,
+            getProjectDescriptionPlainText,
+            plainTextToRichHtml
+          }
+        })
+      : null;
+
     projectNotesActionsUiRuntime = window.TaskMDAProjectNotesActionsUI?.createModule
       ? window.TaskMDAProjectNotesActionsUI.createModule({
           openProjectNoteEditor,
@@ -34322,7 +31798,29 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     projectReadActionsUiRuntime = window.TaskMDAProjectReadActionsUI?.createModule
       ? window.TaskMDAProjectReadActionsUI.createModule({
           getProjectNoteReadModalNoteId: () => projectNoteReadModalNoteId,
-          exportProjectNote,
+          getProjectNoteByIdForExport: (noteId = '') => {
+            const nid = String(noteId || '').trim();
+            if (!nid || !currentProjectState?.project) return null;
+            return getProjectNotesForState(currentProjectState).find((row) => String(row?.noteId || '').trim() === nid) || null;
+          },
+          showToast,
+          sanitizeFilenameSegment,
+          formatExportDateTag,
+          sanitizeRichTextHtmlPreserve,
+          plainTextToRichHtml,
+          resolveKnownUserIdentity,
+          fallbackDirectoryName,
+          getProjectDescriptionPlainText,
+          downloadBlobFile,
+          escapeHtml,
+          convertHtmlToWordML,
+          generateContentTypesXml,
+          generateRootRelsXml,
+          generateDocumentXml,
+          generateStylesXml,
+          generateDocumentRelsXml,
+          base64ToUint8Array,
+          buildZipStoreArchive,
           openProjectNoteEditorFromReadModal,
           deleteProjectNote,
           hideProjectNoteSelectionMenu,
@@ -34341,6 +31839,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       ? window.TaskMDAProjectNoteEditorActionsUI.createModule({
           isProjectNoteModalFullscreen: () => !!projectNoteModalFullscreen,
           applyProjectNoteModalFullscreen,
+          runWithLoading,
           saveProjectNoteFromEditor,
           pickGlobalFeedDigestImportMode,
           importProjectNoteDigestFromFiles
@@ -34364,6 +31863,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
 
     projectNoteModalShortcutsUiRuntime = window.TaskMDAProjectNoteModalShortcutsUI?.createModule
       ? window.TaskMDAProjectNoteModalShortcutsUI.createModule({
+          runWithLoading,
           saveProjectNoteFromEditor,
           closeProjectNoteEditor,
           trapProjectNoteModalFocus
@@ -34562,6 +32062,17 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
           getProjectRoleLabel,
           normalizeProjectRole,
           getMyProjectRole,
+          setProjectSettingsTabState: (value) => {
+            projectSettingsTab = String(value || 'members');
+          },
+          applyProjectSettingsTabView,
+          getProjectPermissionDetailsOpen: () => projectPermissionDetailsOpen,
+          setProjectPermissionDetailsOpen: (value) => {
+            projectPermissionDetailsOpen = !!value;
+          },
+          getProjectRoleCatalog,
+          normalizeProjectRoleBase,
+          getBaseProjectRoleLabel,
           canManageProjectCollaboration,
           getProjectState,
           upsertGlobalTheme,
@@ -34574,8 +32085,11 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
           showToast,
           addNotification,
           showProjectDetail,
-          renderProjectGroups,
-          renderProjectUserGroups,
+          getProjectMembersResolved,
+          renderUserGroupMemberSelect,
+          renderProjectGroupMemberSelect,
+          fallbackDirectoryName,
+          escapeHtml,
           syncProjectEventsToSharedSpace,
           getSharedFolderHandle: () => sharedFolderHandle
         })
@@ -34772,6 +32286,89 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         })
       : null;
 
+    globalDocRefUtilsRuntime = window.TaskMDAGlobalDocRefUtils?.createModule
+      ? window.TaskMDAGlobalDocRefUtils.createModule({
+          escapeHtml,
+          encodeDocumentPreviewRef
+        })
+      : null;
+
+    feedDigestUiRuntime = window.TaskMDAFeedDigestUI?.createModule
+      ? window.TaskMDAFeedDigestUI.createModule({
+          normalizeSearch,
+          normalizeDigestText,
+          storageKey: GLOBAL_FEED_DIGEST_VIEW_STORAGE_KEY,
+          setViewMode: (mode) => {
+            globalFeedDigestViewMode = mode === 'full' ? 'full' : 'compact';
+          }
+        })
+      : null;
+
+    feedDigestEditorRuntime = window.TaskMDAFeedDigestEditor?.createModule
+      ? window.TaskMDAFeedDigestEditor.createModule({
+          getQuillEditor: (editorId) => projectDescriptionQuillEditors.get(editorId),
+          sanitizeProjectDescriptionHtml,
+          stripHtmlTagsForDigest,
+          normalizeGlobalFeedDigestView,
+          getGlobalFeedDigestViewMode: () => globalFeedDigestViewMode,
+          extractFeedDigestFromFile,
+          buildDigestContentHtml,
+          showToast,
+          scheduleProjectNoteDraftSave
+        })
+      : null;
+
+    feedDigestMimeRuntime = window.TaskMDAFeedDigestMime?.createModule
+      ? window.TaskMDAFeedDigestMime.createModule({
+          decodeMimeEncodedWords,
+          normalizeDigestText,
+          stripHtmlTagsForDigest,
+          splitMimeHeaderAndBody,
+          parseMimeHeaders,
+          parseMimeEntity,
+          stringifyMimeHeaders
+        })
+      : null;
+
+    feedDigestPdfRuntime = window.TaskMDAFeedDigestPdf?.createModule
+      ? window.TaskMDAFeedDigestPdf.createModule({
+          escapeHtml,
+          normalizeDigestText,
+          sanitizeProjectDescriptionHtml,
+          renderSafeMarkdown
+        })
+      : null;
+
+    feedDigestContentRuntime = window.TaskMDAFeedDigestContent?.createModule
+      ? window.TaskMDAFeedDigestContent.createModule({
+          sanitizeProjectDescriptionHtml,
+          applyProfanityFilterToHtml,
+          normalizeDigestText,
+          stripHtmlTagsForDigest,
+          escapeHtml,
+          normalizeGlobalFeedDigestView,
+          trimDigestTextForCompact,
+          renderDigestMarkdownHtml,
+          renderDigestDetailsList,
+          compactTextMaxChars: FEED_DIGEST_COMPACT_TEXT_MAX_CHARS,
+          compactTextMaxLines: FEED_DIGEST_COMPACT_TEXT_MAX_LINES
+        })
+      : null;
+
+    editorInteropRuntime = window.TaskMDAEditorInterop?.createModule
+      ? window.TaskMDAEditorInterop.createModule({
+          appendDigestBlocksToRichEditor,
+          normalizeGlobalFeedDigestView,
+          pickGlobalFeedDigestImportMode,
+          getGlobalFeedDigestViewMode: () => globalFeedDigestViewMode,
+          extractFeedDigestFromFile,
+          buildDigestContentHtml,
+          showToast,
+          updateGlobalFeedMentionCounter,
+          scheduleProjectNoteDraftSave
+        })
+      : null;
+
     attachmentsUiRuntime = window.TaskMDAAttachmentsUI?.createModule
       ? window.TaskMDAAttachmentsUI.createModule({
           fileToDataUrl,
@@ -34904,35 +32501,102 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       ? window.TaskMDAGlobalNotes.createModule({
           state: {
             setSearchQuery: (value) => { globalNotesSearchQuery = String(value || ''); },
+            getSearchQuery: () => globalNotesSearchQuery,
             setScopeFilter: (value) => { globalNotesScopeFilter = String(value || 'all'); },
+            getScopeFilter: () => globalNotesScopeFilter,
             setOriginFilter: (value) => { globalNotesOriginFilter = String(value || 'all'); },
+            getOriginFilter: () => globalNotesOriginFilter,
             setSortMode: (value) => { globalNotesSortMode = String(value || 'recent'); },
+            getSortMode: () => globalNotesSortMode,
             setTabMode: (value) => { globalNotesTabMode = String(value || 'all'); },
+            getTabMode: () => globalNotesTabMode,
+            getThemeFilter: () => globalNotesThemeFilter,
             setPage: (value) => { globalNotesPage = Math.max(1, Number(value) || 1); },
+            getPage: () => globalNotesPage,
+            getCurrentUserId: () => String(currentUser?.userId || '').trim(),
+            getFocusNoteId: () => globalNotesFocusNoteId,
+            setFocusNoteId: (value) => { globalNotesFocusNoteId = String(value || '').trim(); },
+            getCurrentProjectState: () => currentProjectState,
+            setProjectNotesFocusNoteId: (value) => { projectNotesFocusNoteId = String(value || '').trim(); },
             getBulkSelectionMode: () => globalNotesBulkSelectionMode,
-            getSelectedCount: () => selectedGlobalNoteIdsForBulkDelete.size
+            setBulkSelectionMode: (value) => { globalNotesBulkSelectionMode = !!value; },
+            getSelectedCount: () => selectedGlobalNoteIdsForBulkDelete.size,
+            getSelectedNoteIds: () => Array.from(selectedGlobalNoteIdsForBulkDelete),
+            isNoteSelected: (noteId) => selectedGlobalNoteIdsForBulkDelete.has(String(noteId || '').trim()),
+            addSelectedNote: (noteId) => {
+              const normalizedId = String(noteId || '').trim();
+              if (normalizedId) selectedGlobalNoteIdsForBulkDelete.add(normalizedId);
+            },
+            removeSelectedNote: (noteId) => {
+              const normalizedId = String(noteId || '').trim();
+              if (normalizedId) selectedGlobalNoteIdsForBulkDelete.delete(normalizedId);
+            },
+            clearSelectedNotes: () => { selectedGlobalNoteIdsForBulkDelete.clear(); }
           },
           actions: {
             renderGlobalNotes,
-            setGlobalNotesBulkSelectionMode,
-            clearSelectedGlobalNotesBulk: () => { selectedGlobalNoteIdsForBulkDelete.clear(); },
-            selectAllVisibleGlobalNotesForBulkDelete,
-            deleteSelectedGlobalNotes,
-            exportSelectedGlobalNotesAsZip,
+            ensureGlobalNotesVerticalThemeLayout,
+            renderGlobalNotesThemeTabs,
+            showProjectDetail,
+            setProjectView,
+            renderProjectNotes,
+            openProjectNoteReadModal,
+            getProjectNotesForState,
+            openGlobalNoteReadModal,
+            isAppAdmin,
+            getGlobalNoteThemeLabels,
+            paginateItems,
+            renderPagination,
+            getGlobalNotesPerPage: () => paginationConfig.globalNotesPerPage,
+            resolveKnownUserIdentity,
+            openDocumentPreviewByRef,
+            downloadDocumentByRef,
             openGlobalNoteEditor,
+            runWithLoading,
             saveGlobalNoteFromEditor,
             deleteGlobalNote,
             closeGlobalNoteEditor,
             pickGlobalFeedDigestImportMode,
             requestDigestImportForEditor,
             importDocumentsIntoGlobalNoteEditor,
-            toggleGlobalNoteFeedPublish,
-            toggleGlobalNoteFavorite,
             exportGlobalNote,
-            toggleGlobalNoteBulkSelection
+            encodeDocumentPreviewRef,
+            canManageGlobalNote,
+            getAllGlobalNotes: () => getAllGlobalNotesCached(),
+            getAllGlobalDocs: () => getAllGlobalDocsCached(),
+            getAllProjects,
+            getProjectState,
+            getProjectNotesForState,
+            getGlobalNoteById: (noteId) => getGlobalNoteByIdCached(noteId),
+            saveGlobalNote: (note) => putGlobalNoteCached(note),
+            deleteGlobalNoteById: (noteId) => deleteGlobalNoteByIdCached(noteId),
+            removeGlobalNoteFromFeed,
+            syncGlobalNoteFeed,
+            isGlobalFeedView: () => isGlobalFeedViewActive(),
+            renderGlobalFeed
           },
           helpers: {
-            showToast
+            showToast,
+            escapeHtml,
+            sanitizeFilenameSegment,
+            formatExportDateTag,
+            sanitizeRichTextHtmlPreserve,
+            stripInlineAttachedDocumentBlocksFromHtml,
+            normalizeGlobalNoteVisibility,
+            normalizeSearch,
+            normalizeCatalogKey,
+            plainTextToRichHtml,
+            getProjectDescriptionPlainText,
+            downloadBlobFile,
+            fallbackDirectoryName,
+            convertHtmlToWordML,
+            generateContentTypesXml,
+            generateRootRelsXml,
+            generateDocumentXml,
+            generateStylesXml,
+            generateDocumentRelsXml,
+            base64ToUint8Array,
+            buildZipStoreArchive
           }
         })
       : null;
@@ -35098,8 +32762,14 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
             buildGlobalMentionCatalog,
             extractMentionedUserIdsFromText,
             getGlobalPostById: (postId) => getDecrypted('globalPosts', postId, 'postId'),
-            putGlobalPost: (post) => putEncrypted('globalPosts', post, 'postId'),
+            getGlobalNoteById: (noteId) => getGlobalNoteByIdCached(noteId),
+            putGlobalPost: async (post) => {
+              const saved = await putEncrypted('globalPosts', post, 'postId');
+              invalidateGlobalFeedReadModel();
+              return saved;
+            },
             addKnownGlobalPostId: (postId) => knownGlobalPostIds.add(postId),
+            getDashboardNewsTypeMeta,
             getFeedSummaryWordCount,
             computeGlobalFeedPostAutoSummary,
             writeGlobalFeedPostToSharedFolder,
@@ -35110,7 +32780,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
             getInitials,
             renderGlobalFeedContentHtml,
             getAllGlobalPosts: () => getAllDecrypted('globalPosts', 'postId'),
-            getAllGlobalDocs: () => getAllDecrypted('globalDocs', 'id'),
+            getAllGlobalDocs: () => getAllGlobalDocsCached(),
             populateGlobalFeedComposerContext,
             extractLinkedGlobalDocIdsFromHtml,
             stripInlineAttachedDocumentBlocksFromHtml,
@@ -35123,6 +32793,8 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
             openGlobalTaskDetails,
             setProjectView,
             openProjectNoteReadModal,
+            openDocumentPreviewByRef,
+            downloadDocumentByRef,
             renderGlobalNotes,
             openGlobalNoteReadModal,
             openStandaloneCalendarDetails,
@@ -35140,7 +32812,20 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
             showToast,
             uuidv4,
             matchesQuery,
-            escapeHtml
+            escapeHtml,
+            sanitizeFilenameSegment,
+            formatExportDateTag,
+            sanitizeRichTextHtmlPreserve,
+            getProjectDescriptionPlainText,
+            downloadBlobFile,
+            convertHtmlToWordML,
+            generateContentTypesXml,
+            generateRootRelsXml,
+            generateDocumentXml,
+            generateStylesXml,
+            generateDocumentRelsXml,
+            base64ToUint8Array,
+            buildZipStoreArchive
           }
         })
       : null;
@@ -35304,58 +32989,74 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         })
       : null;
 
-    if (globalNotesRuntime) {
-      window.openGlobalNoteEditor = (...args) => globalNotesRuntime.openGlobalNoteEditor(...args);
-      window.deleteGlobalNote = (...args) => globalNotesRuntime.deleteGlobalNote(...args);
-      window.toggleGlobalNoteFeedPublish = (...args) => globalNotesRuntime.toggleGlobalNoteFeedPublish(...args);
-      window.toggleGlobalNoteFavorite = (...args) => globalNotesRuntime.toggleGlobalNoteFavorite(...args);
-      window.exportGlobalNote = (...args) => globalNotesRuntime.exportGlobalNote(...args);
-      window.toggleGlobalNoteBulkSelection = (...args) => globalNotesRuntime.toggleGlobalNoteBulkSelection(...args);
-      window.setGlobalNotesPage = (...args) => globalNotesRuntime.setGlobalNotesPage(...args);
+    function exposeRuntimeActionsToWindow(runtime, actionNames = []) {
+      if (!runtime || !Array.isArray(actionNames) || !actionNames.length) return;
+      actionNames.forEach((name) => {
+        if (typeof runtime[name] !== 'function') return;
+        window[name] = (...args) => runtime[name](...args);
+      });
     }
-    if (globalCalendarRuntime) {
-      window.openGlobalCalendarItemModal = (...args) => globalCalendarRuntime.openGlobalCalendarItemModal(...args);
-      window.editStandaloneCalendarItem = (...args) => globalCalendarRuntime.editStandaloneCalendarItem(...args);
-      window.archiveStandaloneCalendarItem = (...args) => globalCalendarRuntime.archiveStandaloneCalendarItem(...args);
-      window.deleteStandaloneCalendarItem = (...args) => globalCalendarRuntime.deleteStandaloneCalendarItem(...args);
-      window.openStandaloneCalendarDetails = (...args) => globalCalendarRuntime.openStandaloneCalendarDetails(...args);
-    }
-    if (globalDocsRuntime) {
-      window.deleteGlobalDocument = (...args) => globalDocsRuntime.deleteGlobalDocument(...args);
-      window.openDocumentBindingModal = (...args) => globalDocsRuntime.openDocumentBindingModal(...args);
-    }
+
+    exposeRuntimeActionsToWindow(globalNotesRuntime, [
+      'openGlobalNoteEditor',
+      'deleteGlobalNote',
+      'toggleGlobalNoteFeedPublish',
+      'toggleGlobalNoteFavorite',
+      'exportGlobalNote',
+      'exportGlobalNoteAsPdf',
+      'exportGlobalNoteAsDocx',
+      'toggleGlobalNoteExportMenu',
+      'closeGlobalNoteExportMenu',
+      'toggleGlobalNoteBulkSelection',
+      'setGlobalNotesPage'
+    ]);
+    exposeRuntimeActionsToWindow(globalFeedRuntime, [
+      'toggleGlobalFeedExportMenu',
+      'closeGlobalFeedExportMenu',
+      'exportGlobalFeedPost',
+      'exportGlobalFeedPostAsPdf',
+      'exportGlobalFeedPostAsDocx'
+    ]);
+    exposeRuntimeActionsToWindow(projectReadActionsUiRuntime, [
+      'exportProjectNote',
+      'toggleProjectNoteExportMenu',
+      'closeProjectNoteExportMenu'
+    ]);
+    exposeRuntimeActionsToWindow(globalCalendarRuntime, [
+      'openGlobalCalendarItemModal',
+      'editStandaloneCalendarItem',
+      'archiveStandaloneCalendarItem',
+      'deleteStandaloneCalendarItem',
+      'openStandaloneCalendarDetails'
+    ]);
+    exposeRuntimeActionsToWindow(globalDocsRuntime, [
+      'deleteGlobalDocument',
+      'openDocumentBindingModal'
+    ]);
 
     async function initApp() {
       initDashboardStatsCollapse();
-      if (appInitRuntime?.initApp) {
-        await appInitRuntime.initApp();
-        return;
-      }
-      console.error('TaskMDAAppInit module not available');
+      return appInitRuntime?.initApp
+        ? await appInitRuntime.initApp()
+        : console.error('TaskMDAAppInit module not available');
     }
 
     async function handleSelectFolder() {
-      if (appInitRuntime?.handleSelectFolder) {
-        await appInitRuntime.handleSelectFolder();
-        return;
-      }
-      console.error('TaskMDAAppInit module not available');
+      return appInitRuntime?.handleSelectFolder
+        ? await appInitRuntime.handleSelectFolder()
+        : console.error('TaskMDAAppInit module not available');
     }
 
     async function handleContinueWithoutFolder() {
-      if (appInitRuntime?.handleContinueWithoutFolder) {
-        await appInitRuntime.handleContinueWithoutFolder();
-        return;
-      }
-      console.error('TaskMDAAppInit module not available');
+      return appInitRuntime?.handleContinueWithoutFolder
+        ? await appInitRuntime.handleContinueWithoutFolder()
+        : console.error('TaskMDAAppInit module not available');
     }
 
     async function handleLogout() {
-      if (appInitRuntime?.handleLogout) {
-        await appInitRuntime.handleLogout();
-        return;
-      }
-      console.error('TaskMDAAppInit module not available');
+      return appInitRuntime?.handleLogout
+        ? await appInitRuntime.handleLogout()
+        : console.error('TaskMDAAppInit module not available');
     }
 
     function openAttachSharedProjectModal() {
@@ -35557,9 +33258,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       }
       showToast(enabled ? 'Résumé automatique activé' : 'Résumé automatique désactivé');
     });
-    if (viaAnnuaireUiRuntime?.bindViaAnnuaireEventHandlers) {
-      viaAnnuaireUiRuntime.bindViaAnnuaireEventHandlers();
-    }
+    viaAnnuaireUiRuntime?.bindViaAnnuaireEventHandlers?.();
     document.getElementById('btn-open-app-help')?.addEventListener('click', () => {
       document.getElementById('modal-app-help')?.classList.remove('hidden');
     });
@@ -35634,8 +33333,9 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       window.TaskMDACommsUI.bind({
         showGlobalWorkspace,
         closeMobileSidebar,
-        publishGlobalFeedPost,
-        publishGlobalFeedDigestFromFiles,
+        publishGlobalFeedPost: async () => await globalFeedRuntime?.publishGlobalFeedPost?.(),
+        publishGlobalFeedDigestFromFiles: async (fileList, options = {}) =>
+          await globalFeedRuntime?.publishGlobalFeedDigestFromFiles?.(fileList, options),
         pickGlobalFeedDigestImportMode,
         insertMentionTokenInGlobalFeed,
         setGlobalFeedComposerCollapsed,
@@ -35803,55 +33503,14 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       await viewOptionsUiRuntime?.handleViewOptionsClick?.(e);
     }
     quickLinksUiRuntime?.bindDom?.();
-    document.getElementById('btn-add-member')?.addEventListener('click', addProjectMember);
-    document.getElementById('member-name-input')?.addEventListener('keydown', async (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        await addProjectMember();
-      }
-    });
-    document.getElementById('btn-send-invite')?.addEventListener('click', addProjectInvite);
+    projectMembersDomainRuntime?.bindDom?.();
     document.getElementById('btn-email-shared-attach')?.addEventListener('click', () => {
       void sendCollaborativeAttachEmail();
-    });
-    document.getElementById('btn-create-user-group')?.addEventListener('click', createUserGroup);
-    document.getElementById('btn-update-user-group')?.addEventListener('click', updateUserGroupSelection);
-    document.getElementById('user-group-name-input')?.addEventListener('keydown', async (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        await createUserGroup();
-      }
-    });
-    document.getElementById('invite-email-input')?.addEventListener('keydown', async (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        await addProjectInvite();
-      }
-    });
-    document.getElementById('btn-create-group')?.addEventListener('click', createProjectGroup);
-    document.getElementById('group-name-input')?.addEventListener('keydown', async (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        await createProjectGroup();
-      }
-    });
-    document.getElementById('btn-add-theme')?.addEventListener('click', addProjectTheme);
-    document.getElementById('theme-name-input')?.addEventListener('keydown', async (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        await addProjectTheme();
-      }
     });
     document.getElementById('btn-email-project-status')?.addEventListener('click', () => sendProjectStatusEmail(false));
     document.getElementById('btn-email-project-complete')?.addEventListener('click', () => sendProjectStatusEmail(true));
     document.getElementById('btn-project-open-work')?.addEventListener('click', () => setProjectDetailMode('work'));
     document.getElementById('btn-project-open-settings')?.addEventListener('click', () => setProjectDetailMode('settings'));
-    document.getElementById('project-settings-tab-overview')?.addEventListener('click', () => setProjectSettingsTab('overview'));
-    document.getElementById('project-settings-tab-members')?.addEventListener('click', () => setProjectSettingsTab('members'));
-    document.getElementById('project-settings-tab-collab')?.addEventListener('click', () => setProjectSettingsTab('collab'));
-    document.getElementById('project-settings-tab-themes')?.addEventListener('click', () => setProjectSettingsTab('themes'));
-    document.getElementById('project-settings-tab-permissions')?.addEventListener('click', () => setProjectSettingsTab('permissions'));
-    document.getElementById('project-settings-tab-structure')?.addEventListener('click', () => setProjectSettingsTab('structure'));
     document.getElementById('global-settings-tab-branding')?.addEventListener('click', () => setGlobalSettingsTab('branding'));
     document.getElementById('global-settings-tab-themes')?.addEventListener('click', () => setGlobalSettingsTab('themes'));
     document.getElementById('global-settings-tab-groups')?.addEventListener('click', () => setGlobalSettingsTab('groups'));
@@ -35861,10 +33520,6 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     document.getElementById('global-settings-tab-email')?.addEventListener('click', () => setGlobalSettingsTab('email'));
     document.getElementById('global-settings-tab-quick-links')?.addEventListener('click', () => setGlobalSettingsTab('quick-links'));
     document.getElementById('global-settings-tab-views')?.addEventListener('click', () => setGlobalSettingsTab('views'));
-    document.getElementById('btn-toggle-permissions-details')?.addEventListener('click', () => {
-      projectPermissionDetailsOpen = !projectPermissionDetailsOpen;
-      renderProjectPermissionMatrix(currentProjectState);
-    });
 
     // Carousel navigation
     document.getElementById('carousel-prev')?.addEventListener('click', () => {
@@ -35918,7 +33573,6 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       trackUxMetric('openNewProject');
       pendingLinkedCreateProjectDocs = [];
       refreshLinkedPendingSummaries();
-      refreshLinkedPendingSummaries();
       document.getElementById('modal-new-project').classList.remove('hidden');
       document.getElementById('project-name').value = '';
       const createProjectInternalReferenceInput = document.getElementById('project-internal-reference');
@@ -35942,7 +33596,6 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       if (passphraseInput) passphraseInput.value = '';
       const themesInput = document.getElementById('project-themes-input');
       if (themesInput) themesInput.value = '';
-      populateProjectDeadlineForm('project', null);
       const createPresetName = document.getElementById('project-group-preset-name-input');
       const createPresetDesc = document.getElementById('project-group-preset-description-input');
       if (createPresetName) createPresetName.value = '';
@@ -35953,7 +33606,6 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
 
     function closeNewProjectModal() {
       pendingLinkedCreateProjectDocs = [];
-      refreshLinkedPendingSummaries();
       refreshLinkedPendingSummaries();
       document.getElementById('modal-new-project').classList.add('hidden');
       const createProjectDocInput = document.getElementById('project-create-doc-files');
@@ -35976,7 +33628,6 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     async function closeEditProjectModal() {
       editProjectFromDashboard = false;
       pendingLinkedEditProjectDocs = [];
-      refreshLinkedPendingSummaries();
       refreshLinkedPendingSummaries();
       await releaseActiveProjectEditLock();
       document.getElementById('modal-edit-project')?.classList.add('hidden');
@@ -37332,47 +34983,26 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     document.getElementById('btn-cancel-task').addEventListener('click', async () => {
-      if (taskLifecycleDomainRuntime?.closeTaskModalAndReset) {
-        await taskLifecycleDomainRuntime.closeTaskModalAndReset();
-        return;
-      }
+      await taskLifecycleDomainRuntime?.closeTaskModalAndReset?.();
     });
     document.getElementById('btn-task-assignee-quick-add')?.addEventListener('click', () => {
-      if (taskLifecycleDomainRuntime?.handleQuickAssigneeAdd) {
-        taskLifecycleDomainRuntime.handleQuickAssigneeAdd();
-        return;
-      }
+      taskLifecycleDomainRuntime?.handleQuickAssigneeAdd?.();
     });
     document.getElementById('task-assignee-quick-input')?.addEventListener('keydown', (e) => {
-      if (taskLifecycleDomainRuntime?.handleQuickAssigneeKeydown) {
-        taskLifecycleDomainRuntime.handleQuickAssigneeKeydown(e);
-        return;
-      }
+      taskLifecycleDomainRuntime?.handleQuickAssigneeKeydown?.(e);
     });
     document.getElementById('task-group')?.addEventListener('change', async () => {
-      if (taskLifecycleDomainRuntime?.handleTaskGroupChange) {
-        await taskLifecycleDomainRuntime.handleTaskGroupChange();
-        return;
-      }
+      await taskLifecycleDomainRuntime?.handleTaskGroupChange?.();
     });
     document.getElementById('task-deadline-mode')?.addEventListener('change', (e) => {
-      if (taskLifecycleDomainRuntime?.handleTaskDeadlineModeChange) {
-        taskLifecycleDomainRuntime.handleTaskDeadlineModeChange(e);
-        return;
-      }
+      taskLifecycleDomainRuntime?.handleTaskDeadlineModeChange?.(e);
     });
     document.getElementById('btn-open-task-theme-manager')?.addEventListener('click', async () => {
-      if (taskLifecycleDomainRuntime?.openTaskThemeManager) {
-        await taskLifecycleDomainRuntime.openTaskThemeManager();
-        return;
-      }
+      await taskLifecycleDomainRuntime?.openTaskThemeManager?.();
     });
 
     document.getElementById('btn-save-task').addEventListener('click', async () => {
-      if (taskLifecycleDomainRuntime?.saveTaskFromModal) {
-        await taskLifecycleDomainRuntime.saveTaskFromModal();
-        return;
-      }
+      await taskLifecycleDomainRuntime?.saveTaskFromModal?.();
     });
 
     // Send message
@@ -37423,10 +35053,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       closeTaskConvertModal();
     });
     document.getElementById('btn-task-convert-confirm')?.addEventListener('click', async () => {
-      if (taskLifecycleDomainRuntime?.confirmTaskConvertFromModal) {
-        await taskLifecycleDomainRuntime.confirmTaskConvertFromModal();
-        return;
-      }
+      await taskLifecycleDomainRuntime?.confirmTaskConvertFromModal?.();
     });
     document.getElementById('btn-close-global-conversation-delete')?.addEventListener('click', () => {
       closeGlobalConversationDeleteModal();
@@ -37438,10 +35065,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       await confirmDeleteGlobalConversation();
     });
     document.getElementById('task-convert-project-name')?.addEventListener('keydown', async (e) => {
-      if (taskLifecycleDomainRuntime?.handleTaskConvertNameKeydown) {
-        taskLifecycleDomainRuntime.handleTaskConvertNameKeydown(e);
-        return;
-      }
+      taskLifecycleDomainRuntime?.handleTaskConvertNameKeydown?.(e);
     });
     document.getElementById('btn-close-calendar-info-details')?.addEventListener('click', async () => {
       await closeStandaloneCalendarDetails();
@@ -37548,17 +35172,21 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       });
     }
 
+    async function closeTaskModalAndResetWithFallback() {
+      if (taskLifecycleDomainRuntime?.closeTaskModalAndReset) {
+        await taskLifecycleDomainRuntime.closeTaskModalAndReset();
+        return;
+      }
+      await releaseActiveTaskEditLock();
+      document.getElementById('modal-new-task').classList.add('hidden');
+      editingTaskId = null;
+      editingStandaloneTaskId = null;
+    }
+
     // Close modals on escape key
     document.addEventListener('keydown', async (e) => {
       if (e.key === 'Escape') {
-        if (taskLifecycleDomainRuntime?.closeTaskModalAndReset) {
-          await taskLifecycleDomainRuntime.closeTaskModalAndReset();
-        } else {
-          await releaseActiveTaskEditLock();
-          document.getElementById('modal-new-task').classList.add('hidden');
-          editingTaskId = null;
-          editingStandaloneTaskId = null;
-        }
+        await closeTaskModalAndResetWithFallback();
         await releaseActiveProjectEditLock();
         if (activeCalendarEditLock?.itemId) {
           await releaseCalendarItemLock(activeCalendarEditLock.itemId, activeCalendarEditLock.lockId || '');
@@ -37578,7 +35206,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         closeProjectNoteEditor();
         closeTaskConvertModal();
         closeGlobalConversationDeleteModal();
-        closeGlobalNotesBulkExportModal();
+        globalNotesRuntime?.closeGlobalNotesBulkExportModal?.();
         document.getElementById('modal-app-help')?.classList.add('hidden');
         await closeGlobalTaskDetails();
         globalCalendarRuntime?.resetStandaloneCalendarForm?.();
@@ -37595,14 +35223,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     });
 
     registerSafeBackdropClose('modal-new-task', async () => {
-        if (taskLifecycleDomainRuntime?.closeTaskModalAndReset) {
-          await taskLifecycleDomainRuntime.closeTaskModalAndReset();
-          return;
-        }
-        await releaseActiveTaskEditLock();
-        document.getElementById('modal-new-task')?.classList.add('hidden');
-        editingTaskId = null;
-        editingStandaloneTaskId = null;
+        await closeTaskModalAndResetWithFallback();
     });
     registerSafeBackdropClose('modal-global-task-details', async () => {
       await closeGlobalTaskDetails();
@@ -37614,7 +35235,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
       closeGlobalConversationDeleteModal();
     });
     registerSafeBackdropClose('modal-global-notes-export', () => {
-      closeGlobalNotesBulkExportModal();
+      globalNotesRuntime?.closeGlobalNotesBulkExportModal?.();
     });
     registerSafeBackdropClose('modal-calendar-info-details', async () => {
       await closeStandaloneCalendarDetails();
@@ -37673,10 +35294,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     globalEmailRuntime?.bindDom();
     // Fonction pour remplir le select de sélection de groupe en messagerie
     async function populateGlobalMessageGroupChannelSelect() {
-      if (globalGroupChannelUiRuntime?.populateGlobalMessageGroupChannelSelect) {
-        await globalGroupChannelUiRuntime.populateGlobalMessageGroupChannelSelect();
-        return;
-      }
+      await globalGroupChannelUiRuntime?.populateGlobalMessageGroupChannelSelect?.();
     }
 
 
@@ -37741,17 +35359,12 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     async function readMessageFiles(inputId = 'message-files') {
-      // Compatibility wrapper: delegated implementation lives in TaskMDAAttachmentsUI.
-      if (attachmentsUiRuntime?.readMessageFiles) {
-        return attachmentsUiRuntime.readMessageFiles(inputId);
-      }
-      return [];
+      return await attachmentsUiRuntime?.readMessageFiles?.(inputId) || [];
     }
 
     function renameFileExtension(name, extensionWithDot) {
-      if (attachmentsUiRuntime?.renameFileExtension) {
-        return attachmentsUiRuntime.renameFileExtension(name, extensionWithDot);
-      }
+      const renameExt = attachmentsUiRuntime?.renameFileExtension;
+      if (renameExt) return renameExt(name, extensionWithDot);
       const safeName = String(name || 'image').trim();
       const ext = String(extensionWithDot || '.jpg').trim() || '.jpg';
       const dot = safeName.lastIndexOf('.');
@@ -37760,9 +35373,8 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     async function optimizeMessageAttachment(file, rawDataUrl) {
-      if (attachmentsUiRuntime?.optimizeMessageAttachment) {
-        return attachmentsUiRuntime.optimizeMessageAttachment(file, rawDataUrl);
-      }
+      const optimizeAttachment = attachmentsUiRuntime?.optimizeMessageAttachment;
+      if (optimizeAttachment) return optimizeAttachment(file, rawDataUrl);
       return {
         name: String(file?.name || 'piece-jointe'),
         size: Number(file?.size || 0),
@@ -37811,9 +35423,8 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function buildInlineMessageImageHtml(dataUrl, altText = 'image') {
-      if (attachmentsUiRuntime?.buildInlineMessageImageHtml) {
-        return attachmentsUiRuntime.buildInlineMessageImageHtml(dataUrl, altText);
-      }
+      const buildInlineImageHtml = attachmentsUiRuntime?.buildInlineMessageImageHtml;
+      if (buildInlineImageHtml) return buildInlineImageHtml(dataUrl, altText);
       const safeSrc = String(dataUrl || '').trim();
       if (!safeSrc) return '';
       const safeAlt = escapeHtml(String(altText || 'image').slice(0, 120));
@@ -37821,10 +35432,7 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     async function insertImageFilesIntoDiscussionInput(input, files) {
-      if (attachmentsUiRuntime?.insertImageFilesIntoDiscussionInput) {
-        return attachmentsUiRuntime.insertImageFilesIntoDiscussionInput(input, files);
-      }
-      return 0;
+      return await attachmentsUiRuntime?.insertImageFilesIntoDiscussionInput?.(input, files) || 0;
     }
 
     function fileToDataUrl(file) {
@@ -38011,86 +35619,46 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     }
 
     function insertTextAtCursor(input, text) {
-      if (discussionInputUiRuntime?.insertTextAtCursor) {
-        discussionInputUiRuntime.insertTextAtCursor(input, text);
-        return;
-      }
+      const insertAtCursor = discussionInputUiRuntime?.insertTextAtCursor;
+      if (insertAtCursor) return insertAtCursor(input, text);
       if (!input) return;
-      if (input.isContentEditable) {
-        input.focus();
-        const selection = window.getSelection();
-        if (selection && selection.rangeCount > 0) {
-          const range = selection.getRangeAt(0);
-          range.deleteContents();
-          const node = document.createTextNode(String(text || ''));
-          range.insertNode(node);
-          range.setStartAfter(node);
-          range.setEndAfter(node);
-          selection.removeAllRanges();
-          selection.addRange(range);
-        } else {
-          input.appendChild(document.createTextNode(String(text || '')));
-        }
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        return;
-      }
-      const start = typeof input.selectionStart === 'number' ? input.selectionStart : input.value.length;
-      const end = typeof input.selectionEnd === 'number' ? input.selectionEnd : input.value.length;
-      const before = input.value.slice(0, start);
-      const after = input.value.slice(end);
-      input.value = `${before}${text}${after}`;
-      const nextPos = start + text.length;
-      input.selectionStart = nextPos;
-      input.selectionEnd = nextPos;
+      const safeText = String(text || '');
+      if (input.isContentEditable) input.textContent = `${String(input.textContent || '')}${safeText}`;
+      else input.value = `${String(input.value || '')}${safeText}`;
       input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.focus();
     }
 
     function setDiscussionInputPlaceholder(input, text) {
-      if (discussionInputUiRuntime?.setDiscussionInputPlaceholder) {
-        discussionInputUiRuntime.setDiscussionInputPlaceholder(input, text);
-        return;
-      }
+      const setPlaceholder = discussionInputUiRuntime?.setDiscussionInputPlaceholder;
+      if (setPlaceholder) return setPlaceholder(input, text);
       if (!input) return;
       const value = String(text || '').trim();
-      if (input.isContentEditable) {
-        input.setAttribute('data-placeholder', value || 'Taper un message...');
-      } else {
-        input.placeholder = value || 'Taper un message...';
-      }
+      if (input.isContentEditable) input.setAttribute('data-placeholder', value || 'Taper un message...');
+      else input.placeholder = value || 'Taper un message...';
     }
 
     function getDiscussionInputPlainText(input) {
-      if (discussionInputUiRuntime?.getDiscussionInputPlainText) {
-        return discussionInputUiRuntime.getDiscussionInputPlainText(input);
-      }
+      const getPlainText = discussionInputUiRuntime?.getDiscussionInputPlainText;
+      if (getPlainText) return getPlainText(input);
       if (!input) return '';
-      if (input.isContentEditable) {
-        return String(input.textContent || '').replace(/\u00a0/g, ' ').trim();
-      }
+      if (input.isContentEditable) return String(input.textContent || '').replace(/\u00a0/g, ' ').trim();
       return String(input.value || '').trim();
     }
 
     function getDiscussionInputHtml(input) {
-      if (discussionInputUiRuntime?.getDiscussionInputHtml) {
-        return discussionInputUiRuntime.getDiscussionInputHtml(input);
-      }
+      const getInputHtml = discussionInputUiRuntime?.getDiscussionInputHtml;
+      if (getInputHtml) return getInputHtml(input);
       if (!input) return '';
       const raw = input.isContentEditable ? String(input.innerHTML || '') : plainTextToRichHtml(String(input.value || ''));
       return sanitizeProjectDescriptionHtml(raw || '');
     }
 
     function clearDiscussionInput(input) {
-      if (discussionInputUiRuntime?.clearDiscussionInput) {
-        discussionInputUiRuntime.clearDiscussionInput(input);
-        return;
-      }
+      const clearInput = discussionInputUiRuntime?.clearDiscussionInput;
+      if (clearInput) return clearInput(input);
       if (!input) return;
-      if (input.isContentEditable) {
-        input.innerHTML = '';
-      } else {
-        input.value = '';
-      }
+      if (input.isContentEditable) input.innerHTML = '';
+      else input.value = '';
       input.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
@@ -38404,11 +35972,9 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
     // ============================================================================
 
     function startApp() {
-      if (appInitRuntime?.startApp) {
-        appInitRuntime.startApp();
-        return;
-      }
-      console.error('TaskMDAAppInit module not available');
+      return appInitRuntime?.startApp
+        ? appInitRuntime.startApp()
+        : console.error('TaskMDAAppInit module not available');
     }
 
     // Démarrer l'application
@@ -38565,3 +36131,4 @@ h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
         });
       });
     }
+

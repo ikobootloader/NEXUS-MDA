@@ -2,6 +2,8 @@
 // TASKMDA TEAM - MODULE EDITEUR PROJET
 // Extrait de taskmda-team.js pour alleger le fichier principal
 // ============================================================================
+(function initTaskMDAEditorModule(global) {
+  'use strict';
 
     function insertHtmlAtCursor(html) {
       const selection = window.getSelection();
@@ -52,8 +54,8 @@
         `;
         editor.appendChild(overlay);
       }
-      if (overlay.dataset.bound !== '1') {
-        overlay.dataset.bound = '1';
+      if (overlay.dataset.editorImageOverlayBound !== '1') {
+        overlay.dataset.editorImageOverlayBound = '1';
         const panel = overlay.querySelector('.project-editor-image-overlay-panel');
         const range = overlay.querySelector('.project-editor-image-width-range');
         const value = overlay.querySelector('.project-editor-image-width-value');
@@ -682,8 +684,8 @@
         }
       });
       document.querySelectorAll('.project-editor-btn[data-editor-action]').forEach((btn) => {
-        if (btn.dataset.boundEditorAction === '1') return;
-        btn.dataset.boundEditorAction = '1';
+        if (btn.dataset.editorActionBound === '1') return;
+        btn.dataset.editorActionBound = '1';
         btn.addEventListener('click', () => {
           const editorId = btn.getAttribute('data-editor-target');
           const action = btn.getAttribute('data-editor-action');
@@ -691,7 +693,7 @@
           if (!editorId || !action) return;
           const editor = document.getElementById(editorId);
           if (!btn.id) btn.id = `project-editor-btn-${uuidv4()}`;
-          applyProjectDescriptionEditorAction(action, editor, inputId, btn);
+          applyProjectDescriptionEditorActionEnhanced(action, editor, inputId, btn);
         });
       });
 
@@ -706,8 +708,8 @@
       imageBindings.forEach(({ editorId, inputId }) => {
         const editor = document.getElementById(editorId);
         const hasQuill = Boolean(projectDescriptionQuillEditors.get(editorId));
-        if (editor && !hasQuill && editor.dataset.boundDescriptionImageSelection !== '1') {
-          editor.dataset.boundDescriptionImageSelection = '1';
+        if (editor && !hasQuill && editor.dataset.editorDescriptionImageSelectionBound !== '1') {
+          editor.dataset.editorDescriptionImageSelectionBound = '1';
           ensureProjectEditorImageOverlay(editor);
           editor.addEventListener('click', (event) => {
             const target = event.target instanceof Element ? event.target : null;
@@ -751,8 +753,8 @@
           removeProjectEditorImageOverlay(editor);
         }
         const input = document.getElementById(inputId);
-        if (!input || input.dataset.boundDescriptionImage === '1') return;
-        input.dataset.boundDescriptionImage = '1';
+        if (!input || input.dataset.editorDescriptionImageBound === '1') return;
+        input.dataset.editorDescriptionImageBound = '1';
         input.addEventListener('change', async () => {
           const editor = document.getElementById(editorId);
           if (!editor) return;
@@ -800,13 +802,39 @@
       panel.classList.remove('hidden');
     }
 
-    const applyProjectDescriptionEditorActionBase = applyProjectDescriptionEditorAction;
-    applyProjectDescriptionEditorAction = function applyProjectDescriptionEditorActionEnhanced(action, editor, fileInputId = '', triggerEl = null) {
+    function applyProjectDescriptionEditorActionEnhanced(action, editor, fileInputId = '', triggerEl = null) {
       if (action === 'emoji') {
         toggleProjectEditorEmojiPicker(editor, triggerEl || document.activeElement || null);
         return;
       }
-      applyProjectDescriptionEditorActionBase(action, editor, fileInputId);
+      applyProjectDescriptionEditorAction(action, editor, fileInputId);
+    }
+
+    const api = {
+      insertHtmlAtCursor,
+      ensureProjectDescriptionQuillEditor,
+      initProjectDescriptionEditors,
+      applyProjectDescriptionEditorAction: applyProjectDescriptionEditorActionEnhanced,
+      toggleProjectEditorEmojiPicker,
+      ensureProjectEditorEmojiPanel,
+      ensureProjectEditorImageOverlay,
+      removeProjectEditorImageOverlay,
+      clearProjectEditorImageSelection,
+      updateProjectEditorImageOverlayPosition,
+      setProjectEditorImageSelection
     };
 
+    global.TaskMDAEditor = api;
 
+    // Backward compatibility for existing direct calls from team.js.
+    global.insertHtmlAtCursor = insertHtmlAtCursor;
+    global.ensureProjectDescriptionQuillEditor = ensureProjectDescriptionQuillEditor;
+    global.initProjectDescriptionEditors = initProjectDescriptionEditors;
+    global.applyProjectDescriptionEditorAction = applyProjectDescriptionEditorActionEnhanced;
+    global.toggleProjectEditorEmojiPicker = toggleProjectEditorEmojiPicker;
+    global.ensureProjectEditorImageOverlay = ensureProjectEditorImageOverlay;
+    global.removeProjectEditorImageOverlay = removeProjectEditorImageOverlay;
+    global.clearProjectEditorImageSelection = clearProjectEditorImageSelection;
+    global.updateProjectEditorImageOverlayPosition = updateProjectEditorImageOverlayPosition;
+    global.setProjectEditorImageSelection = setProjectEditorImageSelection;
+}(window));

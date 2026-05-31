@@ -152,10 +152,17 @@ L'application est structurée en modules spécialisés :
 
 #### Modules métier
 - `taskmda-project.js` - Domaine projets
+  - Projet notes: wrappers `escapeHtml`/`normalizeSearch` harmonises avec `taskmda-core-utils.js` (Lot 2)
 - `taskmda-project-members-domain.js` - Domaine membres projet et RBAC projet
 - `taskmda-task-lifecycle-domain.js` - Cycle de vie des tâches
 - `taskmda-workflow.js` - Orchestration workflow
 - `taskmda-global.js` - Domaines transverses (notes, docs, feed)
+- `taskmda-global-doc-ref-utils.js` - Utilitaires refs documents inline (feed/notes)
+- `taskmda-feed-digest-ui.js` - Utilitaires UI digest (mode compact/complet, resume)
+- `taskmda-feed-digest-editor.js` - Import digest vers editeurs riches (notes/feed)
+- `taskmda-feed-digest-mime.js` - Parsing MIME/email (EML/MSG) pour digest
+- `taskmda-feed-digest-pdf.js` - Structuration/rendu digest PDF (pages, liens, markdown, extraction pdf2md)
+- `taskmda-feed-digest-content.js` - Construction du rendu digest (email/pdf/autres)
 - `taskmda-doc.js` - Gestion documentaire complète
 - `taskmda-hierarchy.js` - Epic/Feature
 
@@ -165,6 +172,8 @@ L'application est structurée en modules spécialisés :
 - `taskmda-recurrence.js` - Tâches récurrentes
 - `taskmda-notifications.js` - Centre de notifications
 - `taskmda-tasks.js` - Rendus et interactions de tâches
+  - Export annuel: `formatExportDateTag` harmonise avec `taskmda-core-utils.js` (Lot 2)
+  - Sous-taches: logique centralisee, orchestrateur en delegation directe (Lot 2)
 - `taskmda-social.js` - UI sociale (feed/messages)
 - `taskmda-comms-ui.js` - UI communication transverse
 - `taskmda-admin-ui.js` - UI administration et habilitations
@@ -176,6 +185,10 @@ L'application est structurée en modules spécialisés :
 
 #### Modules infrastructure
 - `taskmda-core-utils.js` - Utilitaires purs
+  - Centralise aussi `sharingModeBadge`, `matchesQuery`, `sanitizeFilenameSegment` (Lot 2)
+  - Utilise aussi par `taskmda-file-watcher.js` et `taskmda-notes-shared.js` pour `escapeHtml` / `formatFileSize`
+  - Centralise aussi `formatDate` pour l orchestrateur principal
+  - Centralise aussi `formatDateTime(dateValue, emptyLabel)` pour projet-notes et file-watcher
 - `taskmda-runtime-contract.js` - Contrat d'orchestration
 - `taskmda-shell.js` - Shell transverse
 - `taskmda-app-init.js` - Initialisation
@@ -242,6 +255,68 @@ projects/
 ## 🆕 Nouveautés récentes
 
 ### Mai 2026
+
+#### ✅ Revue de code: suppression d un doublon d orchestration
+
+- Suppression de definitions dupliquees de `discoverAndLoadExistingProjects` et `renderProjectGroups` dans `js/taskmda-team.js`.
+- Conservation de la version robuste (chargement avec stats, gestion legacy et reconstruction locale).
+- Effet attendu: moins d entropie et moins de risque de divergence comportementale.
+
+#### ✅ Refactor Lot 1: orchestrateur aminci (groupes projet)
+
+- Déplacement du rendu des groupes projet (`renderProjectGroups`) dans le module domaine `js/taskmda-project-members-domain.js`.
+- `js/taskmda-team.js` conserve une délégation légère vers le runtime domaine.
+- Déplacement du rendu des groupes utilisateurs projet (`renderProjectUserGroups`) dans le même module domaine.
+- Déplacement du rendu des invitations projet (`renderProjectInvitations`) dans le même module domaine.
+- Déplacement du rendu des membres projet (`renderProjectMembers`) dans le même module domaine.
+- Déplacement du rendu des thématiques projet (`renderProjectThemes`) dans le même module domaine.
+- Déplacement du rendu de la matrice des droits projet (`renderProjectPermissionMatrix`) dans le même module domaine.
+- Déplacement du rendu des sélecteurs de rôles projet (`renderProjectRoleSelectors`) dans le même module domaine.
+- Déplacement de l’autocomplétion annuaire des membres (`renderMemberDirectoryAutocomplete`) dans le même module domaine.
+- Déplacement de l’action de bascule du détail des droits (`toggleProjectPermissionDetails`) dans le même module domaine.
+- Déplacement des listeners DOM de collaboration projet dans `bindDom()` du même module domaine.
+- Déplacement des listeners d’onglets de réglages projet (`overview/members/collab/themes/permissions/structure`) dans `bindDom()` du même module domaine.
+- Déplacement de la logique `setProjectSettingsTab` dans le même module domaine (avec délégation/fallback côté orchestrateur).
+- Déplacement de la logique d’attribution des rôles assignables (`getAssignableProjectRolesForUser`) dans le même module domaine.
+- Réduction des wrappers globaux pass-through restants (`removeProjectMember`, `selectUserGroup`, `deleteUserGroup`) en délégations directes runtime.
+- Suppression des wrappers pass-through `invitations/groupes/thématiques` côté orchestrateur avec délégation runtime directe et exposition `window.*` minimale.
+- Suppression de doublons consécutifs d’appels `refreshLinkedPendingSummaries()` dans l’orchestrateur.
+- Suppression d’un doublon d’appel `populateProjectDeadlineForm('project', null)` dans l’ouverture de la modale nouveau projet.
+- Suppression des derniers wrappers de rendu collaboration restants (`renderProjectRoleSelectors`, `renderProjectMembers`, `renderProjectUserGroups`, `renderProjectPermissionMatrix`) au profit d’appels runtime directs.
+- Correctif de compatibilité: ré-exposition `window.deleteProjectGroup` pour les actions inline `onclick` des cartes de groupes.
+- Factorisation du rendu collaboration projet via un helper unique `renderProjectCollaborationPanels(...)` pour éviter les blocs de délégation répétés.
+- Suppression de wrappers one-liner morts côté orchestrateur dans le périmètre notes globales (bulk/favoris), avec conservation des points d’entrée `window.*` actifs.
+- Suppression du wrapper local `closeGlobalNotesBulkExportModal` avec délégation runtime directe.
+- Suppression des wrappers locaux `openGlobalFeedReference` / `openGlobalFeedPost` au profit d’appels runtime directs (incluant `window.*`).
+- Suppression de wrappers feed non utilisés (`refreshGlobalFeedFilterButtons`, `renderGlobalFeedSummary`) et inline de `publishGlobalFeedPost` dans le binding `TaskMDACommsUI`.
+- Suppression du wrapper local `openGlobalFeedPostReadModal` avec exposition `window.*` directement branchée au runtime.
+- Suppression de wrappers notes/fédération non utilisés (`buildGlobalNoteCardHtml`, `buildGlobalHubProjectNoteRef`, `parseGlobalHubProjectNoteRef`, wrapper local `openGlobalHubAggregatedNoteRead`) avec exposition runtime directe conservée.
+- Suppression du wrapper one-liner local `publishGlobalFeedDigestFromFiles`; délégation inline directement dans le binding `TaskMDACommsUI`.
+- Suppression du wrapper mort `resolveLinkedDocsForFeedPost` et remplacement de `window.openGlobalFeedReference` / `window.openGlobalFeedPost` par des fonctions nommées locales réutilisables (scope dépendances fiabilisé).
+- Harmonisation de `window.openGlobalFeedPostReadModal` et `window.openGlobalHubAggregatedNoteRead` vers des fonctions nommées locales (même stratégie de délégation runtime).
+- Factorisation des expositions `window.*` pass-through (notes/feed/actions lecture projet/calendrier/docs) via un helper unique `exposeRuntimeActionsToWindow(...)` pour réduire le volume répétitif côté orchestrateur.
+- Harmonisation Lot 2: `normalizeSearch` du module projet-notes (`js/taskmda-project.js`) délègue désormais à `TaskMDACoreUtils.normalizeSearch` (avec fallback local et `trim` conservé).
+- Harmonisation Lot 2: `escapeHtml` du module projet-notes (`js/taskmda-project.js`) délègue désormais à `TaskMDACoreUtils.escapeHtml` (avec fallback local conservé).
+- Micro-factorisation Lot 2: simplification de `buildUnifiedCardHtml` (module projet-notes) avec variable locale `noteIdRaw` pour éviter les conversions répétées.
+- Micro-factorisation Lot 2: simplification de `defaultProjectActionsRenderer` avec `noteIdRaw` centralisé avant échappement.
+- Micro-factorisation Lot 2: simplification de `buildUnifiedCardHtml` avec variable locale `createdByRaw` pour éviter les conversions répétées de l’auteur.
+- Micro-factorisation Lot 2: pré-normalisation locale des IDs de tâches liées (`linkedTaskIdsNormalized`) dans `buildUnifiedCardHtml`.
+- Micro-factorisation Lot 2: extraction de `authorLabel` et `createdAtLabel` dans `buildUnifiedCardHtml` pour alléger le template.
+- Micro-factorisation Lot 2: extraction de la logique de blob de recherche vers `buildNoteSearchBlob(...)` dans `renderUnifiedNotesList`.
+- Lot 3 (phase 1): optimisation du rendu des notes projet (`js/taskmda-team.js`) avec `rerenderProjectNotesViewIfActive(...)` pour éviter les rerenders complets quand l’onglet actif n’est pas `notes`.
+- Lot 3 (phase 2): `toggleProjectNoteFeedPublish` applique un patch incrémental d’une seule carte quand les filtres le permettent, avec fallback automatique sur rerender complet.
+- Lot 3 (phase 3): `renderProjectNotes(...)` diffère le rendu complet quand l’onglet actif n’est pas `notes`, tout en conservant la mise à jour des options de liaison.
+- Lot 3 (phase 4): consolidation des gardes de rendu via helper commun `isProjectNotesViewActive()` pour fiabiliser la logique incrémentale.
+- Lot 3 (phase 5): factorisation du contexte de rendu des notes dans `buildProjectNotesRenderContext(...)` pour mutualiser les calculs entre rendu complet et patch carte.
+- Lot 3 (phase 6): micro-optimisation de `renderProjectNotes(...)` en retardant la construction du contexte tant que le renderer Notes n’est pas confirmé disponible.
+- Lot 3 (phase 7): le patch incrémental de carte réutilise le contexte de la vue filtrée (`visibleNotes`) pour limiter les recalculs et éviter les divergences.
+- Lot 3 (phase 8): extraction du helper `filterVisibleProjectNotes(...)` pour unifier le filtrage thématique entre rendu complet et patch incrémental.
+- Lot 3 (phase 9): suppression d’une lecture redondante des notes dans le patch incrémental (`notesAll` réutilisé pour recherche + filtrage).
+
+#### ✅ Annuaire ESMS: recherche par numéro FINESS dans le champ texte
+
+- Le champ de recherche ESMS accepte explicitement un numéro FINESS (ex: `010780521`).
+- Une recherche directe FINESS (`nofinesset` / `nofinessej`) complète le filtrage départemental pour fiabiliser la remontée de l'établissement ciblé.
 
 #### ✅ Bouton général projet contextuel
 

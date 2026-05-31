@@ -615,6 +615,10 @@
   }
 
   function escapeHtml(value) {
+    const coreEscapeHtml = window.TaskMDACoreUtils?.escapeHtml;
+    if (typeof coreEscapeHtml === 'function') {
+      return coreEscapeHtml(value);
+    }
     if (value === null || value === undefined) return '';
     return String(value)
       .replace(/&/g, '&amp;')
@@ -631,12 +635,20 @@
   }
 
   function formatDate(timestamp) {
+    const coreFormatDateTime = window.TaskMDACoreUtils?.formatDateTime;
+    if (typeof coreFormatDateTime === 'function') {
+      return coreFormatDateTime(timestamp, 'Jamais');
+    }
     if (!timestamp) return 'Jamais';
     const date = new Date(timestamp);
     return date.toLocaleString('fr-FR');
   }
 
   function formatFileSize(bytes) {
+    const coreFormatFileSize = window.TaskMDACoreUtils?.formatFileSize;
+    if (typeof coreFormatFileSize === 'function') {
+      return coreFormatFileSize(bytes);
+    }
     if (bytes < 1024) return `${bytes} o`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} Ko`;
     return `${(bytes / (1024 * 1024)).toFixed(1)} Mo`;

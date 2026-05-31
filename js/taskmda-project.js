@@ -114,6 +114,9 @@
     // Injected dependencies: callbacks/state accessors provided by taskmda-team orchestrator.
     const opts = options || {};
     let bound = false;
+    const runWithLoading = typeof opts.runWithLoading === 'function'
+      ? opts.runWithLoading
+      : async (action) => await action();
 
     function bindDom() {
       // DOM bindings are attached once; module remains idempotent across repeated init calls.
@@ -440,8 +443,132 @@
       });
     }
 
+    async function exportProjectNote(noteId = '', format = 'html') {
+      const note = opts.getProjectNoteByIdForExport?.(noteId);
+      if (!note) {
+        opts.showToast?.('Note introuvable');
+        return;
+      }
+      const title = String(note.title || '').trim() || 'Note';
+      const safeTitle = opts.sanitizeFilenameSegment?.(title) || 'note';
+      const tag = opts.formatExportDateTag?.() || String(Date.now());
+      const contentHtml = opts.sanitizeRichTextHtmlPreserve?.(
+        String(note.contentHtml || '').trim() || opts.plainTextToRichHtml?.(String(note.content || '').trim()) || ''
+      ) || '';
+      const theme = String(note.theme || '').trim();
+      const tags = Array.isArray(note.tags) ? note.tags.map((entry) => String(entry || '').trim()).filter(Boolean) : [];
+      const author = opts.resolveKnownUserIdentity?.(
+        String(note.createdBy || '').trim(),
+        String(note.createdByName || opts.fallbackDirectoryName?.(note.createdBy || '') || 'Auteur').trim()
+      )?.name || String(note.createdByName || 'Auteur');
+      const dateFormatted = new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR');
+
+      const targetFormat = String(format || '').trim().toLowerCase();
+      if (targetFormat === 'txt') {
+        const plain = opts.getProjectDescriptionPlainText?.(contentHtml) || '';
+        const themeLine = theme ? `Thématique: ${theme}\n\n` : '';
+        const payload = `${title}\n\n${themeLine}${plain}\n`;
+        opts.downloadBlobFile?.(payload, `note_projet_${safeTitle}_${tag}.txt`, 'text/plain;charset=utf-8');
+        opts.showToast?.('Note projet exportee (TXT)');
+        return;
+      }
+      if (targetFormat === 'html') {
+        const escapeHtml = opts.escapeHtml || ((value) => String(value || ''));
+        const chips = [
+          ...(theme ? [`<span class="chip chip-theme">${escapeHtml(theme)}</span>`] : []),
+          ...tags.map((entry) => `<span class="chip">#${escapeHtml(entry)}</span>`)
+        ].join('');
+        const html = `<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1e293b}h1{margin:0 0 8px}.meta{color:#64748b;font-size:13px;margin-bottom:12px}.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}.chip{font-size:11px;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;color:#334155}.chip-theme{background:#ecfdf5;border-color:#a7f3d0;color:#047857}</style></head><body><h1>${escapeHtml(title)}</h1><p class="meta">${escapeHtml(author)} | ${escapeHtml(dateFormatted)}</p>${chips ? `<div class="chips">${chips}</div>` : ''}<article>${contentHtml || '<p>Aucun contenu.</p>'}</article></body></html>`;
+        opts.downloadBlobFile?.(html, `note_projet_${safeTitle}_${tag}.html`, 'text/html;charset=utf-8');
+        opts.showToast?.('Note projet exportee (HTML)');
+        return;
+      }
+      if (targetFormat === 'pdf') {
+        const escapeHtml = opts.escapeHtml || ((value) => String(value || ''));
+        const badges = [
+          ...(theme ? [`<span class="tag tag-theme">${escapeHtml(theme)}</span>`] : []),
+          ...tags.map((t) => `<span class="tag">#${escapeHtml(t)}</span>`)
+        ].join('');
+        const printHtml = `<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{font-family:'Segoe UI',Arial,sans-serif;padding:24px;color:#1e293b;max-width:800px;margin:0 auto}h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}.meta{color:#64748b;font-size:12px;margin-bottom:12px}.tags{margin-bottom:14px}.tag{display:inline-block;font-size:10px;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;color:#334155;margin-right:6px;margin-bottom:4px}.tag-theme{background:#ecfdf5;border-color:#a7f3d0;color:#047857}.content{margin-top:20px;line-height:1.6;color:#1e293b}.content img{max-width:100%;height:auto}@media print{body{padding:0}}</style></head><body><h1>${escapeHtml(title)}</h1><p class="meta">${escapeHtml(author)} | ${escapeHtml(dateFormatted)}</p>${badges ? `<div class="tags">${badges}</div>` : ''}<div class="content">${contentHtml || '<p>Cette note ne contient aucun contenu.</p>'}</div></body></html>`;
+        let popup = null;
+        try { popup = window.open('', '_blank', 'width=900,height=700'); } catch (_) { popup = null; }
+        if (popup && popup.document) {
+          popup.document.open();
+          popup.document.write(printHtml);
+          popup.document.close();
+          setTimeout(() => { try { popup.print(); } catch (_) {} }, 300);
+          opts.showToast?.('Impression ouverte - choisissez Enregistrer en PDF');
+        } else {
+          opts.showToast?.('Impossible d ouvrir la fenetre d impression');
+        }
+        return;
+      }
+      if (targetFormat === 'docx') {
+        const converted = opts.convertHtmlToWordML?.(contentHtml) || { wordML: '', images: [], relationships: [] };
+        const { wordML, images, relationships } = converted;
+        const now = Date.now();
+        const files = [
+          { name: '[Content_Types].xml', data: opts.generateContentTypesXml?.(images) || '', mtime: now },
+          { name: '_rels/.rels', data: opts.generateRootRelsXml?.() || '', mtime: now },
+          { name: 'word/document.xml', data: opts.generateDocumentXml?.({ title, author, dateFormatted, theme, tags }, wordML || ''), mtime: now },
+          { name: 'word/styles.xml', data: opts.generateStylesXml?.() || '', mtime: now }
+        ];
+        if (images.length > 0) {
+          files.push({ name: 'word/_rels/document.xml.rels', data: opts.generateDocumentRelsXml?.(relationships) || '', mtime: now });
+          images.forEach((img) => {
+            files.push({ name: `word/media/${img.filename}`, data: opts.base64ToUint8Array?.(img.base64) || new Uint8Array(0), mtime: now });
+          });
+        }
+        const zipBytes = opts.buildZipStoreArchive?.(files);
+        if (!zipBytes) {
+          opts.showToast?.('Echec export DOCX');
+          return;
+        }
+        opts.downloadBlobFile?.(
+          new Blob([zipBytes], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }),
+          `note_projet_${safeTitle}_${tag}.docx`,
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        );
+        opts.showToast?.('Note projet exportee (DOCX)');
+      }
+    }
+
+    function toggleProjectNoteExportMenu(noteId, event) {
+      if (event) {
+        event.stopPropagation();
+        event.preventDefault();
+      }
+      const nid = String(noteId || '').trim();
+      if (!nid) return;
+      const menu = document.getElementById(`project-note-export-menu-${nid}`);
+      const btn = document.getElementById(`project-note-export-menu-btn-${nid}`);
+      if (!menu || !btn) return;
+      document.querySelectorAll('[id^="project-note-export-menu-"]').forEach((otherMenu) => {
+        if (otherMenu.id === menu.id || otherMenu.id.startsWith('project-note-export-menu-btn-')) return;
+        otherMenu.classList.add('hidden');
+        const otherId = otherMenu.id.replace('project-note-export-menu-', '');
+        const otherBtn = document.getElementById(`project-note-export-menu-btn-${otherId}`);
+        if (otherBtn) otherBtn.setAttribute('aria-expanded', 'false');
+      });
+      const willOpen = menu.classList.contains('hidden');
+      menu.classList.toggle('hidden', !willOpen);
+      btn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+    }
+
+    function closeProjectNoteExportMenu(noteId) {
+      const nid = String(noteId || '').trim();
+      if (!nid) return;
+      const menu = document.getElementById(`project-note-export-menu-${nid}`);
+      const btn = document.getElementById(`project-note-export-menu-btn-${nid}`);
+      if (menu) menu.classList.add('hidden');
+      if (btn) btn.setAttribute('aria-expanded', 'false');
+    }
+
     return {
-      bindDom
+      bindDom,
+      exportProjectNote,
+      toggleProjectNoteExportMenu,
+      closeProjectNoteExportMenu
     };
   }
 
@@ -471,7 +598,9 @@
       });
 
       document.getElementById('btn-project-note-save')?.addEventListener('click', async () => {
-        await opts.saveProjectNoteFromEditor?.();
+        await runWithLoading(async () => {
+          await opts.saveProjectNoteFromEditor?.();
+        });
       });
 
       document.getElementById('btn-project-note-digest')?.addEventListener('click', () => {
@@ -633,7 +762,9 @@
           const key = String(event.key || '').toLowerCase();
           if ((event.ctrlKey || event.metaKey) && key === 's') {
             event.preventDefault();
-            opts.saveProjectNoteFromEditor?.();
+            void runWithLoading(async () => {
+              await opts.saveProjectNoteFromEditor?.();
+            });
             return;
           }
           if (key === 'escape') {
@@ -872,7 +1003,13 @@
   // Module role: UI/domain boundary for TaskMDAProjectNotesModule.
   'use strict';
 
+  const coreUtils = global.TaskMDACoreUtils || {};
+  const coreEscapeHtml = typeof coreUtils.escapeHtml === 'function' ? coreUtils.escapeHtml : null;
+  const coreNormalizeSearch = typeof coreUtils.normalizeSearch === 'function' ? coreUtils.normalizeSearch : null;
+  const coreFormatDateTime = typeof coreUtils.formatDateTime === 'function' ? coreUtils.formatDateTime : null;
+
   function escapeHtml(value) {
+    if (coreEscapeHtml) return coreEscapeHtml(value);
     return String(value == null ? '' : value)
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
@@ -882,6 +1019,7 @@
   }
 
   function normalizeSearch(value) {
+    if (coreNormalizeSearch) return String(coreNormalizeSearch(value) || '').trim();
     return String(value || '')
       .toLowerCase()
       .normalize('NFD')
@@ -890,6 +1028,7 @@
   }
 
   function formatDateTime(ts) {
+    if (coreFormatDateTime) return coreFormatDateTime(ts, '-');
     const safeTs = Number(ts || 0);
     if (!safeTs) return '-';
     return new Date(safeTs).toLocaleString('fr-FR');
@@ -923,16 +1062,22 @@
   }
 
   function buildUnifiedCardHtml(note, ctx) {
+    const theme = String(note.theme || '').trim();
     const tags = Array.isArray(note.tags) ? note.tags : [];
     const linkedTaskIds = Array.isArray(note.linkedTaskIds) ? note.linkedTaskIds : [];
-    const linkedDocsCount = Number((ctx.noteDocsCountById instanceof Map ? ctx.noteDocsCountById.get(String(note.noteId || '')) : 0) || 0);
-    const taskLabels = linkedTaskIds
-      .map((taskId) => ctx.taskTitleById.get(String(taskId || '').trim()))
+    const linkedTaskIdsNormalized = linkedTaskIds.map((taskId) => String(taskId || '').trim()).filter(Boolean);
+    const noteIdRaw = String(note.noteId || '');
+    const linkedDocsCount = Number((ctx.noteDocsCountById instanceof Map ? ctx.noteDocsCountById.get(noteIdRaw) : 0) || 0);
+    const createdByRaw = String(note.createdBy || '');
+    const taskLabels = linkedTaskIdsNormalized
+      .map((taskId) => ctx.taskTitleById.get(taskId))
       .filter(Boolean);
-    const canManage = !!ctx.canManageById.get(String(note.noteId || ''));
-    const isFocused = String(ctx.focusNoteId || '') === String(note.noteId || '');
+    const authorLabel = String(ctx.authorById.get(createdByRaw) || note.createdByName || 'Auteur');
+    const createdAtLabel = formatDateTime(note.createdAt);
+    const canManage = !!ctx.canManageById.get(noteIdRaw);
+    const isFocused = String(ctx.focusNoteId || '') === noteIdRaw;
     const isArchived = Number(note.archivedAt || 0) > 0;
-    const noteId = String(note.noteId || '');
+    const noteId = noteIdRaw;
     const cardIdPrefix = String(ctx.cardIdPrefix || 'project-note');
     const openFn = String(ctx.openFn || 'openProjectNoteReadModal');
     const actionsHtml = canManage
@@ -959,10 +1104,11 @@
               ${Number(note.favoriteAt || 0) > 0 ? '<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-amber-100 text-amber-700 font-semibold">Favori</span>' : ''}
               ${linkedTaskIds.length > 0 ? `<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-slate-100 text-slate-700 font-semibold">${linkedTaskIds.length} tache(s) liee(s)</span>` : ''}
               ${linkedDocsCount > 0 ? `<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-indigo-100 text-indigo-700 font-semibold">${linkedDocsCount} document(s) lie(s)</span>` : ''}
+              ${theme ? `<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 font-semibold">${escapeHtml(theme)}</span>` : ''}
               ${extraBadgesHtml}
             </div>
             <h4 class="mt-2 text-base font-bold text-slate-800">${escapeHtml(note.title || 'Note sans titre')}</h4>
-            <p class="mt-1 text-xs text-slate-500">${escapeHtml(String(ctx.authorById.get(String(note.createdBy || '')) || note.createdByName || 'Auteur'))} • ${escapeHtml(formatDateTime(note.createdAt))}</p>
+            <p class="mt-1 text-xs text-slate-500">${escapeHtml(authorLabel)} • ${escapeHtml(createdAtLabel)}</p>
           </div>
           ${actionsHtml ? `<div class="flex items-center gap-1" onclick="event.stopPropagation();">${actionsHtml}</div>` : ''}
         </div>
@@ -973,7 +1119,8 @@
   }
 
   function defaultProjectActionsRenderer(note, ctx = {}) {
-    const noteId = escapeHtml(String(note.noteId || ''));
+    const noteIdRaw = String(note.noteId || '');
+    const noteId = escapeHtml(noteIdRaw);
     if (ctx.isArchived) {
       return `<button type="button" class="workspace-action-inline" onclick="restoreProjectNote('${noteId}')" data-action-kind="unarchive">Restaurer</button>`;
     }
@@ -998,6 +1145,18 @@
     `;
   }
 
+  function buildNoteSearchBlob(note, taskTitleById) {
+    const taskTitles = (Array.isArray(note?.linkedTaskIds) ? note.linkedTaskIds : [])
+      .map((id) => taskTitleById.get(String(id || '').trim()) || '');
+    return normalizeSearch([
+      note?.title,
+      note?.content,
+      note?.theme,
+      ...(Array.isArray(note?.tags) ? note.tags : []),
+      ...taskTitles
+    ].join(' '));
+  }
+
   function renderUnifiedNotesList(container, options = {}) {
     if (!container) return { total: 0, visible: 0 };
     const notes = Array.isArray(options.notes) ? options.notes : [];
@@ -1014,18 +1173,15 @@
       .filter((note) => matchByMode(note, mode, currentUserId))
       .filter((note) => {
         if (!query) return true;
-        const blob = normalizeSearch([
-          note.title,
-          note.content,
-          ...(Array.isArray(note.tags) ? note.tags : []),
-          ...(Array.isArray(note.linkedTaskIds) ? note.linkedTaskIds : []).map((id) => taskTitleById.get(String(id || '').trim()) || '')
-        ].join(' '));
+        const blob = buildNoteSearchBlob(note, taskTitleById);
         return blob.includes(query);
       })
       .sort((a, b) => {
         if (mode === 'archived') {
           return Number(b.archivedAt || b.updatedAt || b.createdAt || 0) - Number(a.archivedAt || a.updatedAt || a.createdAt || 0);
         }
+        const favoriteDiff = Number(b.favoriteAt || 0) - Number(a.favoriteAt || 0);
+        if (favoriteDiff !== 0) return favoriteDiff;
         const pinDiff = Number(b.pinnedAt || 0) - Number(a.pinnedAt || 0);
         if (pinDiff !== 0) return pinDiff;
         return Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0);

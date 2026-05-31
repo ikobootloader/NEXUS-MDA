@@ -1,5 +1,828 @@
 # Changelog - TaskMDA Team
 
+## Correctif - Mai 2026 (warning Tailwind CDN local)
+
+- UI shell (`taskmda-team.html` + `vendor/tailwindcss.js`):
+  - suppression du warning console runtime Tailwind:
+    - `cdn.tailwindcss.com should not be used in production...`
+  - correction locale sans serveur/npm, sans impact fonctionnel sur le rendu existant.
+- Verification:
+  - warning Tailwind non affiche au chargement.
+
+## Mise a jour incrementale - Mai 2026 (Lot 5: mini probe collaboratif executable - passe 45)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - ajout d un mini protocole executable de verification sync:
+    - `runSharedQueueDebugProbe(durationMs)` (debug),
+    - exposition `window.runSharedQueueDebugProbe`.
+  - comportement:
+    - capture snapshot files avant/apres une fenetre d observation,
+    - calcule `deltaDropped`,
+    - produit un verdict synthétique (`ok`/`warn`) + report detaille.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 5: integrity guard debug files - passe 44)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - ajout d un controle d integrite leger en mode debug:
+    - `validateSharedQueueIntegrityInDebug()`.
+  - controles:
+    - tailles invalides/negatives des files et sets in-flight,
+    - warning si `isSharedWriteProcessing` actif avec file vide,
+    - warning si cardinalite `sharedWriteQueuedIds` < profondeur file principale.
+  - integration dans le reporter periodique (`startSharedQueueDebugReporter`).
+- Effet attendu:
+  - detection precoce d etats incoherents pendant les tests collaboratifs sans impact production.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 5: reset metrics + export debug - passe 43)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - ajout de `resetSharedQueueMetrics()` pour reinitialiser les compteurs queue au reconnect/deconnect dossier partage.
+  - ajout de `exportSharedQueueDebugSnapshot()` pour export compact de l etat agrege des 3 files en debug.
+  - exposition debug globale: `window.exportSharedQueueDebugSnapshot`.
+- Effet attendu:
+  - comparaison de sessions collaborative plus fiable (compteurs remis a zero par session) + extraction rapide des metriques.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 5: health guard debug queue - passe 42)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - ajout d un garde-fou sante des files collaboratives (mode debug uniquement):
+    - detection d augmentation rapide des `dropped` agregees (3 files),
+    - seuil: `SHARED_QUEUE_HEALTH_DROP_ALERT_THRESHOLD = 3`,
+    - cooldown anti-spam: `SHARED_QUEUE_HEALTH_ALERT_COOLDOWN_MS = 30000`.
+  - comportement:
+    - toast discret debug (`Debug sync: hausse des echecs queue (+N)`),
+    - log detaille `[sync-queue:health-alert]` avec snapshot agrege.
+- Effet attendu:
+  - detection rapide des degradations de synchronisation en tests collaboratifs, sans bruit excessif.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 5: rapport debug agrege des files - passe 41)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - ajout d un rapport debug periodique agrege pour les 3 files collaboratives:
+    - file evenements projet (`sharedWriteQueue`),
+    - file messages globaux,
+    - file workflow.
+  - cadence: `SHARED_QUEUE_DEBUG_REPORT_INTERVAL_MS = 15000` (15s).
+  - activation uniquement en mode debug (`taskmda_debug=1`) via:
+    - `startSharedQueueDebugReporter()` au demarrage polling,
+    - `stopSharedQueueDebugReporter()` a l arret polling.
+- Effet attendu:
+  - meilleure observabilite continue (debit, retries, drops, profondeur) pendant les tests collaboratifs.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 5: dedup in-flight workflow/messages - passe 40)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - ajout de deduplication in-flight pour les files auxiliaires:
+    - `globalMessageSharedQueuedIds` pour `globalMessageSharedDeleteQueue`,
+    - `workflowSharedQueuedChangeIds` pour `workflowSharedWriteQueue`.
+  - les enqueues ignorent desormais les doublons tant que le meme `messageId`/`changeId` est deja en attente.
+  - nettoyage des ids in-flight apres traitement (succes/echec) + reset explicite lors de connexion/deconnexion dossier partage.
+- Effet attendu:
+  - reduction de la contention I/O et des ecritures redondantes en mode collaboratif.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 5: files workflow/messages harmonisees - passe 39)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extension de la discipline queue/backoff/metriques aux files auxiliaires:
+    - `globalMessageSharedDeleteQueue`
+    - `workflowSharedWriteQueue`
+  - ajouts:
+    - retry borné + backoff homogène via:
+      - `writeGlobalMessageToSharedFolderWithRetry(...)`
+      - `writeWorkflowChangeToSharedFolderWithRetry(...)`
+    - métriques debug dédiées:
+      - `globalMessageSharedQueueMetrics`
+      - `workflowSharedQueueMetrics`
+    - logging debug unifié via `logAuxSharedQueueMetrics(...)`.
+- Effet attendu:
+  - meilleure robustesse aux erreurs d ecriture transitoires et observabilite homogène des files collaboratives.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 5: queue sync collaborative v1 - passe 38)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - optimisation de la file d ecriture collaborative `sharedWriteQueue`:
+    - priorisation des enqueues par type d evenement (`DELETE_*` > `UPDATE_*` > `CREATE_*`),
+    - backoff homogène centralisé avec jitter (`getSharedWriteBackoffDelayMs`),
+    - métriques debug de file (`sharedWriteMetrics`) + snapshots via `logSharedWriteMetrics(...)`.
+  - conservation du contrat fonctionnel existant (retry borne, fallback notification).
+- Effet attendu:
+  - meilleure stabilité de la synchronisation en charge et meilleure observabilité en mode debug.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: instrumentation perf renderGlobalTasks - passe 37)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - ajout d une instrumentation legere en mode debug sur le wrapper `renderGlobalTasksWithEmptyState()`:
+    - mesure de `renderGlobalTasksBase` via log `[perf] renderGlobalTasksBase(ms)= ...`
+    - meta `viewMode`.
+  - aucune incidence fonctionnelle hors mode debug (`taskmda_debug=1`).
+- Effet attendu:
+  - mesure objective des gains Lot 3 sur le rendu taches globales.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: instrumentation perf renderProjects - passe 36)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - ajout d une instrumentation legere en mode debug dans `renderProjects()`:
+    - timing global `[perf] renderProjects(ms)= ...`
+    - meta de contexte (`reason`, `totalProjects`, `pageItems`, `currentPage`, `viewMode`).
+  - aucune incidence fonctionnelle hors mode debug (`taskmda_debug=1`).
+- Effet attendu:
+  - mesure objective des gains Lot 3 sur les parcours liste projets.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: patch incremental suppression bulk projets - passe 35)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - ajout de `tryRemoveProjectCardsIncremental(projectIds)` pour supprimer localement plusieurs cartes projet visibles.
+  - integration dans `deleteSelectedProjectsBulk()`:
+    - collecte des `projectId` supprimes,
+    - tentative de patch DOM bulk,
+    - fallback unique `renderProjects()` si patch incomplet/non applicable.
+- Effet attendu:
+  - suppression en masse plus fluide sur la liste projets, avec rerender complet reserve aux cas necessaires.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: patch incremental suppression carte projet - passe 34)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - ajout de `tryRemoveProjectCardIncremental(projectId)` pour retirer localement une carte projet visible dans `#projects-container`.
+  - integration dans `deleteCurrentProject(...)` (flux dashboard): tentative de suppression DOM cible avant fallback `renderProjects()`.
+- Effet attendu:
+  - suppression projet plus fluide en vue liste, avec rerender complet seulement si le patch n est pas applicable.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: extension patch statut projet via edition - passe 33)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extension du patch incrementel carte projet au flux `saveProjectEdits()`.
+  - quand le statut projet change (incluant `termine` -> `en-cours`), tentative de patch DOM cible via `tryPatchProjectCardStatusIncremental(...)` avant fallback `renderProjects()`.
+- Effet attendu:
+  - transitions de statut plus fluides en vue liste, y compris les retours depuis `termine`.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: patch incremental carte projet statut - passe 32)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - ajout de helpers incrementaux carte projet:
+    - `getProjectStatusChipHtml(...)`
+    - `getProjectStatusProgressClass(...)`
+    - `tryPatchProjectCardStatusIncremental(projectId, nextStatus)`
+  - `markProjectCompleted(...)` tente desormais un patch DOM cible (badge statut, barre de progression, libelle, bouton `Realise`) avant fallback `renderProjects()`.
+- Effet attendu:
+  - mutation de statut projet plus fluide en vue liste, avec rerender complet seulement si patch impossible.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: extension gating sync/import projets - passe 31)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extension de `isProjectsListViewActive()` sur des rafraichissements post-sync/import:
+    - sync/chargement evenements
+    - connexion dossier partage
+    - bascule visibilite privee
+    - import JSON
+    - lecture dossiers projets
+  - `renderProjects()` est desormais execute uniquement si la liste projets est visible.
+- Effet attendu:
+  - reduction de rerenders projets non visibles apres operations de sync/import.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: extension gating renderProjects - passe 30)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extension de `isProjectsListViewActive()` sur plusieurs flux de mutation pour eviter des `renderProjects()` hors vue liste:
+    - notification nouvel evenement projet (`notifyNewEvent`)
+    - edition projet (`saveProjectEdits`)
+    - suppression projet (`deleteProject`)
+    - completion projet (`markProjectCompleted`)
+- Effet attendu:
+  - reduction de rerenders complets non visibles lors d operations en contexte detail/global.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: gating ciblé renderProjects - passe 29)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - ajout du helper `isProjectsListViewActive()`:
+    - `workspaceMode === 'dashboard'`
+    - ou `workspaceMode === 'project'` sans projet detail ouvert.
+  - application sur le flux `conversion tache -> projet` pour eviter `renderProjects()` quand la liste projets n est pas visible.
+- Effet attendu:
+  - reduction d un rerender complet inutile apres conversion depuis contextes non-liste.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: gating rerender taches globales - passe 28)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - ajout du helper `isGlobalTasksViewActive()`.
+  - remplacement de plusieurs conditions directes `workspaceMode/globalWorkspaceView` pour ne rerendre `renderGlobalTasks()` que si la vue `tasks` globale est active.
+  - application sur des parcours de mutation taches (archive/restaure/supprime/termine/deplacement), auto-archivage et rafraichissements UI.
+- Effet attendu:
+  - reduction des rerenders complets inutiles quand l utilisateur est sur une autre vue globale.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 6: nettoyage final flags bound editor/workflow - passe 27)
+
+- Editeur (`js/taskmda-editor.js`):
+  - `dataset.boundEditorAction` -> `dataset.editorActionBound`
+  - `dataset.boundDescriptionImageSelection` -> `dataset.editorDescriptionImageSelectionBound`
+  - `dataset.boundDescriptionImage` -> `dataset.editorDescriptionImageBound`
+- Workflow (`js/taskmda-workflow.js`):
+  - `dataset.boundWorkflowWikiHelper` remplace par des flags explicites par bouton:
+    - `dataset.workflowWikiSectionHelperBound`
+    - `dataset.workflowWikiLinkHelperBound`
+    - `dataset.workflowWikiPreviewHelperBound`
+  - `dataset.boundWorkflowProcedureEditor` -> `dataset.workflowProcedureEditorActionBound`
+- Verification:
+  - `node --check js/taskmda-editor.js` OK
+  - `node --check js/taskmda-workflow.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 6: guard partage doc preview clarifie - passe 26)
+
+- Documents preview (`js/taskmda-team.js`, `js/taskmda-doc.js`):
+  - conservation du guard partage `inlineDocPreviewBound` pour eviter les double-bindings entre orchestrateur et bundle doc.
+  - clarification par constante locale `DOC_PREVIEW_SHARED_BIND_FLAG` + commentaire d intention dans les deux fichiers.
+- Effet attendu:
+  - meilleure lisibilite du contrat inter-modules, sans changement de comportement.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+  - `node --check js/taskmda-doc.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 6: hygiene marker editor overlay - passe 25)
+
+- Module editeur (`js/taskmda-editor.js`):
+  - remplacement du marqueur generique `dataset.bound` sur l overlay image par `dataset.editorImageOverlayBound`.
+- Effet attendu:
+  - baisse du risque de collision de marquage et intention de binding plus explicite.
+- Verification:
+  - `node --check js/taskmda-editor.js` OK
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 6: hygiene flags toggles/select - passe 24)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - remplacement de marqueurs `dataset` semi-generiques par des noms explicites:
+    - `dataset.toggleBound` -> `dataset.multiSelectToggleBound`
+    - `dataset.toggleClickBound` -> `dataset.projectDocToggleClickBound`
+    - `dataset.changeBound` -> `dataset.projectDocTaskChangeBound`
+- Effet attendu:
+  - marqueurs de binding plus lisibles et moins sujets aux collisions inter-zones.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 6: hygiene guards dataset docs projet - passe 23)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - remplacement de `dataset.bound` par des flags explicites dans le selecteur de taches des documents projet:
+    - `dataset.projectDocSelectAllBound`
+    - `dataset.projectDocClearSelectionBound`
+    - `dataset.projectDocTaskOptionsBound`
+    - `dataset.projectDocTaskFilterBound`
+- Effet attendu:
+  - suppression des marqueurs generiques restants sur cette zone et reduction du risque de collision de bindings.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Correctif - Mai 2026 (notes globales: recursion cache)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - correction de `getAllGlobalNotesCached()` qui appelait par erreur `getAllGlobalNotesCached()` (recursion infinie).
+  - lecture source restauree vers `getAllDecrypted('globalNotes', 'noteId')`.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 6: hygiene guards dataset notes projet - passe 22)
+
+- Notes projet (`js/taskmda-team.js`):
+  - remplacement des flags dataset generiques/restants par des noms explicites:
+    - `dataset.boundThemeSync` -> `dataset.projectNoteThemeInputBound` / `dataset.projectNoteThemeKnownBound`
+    - `dataset.noteAutosaveBound` -> `dataset.projectNoteAutosaveBound`
+    - `dataset.noteDraftBound` -> `dataset.projectNoteDraftBound`
+- Effet attendu:
+  - reduction du risque de collisions de marquage entre modales et bindings heterogenes.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 6: harmonisation guards dataset notes globales - passe 21)
+
+- Notes globales (`js/taskmda-team.js`):
+  - remplacement de guards generiques `dataset.bound` par des flags explicites:
+    - `dataset.globalNoteTagsKnownBound`
+    - `dataset.globalNoteLinkedTaskBound`
+  - zone concernee: binding des listeners `tags connus` + `tache liee` dans l ouverture de la modale note globale.
+- Effet attendu:
+  - reduction du risque de collision de marquage entre bindings heterogenes.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 6: micro-factorisation scans DOM feed - passe 20)
+
+- Fil d info (`js/taskmda-global.js`):
+  - factorisation des scans DOM repetes des menus export feed dans un helper local:
+    - `forEachOpenGlobalFeedExportMenu(visitor)`
+  - reutilisation de ce helper dans:
+    - `toggleGlobalFeedExportMenu(...)`
+    - `handleGlobalFeedExportMenuDocumentClick(...)`
+- Effet attendu:
+  - suppression de duplication, maintenance plus simple, logique de fermeture centralisee.
+- Verification:
+  - `node --check js/taskmda-global.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 6: hygiene listeners global-messages - passe 19)
+
+- Module messages globaux (`js/taskmda-global.js`):
+  - ajout d une garde d idempotence dans `TaskMDAGlobalMessages.createModule(...).bindDom()`:
+    - `let bound = false`
+    - `if (bound) return; bound = true;`
+- Effet attendu:
+  - evite les double-bindings de listeners en cas de rebind involontaire.
+- Verification:
+  - `node --check js/taskmda-global.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: patch DOM feed creation - passe 18)
+
+- Fil d info (`js/taskmda-global.js`):
+  - `publishGlobalFeedPost(...)` (branche creation) tente desormais une insertion incrementale de la carte au lieu d un rerender complet direct.
+  - ajout du helper `tryInsertGlobalFeedPostIncremental(post)`:
+    - recalcul scope feed courant,
+    - generation de la carte du nouveau post,
+    - insertion DOM selon l ordre du scope filtre/tri (ancre suivante disponible, sinon append),
+    - support du cas liste vide (remplacement de l etat vide),
+    - mise a jour du resume feed (`renderGlobalFeedSummary`).
+  - fallback automatique conserve vers `actions.renderGlobalFeed()` si insertion impossible.
+- Verification:
+  - `node --check js/taskmda-global.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: patch DOM feed edition - passe 17)
+
+- Fil d info (`js/taskmda-global.js`):
+  - `publishGlobalFeedPost(...)` (branche edition) tente desormais un patch incremental de la carte editee avant fallback rerender complet.
+  - ajout du helper `tryPatchGlobalFeedPostEditIncremental(post)`:
+    - recalcul scope feed courant,
+    - regeneration de la carte cible uniquement (`buildGlobalFeedCardsHtml([post])`),
+    - remplacement DOM de la carte `#global-feed-post-*`,
+    - mise a jour du resume feed (`renderGlobalFeedSummary`).
+  - fallback automatique conserve vers `actions.renderGlobalFeed()` si patch impossible (carte absente, post filtre, etc.).
+- Verification:
+  - `node --check js/taskmda-global.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: patch DOM feed suppression - passe 16)
+
+- Fil d info (`js/taskmda-team.js`):
+  - ajout de `tryPatchGlobalFeedPostDeleteIncremental(postId)`:
+    - suppression locale de la carte `#global-feed-post-*` quand la vue feed est active,
+    - mise a jour du resume feed via runtime (`renderGlobalFeedSummary`) quand possible,
+    - fallback automatique sur `renderGlobalFeed()` complet si patch non applicable ou vue vide.
+  - `deleteGlobalFeedPost(...)` utilise maintenant ce patch incremental avant fallback complet.
+- Effet attendu:
+  - suppression plus fluide des posts visibles, moins de rerenders complets.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 4: read-model documents globaux - passe 15)
+
+- Documents globaux (`js/taskmda-team.js`):
+  - ajout d un read-model memoire court (`GLOBAL_DOCS_READ_MODEL_TTL_MS = 1200ms`) avec cache liste + index `byId`.
+  - ajout des helpers:
+    - `invalidateGlobalDocsReadModel()`
+    - `getAllGlobalDocsCached()`
+    - `getGlobalDocByIdCached(docId)`
+  - branchement des principaux consommateurs Notes/Feed/Read-modal vers `getAllGlobalDocsCached()`.
+  - invalidation explicite ajoutee sur ecritures/suppressions `globalDocs` dans les parcours edition/liaison/docs.
+  - invalidation defensive apres `deleteGlobalDocument(...)` et `addStandaloneDocuments(...)`.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 4: read-model notes globales - passe 14)
+
+- Notes globales (`js/taskmda-team.js`):
+  - ajout d un read-model memoire court (`GLOBAL_NOTES_READ_MODEL_TTL_MS = 1200ms`) avec cache liste + index `byId`.
+  - ajout des wrappers centralises:
+    - `getAllGlobalNotesCached()`
+    - `getGlobalNoteByIdCached(noteId)`
+    - `putGlobalNoteCached(note)` (avec invalidation)
+    - `deleteGlobalNoteByIdCached(noteId)` (avec invalidation)
+  - branchement des parcours notes (edition/suppression/migration + actions runtime modules) vers ces wrappers.
+- Effet attendu:
+  - diminution des lectures IndexedDB redondantes dans les cycles UI notes.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 4: read-model feed global - passe 13)
+
+- Fil d info (`js/taskmda-team.js`):
+  - ajout d un read-model memoire court pour le scope de rendu feed (`GLOBAL_FEED_READ_MODEL_TTL_MS = 1200ms`).
+  - `renderGlobalFeed()` reutilise `getGlobalFeedRenderScopeCached(...)` au lieu de relire systematiquement le scope.
+  - invalidation explicite du cache sur ecritures `globalPosts` (creation, mise a jour, suppression logique, sync dossier partage) et sur la passerelle runtime `putGlobalPost`.
+- Effet attendu:
+  - reduction des lectures redondantes IndexedDB lors des interactions feed rapprochées.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: harmonisation rerender feed - passe 12)
+
+- Fil d info (`js/taskmda-team.js`):
+  - ajout du helper `isGlobalFeedViewActive()` (source unique de verite).
+  - remplacement des conditions repetees `workspaceMode/globalWorkspaceView` sur les rerenders `renderGlobalFeed()` post-mutation/sync.
+  - harmonisation de deux injections runtime `isGlobalFeedView` pour reutiliser le helper.
+- Effet attendu:
+  - moins de duplication conditionnelle, maintenance plus simple, risque de divergence reduit.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Correctif - Mai 2026 (messages projet: allMessages undefined)
+
+- Correction dans `js/taskmda-team.js`:
+  - suppression d un bloc residuel hors fonction qui referencait `allMessages` sans declaration, provoquant `Uncaught ReferenceError`.
+  - reintegration du controle de coherences `projectReactionPickerMessageId` au debut de `renderMessages(messages)`.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: rendu incremental fil d info global - passe 11)
+
+- Fil d info global (`js/taskmda-team.js`):
+  - `deleteGlobalFeedPost(...)` n impose plus un rerender complet hors vue active `Feed`.
+  - rendu conserve a l identique quand la vue `Feed` est visible.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: rendu incremental notes globales - passe 10)
+
+- Notes globales (`js/taskmda-global.js`):
+  - ajout de `isGlobalNotesViewActive()` et `rerenderGlobalNotesViewIfActive()`.
+  - les mutations `favori`, `publication fil` et `suppression multiple` evitent desormais le rerender complet quand la rubrique `Notes` globale n est pas visible.
+  - comportement conserve quand la vue Notes est active (rerender normal).
+- Verification:
+  - `node --check js/taskmda-global.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 2: audit code mort post-refactor - passe 9)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - suppression de fonctions orphelines non referencees apres verification:
+    - `escapeOdsWhereValue`
+    - `isProjectResourceLockedByOther`
+    - `refreshGlobalMessageHiddenPeersForCurrentUser`
+    - `renderMessagesLegacy`
+    - `triggerWorkspaceRevealAnimation`
+  - correction de structure locale suite a suppression (retrait d un bloc residuel legacy dans la zone messages).
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Lot 2: centralisation utilitaires purs - passe 8)
+
+- Orchestrateur:
+  - suppression de `getSubtaskProgress` devenu orphelin dans `js/taskmda-team.js` (logique sous-taches deja deleguee au module `js/taskmda-tasks.js`).
+- Effet attendu:
+  - reduction d entropie (code mort retire) apres harmonisation sous-taches.
+
+## Mise a jour incrementale - Mai 2026 (Lot 2: centralisation utilitaires purs - passe 7)
+
+- Orchestrateur:
+  - simplification des helpers sous-taches dans `js/taskmda-team.js` (`parseSubtasks`, `getSubtaskProgress`, `buildSubtaskProgressHtml`, `mergeSubtasksWithExisting`) vers des delegations directes `TaskMDATasks`.
+  - suppression des fallbacks metier locaux dupliques; fallback minimal de surete conserve.
+- Effet attendu:
+  - reduction nette du code duplique entre orchestrateur et module `js/taskmda-tasks.js`.
+  - maintenance concentree dans le module taches.
+
+## Mise a jour incrementale - Mai 2026 (Lot 2: centralisation utilitaires purs - passe 6)
+
+- Module taches (`js/taskmda-tasks.js`):
+  - `formatExportDateTag` delegue desormais prioritairement a `TaskMDACoreUtils.formatExportDateTag`.
+  - adaptation de format conservee (`_` -> `-`) pour garder la nomenclature de fichier historique cote export taches.
+  - fallback local conserve si core-utils indisponible.
+- Effet attendu:
+  - reduction de duplication de logique de tag date d export.
+  - convergence progressive des utilitaires d export.
+
+## Mise a jour incrementale - Mai 2026 (Lot 2: centralisation utilitaires purs - passe 5)
+
+- Core utils:
+  - ajout de `formatDateTime(dateValue, emptyLabel)` dans `js/taskmda-core-utils.js`.
+- Modules:
+  - `js/taskmda-project.js`: `formatDateTime` delegue a `TaskMDACoreUtils.formatDateTime(..., '-')`.
+  - `js/taskmda-file-watcher.js`: `formatDate` delegue a `TaskMDACoreUtils.formatDateTime(..., 'Jamais')`.
+- Effet attendu:
+  - alignement du formatage date/heure entre modules avec etiquette vide parametrable.
+  - reduction de duplication locale.
+
+## Mise a jour incrementale - Mai 2026 (Lot 2: centralisation utilitaires purs - passe 4)
+
+- Projet notes (`js/taskmda-project.js`):
+  - harmonisation des wrappers `escapeHtml` et `normalizeSearch` avec references `TaskMDACoreUtils` resolues une seule fois au chargement du module.
+  - fallback local conserve (comportement stable) si `TaskMDACoreUtils` indisponible.
+- Effet attendu:
+  - reduction du bruit repetitif dans les helpers projet-notes.
+  - alignement style delegation core avec les autres modules.
+
+## Mise a jour incrementale - Mai 2026 (Lot 2: centralisation utilitaires purs - passe 3)
+
+- Core utils:
+  - ajout de `formatDate(dateValue)` dans `js/taskmda-core-utils.js`.
+- Orchestrateur:
+  - `js/taskmda-team.js` delegue `formatDate` a `TaskMDACoreUtils`.
+- Effet attendu:
+  - alignement du formatage de date sur un utilitaire unique.
+  - baisse de duplication locale dans l orchestrateur.
+
+## Mise a jour incrementale - Mai 2026 (Lot 2: centralisation utilitaires purs - passe 2)
+
+- Modules:
+  - `js/taskmda-file-watcher.js`: `escapeHtml` et `formatFileSize` deleguent desormais prioritairement a `TaskMDACoreUtils` (fallback local conserve).
+  - `js/taskmda-notes-shared.js`: `escapeHtml` delegue desormais prioritairement a `TaskMDACoreUtils` (fallback local conserve).
+- Effet attendu:
+  - reduction des duplications de helpers transverses.
+  - comportements alignes entre modules UI.
+
+## Mise a jour incrementale - Mai 2026 (Lot 2: centralisation utilitaires purs - passe 1)
+
+- Core utils:
+  - ajout de `sharingModeBadge`, `matchesQuery`, `sanitizeFilenameSegment` dans `js/taskmda-core-utils.js`.
+- Orchestrateur:
+  - `js/taskmda-team.js` delegue maintenant ces fonctions a `TaskMDACoreUtils` (suppression de logique locale dupliquee).
+- Effet attendu:
+  - reduction des duplications structurelles et du risque d incoherence entre vues.
+
+## Mise a jour incrementale - Mai 2026 (Lot 1: cloture extraction rendu digest)
+
+- Orchestrateur:
+  - extraction des derniers blocs digest restants (`split email body/signature`, `buildDigestContentHtml`, sanitation fragment) vers `js/taskmda-feed-digest-content.js`.
+  - `js/taskmda-team.js` conserve des delegations minces via `feedDigestContentRuntime`.
+  - ajout du script `taskmda-feed-digest-content.js` dans `taskmda-team.html` avant l orchestrateur.
+- Effet attendu:
+  - cloture du gisement digest du Lot 1 (UI + editor + MIME + PDF + content).
+  - reduction supplementaire de la taille et du couplage de `js/taskmda-team.js`.
+
+## Mise a jour incrementale - Mai 2026 (Lot 1: extraction loader pdf2md)
+
+- Orchestrateur:
+  - deplacement de `ensurePdf2MdModule` et de la logique `extractPdfMarkdownWithCdn` vers `js/taskmda-feed-digest-pdf.js`.
+  - `js/taskmda-team.js` conserve une delegation mince de `extractPdfMarkdownWithCdn` via `feedDigestPdfRuntime`.
+- Effet attendu:
+  - amincissement supplementaire du bloc digest dans l orchestrateur.
+  - centralisation complete des concerns PDF digest dans un module unique.
+
+## Mise a jour incrementale - Mai 2026 (Lot 1: extraction digest PDF/render helpers)
+
+- Orchestrateur:
+  - extraction des helpers de structuration/rendu digest PDF vers `js/taskmda-feed-digest-pdf.js` (`buildPdfStructuredPage`, liens de page, trim compact, rendu markdown).
+  - `js/taskmda-team.js` conserve des delegations minces via `feedDigestPdfRuntime`.
+  - ajout du script `taskmda-feed-digest-pdf.js` dans `taskmda-team.html` avant l orchestrateur.
+- Effet attendu:
+  - nouvelle reduction du volume du bloc digest dans le fichier central.
+  - meilleure maintenabilite des regles de rendu PDF dans un module dedie.
+
+## Mise a jour incrementale - Mai 2026 (Lot 1: extraction digest MIME/email)
+
+- Orchestrateur:
+  - extraction du parsing MIME/email (`parseEmlDigest`, fallback `msg`, pont `postal-mime`) vers `js/taskmda-feed-digest-mime.js`.
+  - `js/taskmda-team.js` conserve des delegations minces via `feedDigestMimeRuntime`.
+  - suppression dans l orchestrateur des fonctions MIME devenues obsoletes (`postal-mime` loader + normalisation en-tetes email associee).
+  - ajout du script `taskmda-feed-digest-mime.js` dans `taskmda-team.html` avant l orchestrateur.
+- Effet attendu:
+  - reduction nette du bloc digest dans le fichier central.
+  - maintenance facilitee du parsing email dans un module metier dedie.
+
+## Mise a jour incrementale - Mai 2026 (Lot 1: extraction digest editor)
+
+- Orchestrateur:
+  - extraction de `appendDigestBlocksToRichEditor` et `importProjectNoteDigestFromFiles` vers `js/taskmda-feed-digest-editor.js`.
+  - `js/taskmda-team.js` conserve des wrappers de delegation minces via `feedDigestEditorRuntime`.
+  - ajout du script `taskmda-feed-digest-editor.js` dans `taskmda-team.html` avant l orchestrateur.
+- Effet attendu:
+  - baisse supplementaire de la taille et du couplage du fichier central.
+  - logique d import digest des editeurs centralisee dans un module metier/UI dedie.
+
+## Mise a jour incrementale - Mai 2026 (Lot 1: extraction UI digest fil d info)
+
+- Orchestrateur:
+  - extraction des helpers UI digest (`normalizeGlobalFeedDigestView`, `pickGlobalFeedDigestImportMode`, `summarizeDigestText`) vers `js/taskmda-feed-digest-ui.js`.
+  - `js/taskmda-team.js` conserve des delegations runtime minces via `feedDigestUiRuntime`.
+  - ajout du script `taskmda-feed-digest-ui.js` dans `taskmda-team.html` avant l orchestrateur.
+- Effet attendu:
+  - reduction du bruit metier/UI digest dans le fichier central.
+  - point unique de maintenance pour le comportement compact/complet des imports digest.
+
+## Mise a jour incrementale - Mai 2026 (Lot 1: extraction utilitaires refs docs inline)
+
+- Orchestrateur:
+  - extraction des helpers docs inline (`buildInlineAttachedDocumentHtml`, `extractLinkedGlobalDocIdsFromHtml`, `stripInlineAttachedDocumentBlocksFromHtml`) vers un module dedie `js/taskmda-global-doc-ref-utils.js`.
+  - `js/taskmda-team.js` conserve des delegations minces via `globalDocRefUtilsRuntime`.
+  - ajout du script `taskmda-global-doc-ref-utils.js` dans `taskmda-team.html` avant l orchestrateur.
+- Effet attendu:
+  - reduction du volume et du couplage dans `js/taskmda-team.js`.
+  - regroupement metier plus lisible pour la gestion des references documents inline.
+
+## Mise a jour incrementale - Mai 2026 (Lot 1: global feed wrappers + fiabilisation scope)
+
+- Global feed (orchestrateur):
+  - suppression du wrapper one-liner local `publishGlobalFeedDigestFromFiles`; delegation inline dans le binding `TaskMDACommsUI`.
+  - suppression du wrapper mort `resolveLinkedDocsForFeedPost` dans `js/taskmda-team.js`.
+  - ajout de fonctions nommees locales `openGlobalFeedReference` et `openGlobalFeedPost`, puis exposition `window.*` associee.
+  - harmonisation de `openGlobalFeedPostReadModal` et `openGlobalHubAggregatedNoteRead` en fonctions nommees locales avec exposition `window.*`.
+  - factorisation des assignations `window.*` pass-through vers runtimes (`global-notes`, `global-feed`, `project-read-actions-ui`, `global-calendar`, `global-docs`) via helper unique `exposeRuntimeActionsToWindow(...)`.
+  - objectif: reduire le bruit orchestrateur et fiabiliser les injections cross-modules (scope lexical explicite).
+
+## Mise a jour incrementale - Mai 2026 (Lot 2: harmonisation utilitaire recherche)
+
+- Projet notes (`js/taskmda-project.js`):
+  - harmonisation de `normalizeSearch` avec `TaskMDACoreUtils.normalizeSearch` (delegation prioritaire + fallback local).
+  - comportement conserve (`trim` final) pour eviter toute regression de filtrage.
+  - harmonisation de `escapeHtml` avec `TaskMDACoreUtils.escapeHtml` (delegation prioritaire + fallback local).
+  - micro-factorisation de `buildUnifiedCardHtml`: suppression de normalisations repetitives de `noteId` via variable locale unique `noteIdRaw`.
+  - micro-factorisation de `defaultProjectActionsRenderer`: normalisation `noteIdRaw` centralisee avant echappement HTML.
+  - micro-factorisation de `buildUnifiedCardHtml`: centralisation de `createdByRaw` pour eviter la repetition de conversions lors de la resolution auteur.
+  - micro-factorisation de `buildUnifiedCardHtml`: pre-normalisation de `linkedTaskIds` (`linkedTaskIdsNormalized`) pour simplifier la resolution des labels de taches liees.
+  - micro-factorisation de `buildUnifiedCardHtml`: extraction de `authorLabel` et `createdAtLabel` pour simplifier le template de carte.
+  - micro-factorisation de `renderUnifiedNotesList`: extraction du blob de recherche dans `buildNoteSearchBlob(...)` pour reduire la duplication de logique de filtrage.
+
+## Mise a jour incrementale - Mai 2026 (Lot 3: rendu incrementel notes projet - phase 1)
+
+- Notes projet (`js/taskmda-team.js`):
+  - ajout du helper `rerenderProjectNotesViewIfActive(...)`.
+  - les mutations `pin/feed/archive/restore/delete` n imposent plus de rerender complet si la vue active n est pas `notes`.
+  - le rendu reste coherent: l entree dans l onglet `notes` declenche deja `renderProjectNotes(...)`.
+  - objectif: reduire les rerenders inutiles et ameliorer la fluidite hors vue Notes.
+  - phase 2: patch incrementel carte unique sur `toggleProjectNoteFeedPublish` via `tryPatchProjectNoteCardIncremental(...)` quand les filtres n impactent pas presence/ordre (sinon fallback rerender complet).
+  - phase 3: `renderProjectNotes(...)` differe le rendu complet hors onglet `notes` (conserve la mise a jour des options de liaison taches), pour reduire les recalculs inutiles.
+  - phase 4: consolidation de garde via helper `isProjectNotesViewActive()` reutilise par `renderProjectNotes`, `rerenderProjectNotesViewIfActive` et la strategie incrementale.
+  - phase 5: factorisation de la preparation des maps de rendu notes dans `buildProjectNotesRenderContext(...)` (reuse rendu complet + patch incremental carte).
+  - phase 6: micro-optimisation `renderProjectNotes(...)`: construction du contexte de rendu retardee apres verification de disponibilite du renderer Notes.
+  - phase 7: `tryPatchProjectNoteCardIncremental(...)` reutilise le contexte de la vue filtree (`visibleNotes`) pour eviter un recalcul partiel divergent.
+  - phase 8: extraction d un helper commun `filterVisibleProjectNotes(...)` pour unifier le filtrage thematique entre rendu complet et patch incremental.
+  - phase 9: suppression d une lecture redondante des notes dans `tryPatchProjectNoteCardIncremental(...)` (source unique `notesAll` pour la recherche note + filtrage visible).
+
+## Mise a jour incrementale - Mai 2026 (Revue code: suppression doublon critique)
+
+- Orchestrateur:
+  - suppression d une definition dupliquee de `discoverAndLoadExistingProjects` dans `js/taskmda-team.js`.
+  - suppression d une definition dupliquee de `renderProjectGroups` dans `js/taskmda-team.js`.
+  - conservation de la version robuste (stats de chargement, gestion legacy shared-key, rattachement de cle, reconstruction locale).
+  - conservation de la version `renderProjectGroups` la plus complete (membres, selection, edition groupe).
+  - objectif: eliminer un risque d entropie et de divergence fonctionnelle silencieuse.
+
+## Mise a jour incrementale - Mai 2026 (Lot 1: orchestrateur aminci)
+
+- Groupes projet:
+  - extraction du rendu `renderProjectGroups` vers `js/taskmda-project-members-domain.js`.
+  - `js/taskmda-team.js` conserve un wrapper de delegation mince vers `projectMembersDomainRuntime`.
+  - injection explicite des dependances de rendu (membres resolus, echappement HTML, fallback annuaire) dans le module domaine.
+- Groupes utilisateurs projet:
+  - extraction du rendu `renderProjectUserGroups` vers `js/taskmda-project-members-domain.js`.
+  - `js/taskmda-team.js` conserve un wrapper de delegation mince vers `projectMembersDomainRuntime`.
+- Invitations projet:
+  - extraction du rendu `renderProjectInvitations` vers `js/taskmda-project-members-domain.js`.
+  - `js/taskmda-team.js` conserve un wrapper de delegation mince vers `projectMembersDomainRuntime`.
+- Membres projet:
+  - extraction du rendu `renderProjectMembers` vers `js/taskmda-project-members-domain.js`.
+  - `js/taskmda-team.js` conserve un wrapper de delegation mince vers `projectMembersDomainRuntime`.
+- Thematiques projet:
+  - extraction du rendu `renderProjectThemes` vers `js/taskmda-project-members-domain.js`.
+  - `js/taskmda-team.js` conserve un wrapper de delegation mince vers `projectMembersDomainRuntime`.
+- Matrice des droits projet:
+  - extraction du rendu `renderProjectPermissionMatrix` vers `js/taskmda-project-members-domain.js`.
+  - conservation de l etat `projectPermissionDetailsOpen` dans l orchestrateur, injecte en lecture au module domaine.
+  - `js/taskmda-team.js` conserve un wrapper de delegation mince vers `projectMembersDomainRuntime`.
+  - extraction de l action `toggleProjectPermissionDetails` vers le module domaine, avec listener orchestrateur deleguant prioritairement au runtime.
+- Selecteurs de roles projet:
+  - extraction du rendu `renderProjectRoleSelectors` vers `js/taskmda-project-members-domain.js`.
+  - `js/taskmda-team.js` conserve un wrapper de delegation mince vers `projectMembersDomainRuntime`.
+- Attribution des roles projet:
+  - extraction de `getAssignableProjectRolesForUser` vers `js/taskmda-project-members-domain.js`.
+  - `js/taskmda-team.js` supprime sa version locale et injecte `getProjectRoleCatalog` + `normalizeProjectRoleBase` au module domaine.
+- Autocompletion annuaire des membres:
+  - extraction de `renderMemberDirectoryAutocomplete` vers `js/taskmda-project-members-domain.js`.
+  - `js/taskmda-team.js` conserve un wrapper de delegation mince vers `projectMembersDomainRuntime`.
+- Binds DOM collaboration projet:
+  - extraction des listeners `membres/invitations/groupes/thematiques/permissions` vers `bindDom()` dans `js/taskmda-project-members-domain.js`.
+  - simplification de `js/taskmda-team.js` avec un appel unique `projectMembersDomainRuntime.bindDom()`.
+  - extraction des listeners d onglets `settings` projet (`overview/members/collab/themes/permissions/structure`) vers `bindDom()` du module domaine.
+  - extraction de `setProjectSettingsTab` vers `js/taskmda-project-members-domain.js` (validation onglet + application vue via dependances injectees).
+  - `js/taskmda-team.js` conserve un wrapper de delegation avec fallback local.
+  - reduction des wrappers pass-through restants (`removeProjectMember`, `selectUserGroup`, `deleteUserGroup`) en assignations globales directes vers le runtime.
+  - suppression du bloc de wrappers pass-through `invitations/groupes/thematiques` dans `js/taskmda-team.js`; remplacement par appels runtime directs + exposition `window.*` minimale pour les handlers `onclick`.
+  - nettoyage mecanique de doublons consecutifs `refreshLinkedPendingSummaries()` dans `js/taskmda-team.js` (notes/projets/global), sans changement fonctionnel attendu.
+  - suppression d un doublon d appel `populateProjectDeadlineForm('project', null)` dans `openNewProjectModal` (`js/taskmda-team.js`).
+  - suppression des derniers wrappers de rendu collaboration dans `js/taskmda-team.js` (`renderProjectRoleSelectors`, `renderProjectMembers`, `renderProjectUserGroups`, `renderProjectPermissionMatrix`) au profit d appels runtime directs.
+  - correctif de compatibilite handlers inline: exposition globale `window.deleteProjectGroup` restauree pour les actions `onclick` rendues par le module domaine.
+  - factorisation du rendu collaboration projet dans `renderProjectCollaborationPanels(...)` (`js/taskmda-team.js`) pour supprimer les blocs de delegation repetes.
+- Global notes/feed (orchestrateur):
+  - suppression de wrappers one-liner morts (non utilises) pour les actions bulk notes globales (`setGlobalNotesPage` local, bulk selection/delete helpers, favorite helper, ouverture modal export).
+  - conservation des points d entree globaux actifs via `window.*` relies directement au runtime.
+  - suppression du wrapper local `closeGlobalNotesBulkExportModal` et bascule vers appels runtime directs.
+  - suppression des wrappers locaux `openGlobalFeedReference` / `openGlobalFeedPost`; remplacement par appels runtime directs (locaux + `window.*`).
+  - suppression de wrappers feed non utilises (`refreshGlobalFeedFilterButtons`, `renderGlobalFeedSummary`) et inline de `publishGlobalFeedPost` dans `TaskMDACommsUI.bind`.
+  - suppression du wrapper local `openGlobalFeedPostReadModal`; exposition `window.*` directement branchee sur le runtime.
+  - suppression de wrappers notes/federation non utilises (`buildGlobalNoteCardHtml`, `buildGlobalHubProjectNoteRef`, `parseGlobalHubProjectNoteRef`, `openGlobalHubAggregatedNoteRead` local), avec exposition `window.*` directe runtime conservee pour l ouverture agregée.
+
+## Mise a jour incrementale - Mai 2026 (Refactor Editor module boundary)
+
+- Editeur projet:
+  - encapsulation de `js/taskmda-editor.js` dans une IIFE stricte `initTaskMDAEditorModule(global)` pour aligner le pattern module du projet.
+  - suppression du monkey-patching direct de `applyProjectDescriptionEditorAction`; remplacement par une fonction explicite `applyProjectDescriptionEditorActionEnhanced`.
+  - exposition d une API module `window.TaskMDAEditor` (`insertHtmlAtCursor`, `ensureProjectDescriptionQuillEditor`, `initProjectDescriptionEditors`, actions editor) avec alias globaux de compatibilite pour ne pas casser l orchestrateur existant.
+  - conservation du comportement `emoji` via appel explicite a la version enhanced dans les binds toolbar.
+  - correction interop digest: dans `appendDigestBlocksToEditorById` (`js/taskmda-team.js`), appel explicite de `window.TaskMDAEditor.insertHtmlAtCursor` pour eviter le conflit de signature avec le helper local `insertHtmlAtCursor(editable, html)`.
+  - extraction de l interop digest-editeur vers `js/taskmda-editor-interop.js` (`TaskMDAEditorInterop.createModule`) avec delegation runtime depuis `js/taskmda-team.js`.
+  - chargement du module `taskmda-editor-interop.js` dans `taskmda-team.html` avant `taskmda-team.js`.
+  - extraction de `requestDigestImportForEditor` vers `TaskMDAEditorInterop` (picker fichiers + extraction digest + insertion + post-traitements), avec wrapper de delegation dans `js/taskmda-team.js`.
+  - suppression des fallbacks dupliques dans `js/taskmda-team.js` pour `appendDigestBlocksToEditorById` et `requestDigestImportForEditor`: wrappers runtime purs, logique conservee uniquement dans `TaskMDAEditorInterop`.
+  - simplification de wrappers `globalFeedRuntime` dans `js/taskmda-team.js` (`publishGlobalFeedDigestFromFiles`, `resolveLinkedDocsForFeedPost`, `publish/open/reference`, `refresh/render summary`) avec appels optionnels directs pour reduire le bruit orchestration.
+  - `renderGlobalFeed` (`js/taskmda-team.js`) bascule en orchestration pure: suppression de la branche fallback locale (filtrage/tri/rendu scope) et delegation complete a `TaskMDAGlobalFeed.prepareGlobalFeedRenderScope` + `buildGlobalFeedCardsHtml`, avec garde explicite "module indisponible".
+  - `renderGlobalNotes` bascule egalement en orchestration pure: extraction du scope/rendu vers `TaskMDAGlobalNotes.renderGlobalNotes` (`js/taskmda-global.js`) et conservation dans `js/taskmda-team.js` du pre-hook migration + layout seulement.
+  - enrichissement de l etat injecte a `TaskMDAGlobalNotes` (getters `search/scope/origin/sort/theme`) et injection de `renderGlobalNotesThemeTabs` pour une orchestration Notes complete cote module.
+  - harmonisation de wrappers orchestrateur `TaskMDAAppInit` dans `js/taskmda-team.js` (`initApp`, `handleSelectFolder`, `handleContinueWithoutFolder`, `handleLogout`) vers des delegations compactes avec fallback d erreur identique.
+  - simplification des wrappers `discussionInputUiRuntime` dans `js/taskmda-team.js` (`insertTextAtCursor`, `setDiscussionInputPlaceholder`, `getDiscussionInputPlainText`, `getDiscussionInputHtml`, `clearDiscussionInput`) avec delegation prioritaire module et fallback minimal.
+  - simplification des wrappers `attachmentsUiRuntime` dans `js/taskmda-team.js` (`readMessageFiles`, `renameFileExtension`, `optimizeMessageAttachment`, `buildInlineMessageImageHtml`, `insertImageFilesIntoDiscussionInput`) avec delegations compactes et fallback conserve.
+  - simplification du lot wrappers `docStorageBindingRuntime` a fallback trivial dans `js/taskmda-team.js` (`resetDocumentPreviewInlineEditingState`, `canUseSharedFilesystemDocumentStorage`, `resolve/hydrateDocumentDataForRuntime`, `inferStorage*FromPath`, `maybeRelocateStoredDocumentByTheme`) avec delegations compactes.
+  - harmonisation des wrappers `docPreviewInlineUiRuntime` dans `js/taskmda-team.js` (`normalize/getFieldValue`, `mergeContextDoc`, `refreshInlineDisplay`, `start/init inline edit`) en style delegation compacte, sans changement de logique fallback.
+  - harmonisation d un lot `taskLifecycleDomainRuntime` dans `js/taskmda-team.js` (`close/open task convert modal`, `open task create modal with status`, `openTaskModal`, `archive/toggleSubtask/removeAttachment`) en delegations compactes.
+  - harmonisation d un lot `projectMembersDomainRuntime` dans `js/taskmda-team.js` (invitations, groupes projet, themes projet, membres projet, groupes utilisateurs) en delegations compactes.
+  - harmonisation d un lot `shellUiRuntime` / `viaAnnuaireUiRuntime` dans `js/taskmda-team.js` (delegations compactes avec fallback UI conserve quand necessaire).
+  - harmonisation du lot preview modal (`docPreviewModalUiRuntime` / `docStorageBindingRuntime`) dans `js/taskmda-team.js` avec delegations compactes sur `resolve/open/close` preview et fallback modal conserve.
+  - harmonisation d un lot `globalDocsRuntime` / `docStorageBindingRuntime` dans `js/taskmda-team.js` (upload modal, preview/download by ref, binding modal/read mode/actions, readDocumentFilesFromInput) en delegations compactes avec fallbacks conserves.
+  - harmonisation complementaire `taskLifecycleDomainRuntime` / `docStorageBindingRuntime` / `appInitRuntime` / `viaAnnuaireUiRuntime` dans `js/taskmda-team.js` (wrappers et handlers evenements compactes, comportement conserve).
+  - harmonisation finale des wrappers restants `globalNotesRuntime` / `editorInteropRuntime` dans `js/taskmda-team.js` (delegations compactes, comportement conserve).
+  - passe finale de ce cycle: reduction supplementaire des wrappers runtime (app init, message group channel, storage path display) et baisse du compteur `if (runtime?....)` de 46 a 40.
+  - factorisation de la fermeture modale tache (escape + backdrop) via helper unique `closeTaskModalAndResetWithFallback`, reduction de duplication et compteur wrappers runtime a 39.
+  - passe de compactage supplementaire: remplacement de checks runtime inline par delegations via references locales (global docs/feed/preview + calendar/notes render bridges), compteur `if (runtime?....)` reduit de 39 a 23.
+  - passe de balayage final des wrappers: conversion massive en delegations via references locales (`shell`, `annuaire`, `preview inline/modal`, `attachments`, `discussion input`), compteur `if (runtime?....)` reduit de 23 a 3.
+
+## Mise a jour incrementale - Mai 2026 (Refactor Global Notes: selection multiple deleguee au module)
+
+- Orchestrateur / Notes globales:
+  - extraction de la logique de selection multiple des notes globales hors `js/taskmda-team.js` vers le module `TaskMDAGlobalNotes` dans `js/taskmda-global.js`.
+  - deplacement des comportements `toggle/select all/delete` de la selection bulk et de la mise a jour UI associee dans le module domaine.
+  - deplacement des actions `favori` et `publication/retrait fil` (`toggleGlobalNoteFavorite`, `toggleGlobalNoteFeedPublish`) dans le module domaine.
+  - deplacement des exports de note globale (`exportGlobalNote`, `exportGlobalNoteAsPdf`, `exportGlobalNoteAsDocx`) dans le module domaine.
+  - deplacement de la gestion du menu export note (`toggleGlobalNoteExportMenu`, `closeGlobalNoteExportMenu`) dans le module domaine.
+  - deplacement de la fermeture au clic exterieur des menus export de notes (`handleGlobalNotesExportMenuDocumentClick`) dans le module domaine.
+  - deplacement de l export multiple des notes selectionnees (`exportSelectedGlobalNotesAsZip`) dans le module domaine, incluant les formats HTML/TXT/PDF/DOCX.
+  - deplacement du helper PDF notes (`generatePdfBlobForNote`) dans le module domaine, avec wrapper de compatibilite dans l orchestrateur.
+  - deplacement des exports du fil d information (`exportGlobalFeedPost`, `exportGlobalFeedPostAsPdf`, `exportGlobalFeedPostAsDocx`) dans le module domaine `TaskMDAGlobalFeed`.
+  - deplacement de la gestion du menu export du fil (`toggleGlobalFeedExportMenu`, `closeGlobalFeedExportMenu`) et de sa fermeture au clic exterieur (`handleGlobalFeedExportMenuDocumentClick`) dans le module domaine.
+  - suppression des wrappers feed redondants dans `js/taskmda-team.js`; exposition `window.*` des actions export feed directement depuis `globalFeedRuntime` (pattern aligne avec `globalNotesRuntime`).
+  - extension de `TaskMDAProjectReadActionsUI` (`js/taskmda-project.js`) pour exposer `exportProjectNote`, `toggleProjectNoteExportMenu`, `closeProjectNoteExportMenu`.
+  - alignement orchestrateur: exposition `window.*` des actions export note projet via `projectReadActionsUiRuntime` (suppression des affectations globales en dur pre-runtime).
+  - deplacement complet du corps metier export note projet (HTML/TXT/PDF/DOCX) dans `TaskMDAProjectReadActionsUI` avec injections explicites; suppression du bloc volumineux equivalent dans `js/taskmda-team.js` et retrait du chemin transitoire `exportProjectNoteRaw`.
+  - deplacement de `openGlobalFeedPostReadModal` vers `TaskMDAGlobalFeed` (lecture detail post + refs/documents lies + binder actions inline), avec delegation runtime dans `js/taskmda-team.js`.
+  - deplacement de `buildGlobalNoteCardHtml` vers `TaskMDAGlobalNotes` (rendu carte notes globales, badges, docs lies, actions inline), avec wrapper de delegation dans `js/taskmda-team.js`.
+  - deplacement de `buildGlobalHubProjectNoteRef`, `parseGlobalHubProjectNoteRef` et `openGlobalHubAggregatedNoteRead` vers `TaskMDAGlobalNotes`, avec wrappers de delegation dans l orchestrateur.
+  - extraction de l agregation des notes globales + notes projet proprietaire (`collectGlobalNotesAggregationContext`) dans `TaskMDAGlobalNotes`, avec consommation directe depuis `renderGlobalNotes`.
+  - extraction du bloc de filtrage/tri de `renderGlobalNotes` vers `TaskMDAGlobalNotes.filterAndSortGlobalNotes` (filtres origine/visibilite/theme/recherche + tris recent/oldest/favorites/alpha).
+  - extraction du rendu pagine de `renderGlobalNotes` vers `TaskMDAGlobalNotes.renderGlobalNotesResults` (comptage, etat vide, branche selection multiple, branche renderer unifie, fallback cartes, pagination).
+  - extraction du post-traitement UI de `renderGlobalNotes` vers `TaskMDAGlobalNotes.finalizeGlobalNotesRenderUi` (tabs actives, focus scroll, refresh bulk UI, bind preview/download inline docs).
+  - extraction du pre-traitement des documents lies des notes globales vers `TaskMDAGlobalNotes.collectGlobalNotesLinkedDocsContext` (maps `linkedDocsByNoteId` / `linkedDocCountByNoteId`).
+  - segmentation supplementaire par outil: creation de `js/taskmda-global-notes-renderer.js` avec classe `TaskMdaGlobalNotesRenderer` (pipeline notes globales), utilisee par `TaskMDAGlobalNotes` pour l agregation, les docs lies et le filtrage/tri.
+  - delegation complete du rendu/finalisation des notes globales depuis `TaskMDAGlobalNotes` vers `TaskMdaGlobalNotesRenderer` (`renderGlobalNotesResults`, `finalizeGlobalNotesRenderUi`) pour garder `js/taskmda-global.js` plus mince.
+  - ajout d un builder de cartes dedie `js/taskmda-global-notes-card-builder.js` (`TaskMdaGlobalNotesCardBuilder`) et delegation de `buildGlobalNoteCardHtml` pour separer la composition HTML du pipeline de rendu.
+  - ajout d un utilitaire dedie `js/taskmda-global-notes-ref.js` (`TaskMDAGlobalNotesRef`) pour `buildGlobalHubProjectNoteRef` / `parseGlobalHubProjectNoteRef`, consomme depuis `TaskMDAGlobalNotes`.
+  - regroupement thematique UI (Notes): extraction du menu export vers `js/taskmda-global-notes-export-menu.js` (`toggle/close/outside-click`), avec delegation depuis `TaskMDAGlobalNotes`.
+  - regroupement thematique UI (Read Modal): extraction de `TaskMDAGlobalReadActionsUI` et `TaskMDAGlobalReadInlineUI` de `js/taskmda-global.js` vers `js/taskmda-global-read-actions-ui.js` et `js/taskmda-global-read-inline-ui.js`.
+  - regroupement thematique UI (Notes Filters): extraction de `TaskMDAGlobalNotesFiltersUI` de `js/taskmda-global.js` vers `js/taskmda-global-notes-filters-ui.js`.
+  - regroupement thematique Notes (Navigation): extraction de la navigation des refs notes projet (`build/parse/openGlobalHubAggregatedNoteRead`) vers `js/taskmda-global-notes-navigation.js` avec delegation depuis `TaskMDAGlobalNotes`.
+  - lot Notes-Read: extraction du contenu de `openGlobalNoteReadModal` hors `js/taskmda-team.js` vers `js/taskmda-global-notes-read-modal-content.js` (hydration read modal, docs lies, binds preview/download/delete), avec delegation runtime.
+  - lot Notes-Read (suite): extraction de `closeGlobalReadModal` dans le meme module `js/taskmda-global-notes-read-modal-content.js`, avec delegation runtime depuis `js/taskmda-team.js`.
+  - lot Notes-Read (suite): extraction de `beginGlobalReadInlineEdit` et `saveGlobalReadInlineEdit` vers `js/taskmda-global-notes-read-inline-edit.js`, avec delegation runtime et conservation des helpers inline existants.
+  - lot Notes-Read (suite): extraction de `canInlineEditGlobalReadModal` et `cancelGlobalReadInlineEdit` dans `js/taskmda-global-notes-read-inline-edit.js`, avec delegation runtime depuis `js/taskmda-team.js`.
+  - lot Notes-Read (suite): extraction de `isElementInsideGlobalReadInlineEdit` et `placeCaretAtEndOfElement` vers `js/taskmda-global-notes-read-inline-edit.js`, avec wrappers de delegation dans `js/taskmda-team.js`.
+  - lot Notes-Read (suite): extraction de `ensureGlobalReadInlineQuillUi` et `resetGlobalReadInlineEditState` vers `js/taskmda-global-notes-read-inline-edit.js`, avec wrappers de delegation et etat Quill injecte (`setInlineQuill`).
+  - exposition des wrappers globaux associes (`window.exportGlobalNote*`) depuis le runtime module pour conserver la compatibilite des handlers `onclick`.
+  - `js/taskmda-team.js` conserve des wrappers fins de delegation (`updateGlobalNotesBulkDeleteUi`, `setGlobalNotesBulkSelectionMode`, `toggleGlobalNoteBulkSelection`, `selectAllVisibleGlobalNotesForBulkDelete`, `deleteSelectedGlobalNotes`).
+  - injection explicite des dependances metier via `createModule` (etat bulk, selection courante, droits de suppression, suppression store, desindexation feed, rafraichissement feed).
+  - objectif: reduire le poids de l orchestrateur et poursuivre la trajectoire de refactor par domaines sans changement fonctionnel attendu.
+
+## Mise a jour incrementale - Mai 2026 (Annuaire: recherche par numero FINESS dans le champ texte)
+
+- Referentiels / Annuaire ESMS:
+  - le champ texte de recherche (`Nom etablissement`) accepte maintenant explicitement la saisie d un numero FINESS.
+  - ajout d un chemin de recherche direct par FINESS (`nofinesset` / `nofinessej`) en complement du filtrage departemental.
+  - fusion + dedoublonnage des resultats pour garantir la remontee de l etablissement cible quand un FINESS est saisi.
+  - mise a jour du placeholder UI: `Nom etablissement ou FINESS (optionnel)`.
+
 ## Mise a jour incrementale - Mai 2026 (Miniatures automatiques des documents)
 
 - Documents (global + projet):

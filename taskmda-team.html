@@ -1360,7 +1360,7 @@
                     <select id="via-annuaire-live-departement" class="px-3 py-2 border border-slate-300 rounded-lg text-sm">
                       <option value="">Département...</option>
                     </select>
-                    <input id="via-annuaire-live-keyword" type="text" class="px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="Nom établissement (optionnel)">
+                    <input id="via-annuaire-live-keyword" type="text" class="px-3 py-2 border border-slate-300 rounded-lg text-sm" placeholder="Nom établissement ou FINESS (optionnel)">
                     <button id="btn-via-annuaire-live-search" class="task-action-btn px-3 py-2 text-sm font-semibold inline-flex items-center justify-center" data-action-kind="open" data-action-label="Rechercher" aria-label="Rechercher">
                       <span class="material-symbols-outlined taskmda-action-icon" aria-hidden="true">search</span>
                     </button>
@@ -2388,6 +2388,16 @@
           </div>
           <div id="project-note-content-editor" class="project-description-editor task-description-editor" contenteditable="true" aria-label="Contenu de la note (éditeur riche)"></div>
           <textarea id="project-note-content" rows="5" class="hidden"></textarea>
+        </div>
+        <div>
+          <label for="project-note-theme" class="block text-sm font-semibold mb-1">Thématique</label>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+            <input id="project-note-theme" type="text" placeholder="Thématique de la note (optionnel)" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm">
+            <select id="project-note-theme-known" class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm" title="Choisir une thématique du projet, du référentiel ou déjà utilisée sur une note">
+              <option value="">Thématiques existantes...</option>
+            </select>
+          </div>
+          <p class="text-[11px] text-slate-500 mt-1">Saisie libre ou liste. Les tags restent indépendants.</p>
         </div>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
           <input id="project-note-tags" type="text" placeholder="Tags: budget, gouvernance, priorite..." class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm">
@@ -3881,6 +3891,7 @@
   <script src="js/taskmda-tasks.js?v=20260325-02"></script>
   <script src="js/taskmda-social.js?v=20260328-06"></script>
   <script src="js/taskmda-editor.js?v=20260328-03"></script>
+  <script src="js/taskmda-editor-interop.js?v=20260525-01"></script>
   <script src="js/taskmda-workflow.js?v=20260406-04"></script>
   <script src="js/taskmda-shell.js?v=20260430-01"></script>
   <script src="js/taskmda-project.js?v=20260430-01"></script>
@@ -3892,9 +3903,19 @@
   <script src="js/taskmda-admin-ui.js?v=20260406-01"></script>
   <script src="js/taskmda-hierarchy.js?v=20260420-01"></script>
   <script src="js/taskmda-notes-shared.js?v=20260429-01"></script>
+  <script src="js/taskmda-global-notes-ref.js?v=20260524-01"></script>
+  <script src="js/taskmda-global-read-actions-ui.js?v=20260524-01"></script>
+  <script src="js/taskmda-global-read-inline-ui.js?v=20260524-01"></script>
+  <script src="js/taskmda-global-notes-filters-ui.js?v=20260528-01"></script>
+  <script src="js/taskmda-global-notes-navigation.js?v=20260524-01"></script>
+  <script src="js/taskmda-global-notes-read-modal-content.js?v=20260524-01"></script>
+  <script src="js/taskmda-global-notes-read-inline-edit.js?v=20260524-01"></script>
+  <script src="js/taskmda-global-notes-export-menu.js?v=20260524-01"></script>
+  <script src="js/taskmda-global-notes-card-builder.js?v=20260524-03"></script>
+  <script src="js/taskmda-global-notes-renderer.js?v=20260524-03"></script>
   <script src="js/taskmda-document-storage.js?v=20260424-01"></script>
   <script src="js/taskmda-calendar.js?v=20260501-01"></script>
-  <script src="js/taskmda-global.js?v=20260430-01"></script>
+  <script src="js/taskmda-global.js?v=20260528-01"></script>
   <script src="js/taskmda-email-generator.js?v=20260428-01"></script>
   <script src="js/taskmda-file-watcher.js"></script>
   <script src="js/taskmda-core-utils.js?v=20260501-01"></script>
@@ -3903,8 +3924,12 @@
   <script src="js/taskmda-read-modal-zoom.js?v=20260505-01"></script>
   <script src="js/taskmda-action-ui-harmonizer.js?v=20260510-01"></script>
   <script src="js/taskmda-modal-ui-harmonizer.js?v=20260510-01"></script>
-  <script src="js/taskmda-team.js?v=20260430-02"></script>
+  <script src="js/taskmda-global-doc-ref-utils.js?v=20260530-01"></script>
+  <script src="js/taskmda-feed-digest-ui.js?v=20260530-01"></script>
+  <script src="js/taskmda-feed-digest-editor.js?v=20260530-01"></script>
+  <script src="js/taskmda-feed-digest-mime.js?v=20260530-01"></script>
+  <script src="js/taskmda-feed-digest-pdf.js?v=20260530-01"></script>
+  <script src="js/taskmda-feed-digest-content.js?v=20260530-01"></script>
+  <script src="js/taskmda-team.js?v=20260530-01"></script>
 </body>
 </html>
-
-

@@ -749,6 +749,61 @@
       return String(value || '').replace(/"/g, '\\"');
     }
 
+    function extractViaAnnuaireFinessKeyword(keyword) {
+      const normalized = String(keyword || '').replace(/\D/g, '');
+      if (!normalized) return '';
+      return normalized.length >= 7 ? normalized : '';
+    }
+
+    function dedupeViaAnnuaireRows(rows) {
+      const items = Array.isArray(rows) ? rows : [];
+      const seen = new Set();
+      const unique = [];
+      for (const row of items) {
+        if (!row || typeof row !== 'object') continue;
+        const key = [
+          String(row.finess || '').trim(),
+          String(row.idStructure || '').trim(),
+          String(row.name || '').trim(),
+          String(row.city || '').trim()
+        ].join('|');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        unique.push(row);
+      }
+      return unique;
+    }
+
+    async function fetchViaAnnuaireRowsByFinessKeyword(finessKeyword) {
+      const token = String(finessKeyword || '').trim();
+      if (!token) return [];
+      const select = 'nofinesset,nofinessej,rs,rslongue,address,telephone,dep_code,dep_name,com_name,libmft,libcategetab,categetab,libsph,siret';
+      const requests = [
+        actions.fetchViaAnnuairePublicApiRecords?.({
+          limit: 50,
+          offset: 0,
+          orderBy: 'rs',
+          select,
+          where: `nofinesset like "${escapeOdsWhereValue(token)}%"`
+        }, 25000),
+        actions.fetchViaAnnuairePublicApiRecords?.({
+          limit: 50,
+          offset: 0,
+          orderBy: 'rs',
+          select,
+          where: `nofinessej like "${escapeOdsWhereValue(token)}%"`
+        }, 25000)
+      ];
+      const settled = await Promise.allSettled(requests);
+      const raw = [];
+      settled.forEach((entry) => {
+        if (entry.status !== 'fulfilled') return;
+        const batch = Array.isArray(entry.value?.results) ? entry.value.results : [];
+        raw.push(...batch);
+      });
+      return raw.map(mapViaAnnuaireLiveResultItem).filter((item) => item?.name);
+    }
+
     async function runViaAnnuaireLiveSearch(options = {}) {
       const currentState = state.getLiveSearchState?.() || {};
       const fromUi = options.fromUi !== false;
@@ -835,7 +890,13 @@
         }
         const mappedAll = rawRows.map(mapViaAnnuaireLiveResultItem).filter((item) => item.name);
         const filtered = filterViaAnnuaireRecordsBySearchInput(mappedAll, input);
-        const sortedAll = actions.sortViaAnnuaireLiveResults?.(filtered, input.sortKey) || [];
+        const finessKeyword = extractViaAnnuaireFinessKeyword(input.keyword);
+        let merged = filtered;
+        if (finessKeyword) {
+          const finessRows = await fetchViaAnnuaireRowsByFinessKeyword(finessKeyword);
+          merged = dedupeViaAnnuaireRows([...(filtered || []), ...(finessRows || [])]);
+        }
+        const sortedAll = actions.sortViaAnnuaireLiveResults?.(merged, input.sortKey) || [];
         const pageSize = Math.max(1, Number(nextState.pageSize || 12));
         const total = sortedAll.length;
         const maxPageIndex = total > 0 ? Math.max(0, Math.ceil(total / pageSize) - 1) : 0;

@@ -71,6 +71,10 @@
   }
 
   function formatExportDateTag(dateValue) {
+    const coreFormatExportDateTag = global.TaskMDACoreUtils?.formatExportDateTag;
+    if (typeof coreFormatExportDateTag === 'function') {
+      return String(coreFormatExportDateTag(dateValue)).replace('_', '-');
+    }
     const date = dateValue instanceof Date ? dateValue : new Date(dateValue || Date.now());
     const yyyy = String(date.getFullYear());
     const mm = String(date.getMonth() + 1).padStart(2, '0');

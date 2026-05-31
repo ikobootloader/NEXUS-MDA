@@ -1,267 +1,6 @@
 ﻿/* TaskMDA Global Domain Bundle (manual, no-build) */
 /* Consolidates taskmda-global-* modules */
 
-/* --- taskmda-global-notes-filters-ui.js --- */
-(function initTaskMdaGlobalNotesFiltersUiModule(global) {
-  // Module role: UI/domain boundary for TaskMdaGlobalNotesFiltersUiModule.
-  'use strict';
-
-  function createModule(options) {
-    // Injected dependencies: callbacks/state accessors provided by taskmda-team orchestrator.
-    const opts = options || {};
-    let bound = false;
-    const normalizeCatalogKey = typeof opts.normalizeCatalogKey === 'function'
-      ? opts.normalizeCatalogKey
-      : (value) => String(value || '').trim().toLowerCase();
-    const escapeHtml = typeof opts.escapeHtml === 'function'
-      ? opts.escapeHtml
-      : (value) => String(value || '');
-
-    /**
-     * Libellés servant au filtre « Thématiques » des notes globales : aligné sur les notes de projet
-     * (tags = facettes de classement ; sinon champ theme ; sinon seau unique « Sans thematique »).
-     */
-    function getGlobalNoteThemeLabels(note) {
-      const tags = Array.isArray(note?.tags)
-        ? Array.from(new Set(note.tags.map((tag) => String(tag || '').trim()).filter(Boolean)))
-        : [];
-      if (tags.length > 0) return tags;
-      const theme = String(note?.theme || '').trim();
-      if (theme) return [theme];
-      return ['Sans thematique'];
-    }
-
-    function buildGlobalNotesThemeCatalog(notes = []) {
-      const map = new Map();
-      (Array.isArray(notes) ? notes : []).forEach((note) => {
-        getGlobalNoteThemeLabels(note).forEach((label) => {
-          const key = normalizeCatalogKey(label);
-          if (!key) return;
-          const existing = map.get(key);
-          if (existing) existing.count += 1;
-          else map.set(key, { key, label, count: 1 });
-        });
-      });
-      return Array.from(map.values()).sort((a, b) => String(a.label || '').localeCompare(String(b.label || ''), 'fr'));
-    }
-
-    function renderGlobalNotesThemeTabs(notes = []) {
-      const host = document.getElementById('global-notes-theme-tabs');
-      if (!host) return;
-      let selectedThemeFilter = String(opts.getGlobalNotesThemeFilter?.() || 'all').trim() || 'all';
-      const catalog = buildGlobalNotesThemeCatalog(notes);
-      if (selectedThemeFilter !== 'all' && !catalog.some((item) => item.key === selectedThemeFilter)) {
-        opts.setGlobalNotesThemeFilter?.('all');
-        selectedThemeFilter = 'all';
-      }
-      const total = Array.isArray(notes) ? notes.length : 0;
-      host.innerHTML = [
-        `<button type="button" class="project-notes-theme-tab ${selectedThemeFilter === 'all' ? 'is-active' : ''}" data-global-note-theme-tab="all">Toutes <span>${total}</span></button>`,
-        ...catalog.map((item) =>
-          `<button type="button" class="project-notes-theme-tab ${selectedThemeFilter === item.key ? 'is-active' : ''}" data-global-note-theme-tab="${escapeHtml(item.key)}">${escapeHtml(item.label)} <span>${item.count}</span></button>`
-        )
-      ].join('');
-
-      const toggle = document.getElementById('global-notes-themes-toggle');
-      if (!toggle) return;
-      const activeCount = selectedThemeFilter === 'all'
-        ? catalog.length
-        : (catalog.some((item) => item?.key === selectedThemeFilter) ? 1 : 0);
-      let badge = toggle.querySelector('.notes-themes-toggle-count');
-      if (!badge) {
-        badge = document.createElement('span');
-        badge.className = 'notes-themes-toggle-count';
-        toggle.appendChild(badge);
-      }
-      badge.textContent = String(activeCount);
-      badge.title = activeCount > 1 ? `${activeCount} thématiques actives` : `${activeCount} thématique active`;
-    }
-
-    function bindDom() {
-      // DOM bindings are attached once; module remains idempotent across repeated init calls.
-      if (bound) return;
-      bound = true;
-
-      document.getElementById('global-notes-theme-tabs')?.addEventListener('click', (event) => {
-        const btn = event?.target?.closest?.('[data-global-note-theme-tab]');
-        if (!btn) return;
-        const key = String(btn.getAttribute('data-global-note-theme-tab') || 'all').trim() || 'all';
-        opts.setGlobalNotesThemeFilter?.(key);
-        opts.setGlobalNotesPage?.(1);
-        opts.renderGlobalNotes?.().catch(() => null);
-      });
-    }
-
-    return {
-      bindDom,
-      renderGlobalNotesThemeTabs
-    };
-  }
-
-  global.TaskMDAGlobalNotesFiltersUI = {
-    createModule
-  };
-}(window));
-
-/* --- taskmda-global-read-actions-ui.js --- */
-(function initTaskMdaGlobalReadActionsUiModule(global) {
-  // Module role: UI/domain boundary for TaskMdaGlobalReadActionsUiModule.
-  'use strict';
-
-  function createModule(options) {
-    // Injected dependencies: callbacks/state accessors provided by taskmda-team orchestrator.
-    const opts = options || {};
-    let bound = false;
-
-    function bindDom() {
-      // DOM bindings are attached once; module remains idempotent across repeated init calls.
-      if (bound) return;
-      bound = true;
-
-      document.getElementById('btn-close-global-read-modal')?.addEventListener('click', () => {
-        opts.closeGlobalReadModal?.();
-      });
-
-      document.getElementById('btn-global-read-edit')?.addEventListener('click', () => {
-        const noteId = String(document.getElementById('btn-global-read-edit')?.getAttribute('data-note-id') || '').trim();
-        if (!noteId) return;
-        opts.closeGlobalReadModal?.();
-        opts.openGlobalNoteEditor?.(noteId)?.catch?.(() => null);
-      });
-
-      document.getElementById('btn-global-read-delete')?.addEventListener('click', async () => {
-        const noteId = String(document.getElementById('btn-global-read-delete')?.getAttribute('data-note-id') || '').trim();
-        if (!noteId) return;
-        await opts.deleteGlobalNote?.(noteId);
-        opts.closeGlobalReadModal?.();
-      });
-
-      document.getElementById('btn-global-read-export-menu')?.addEventListener('click', (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        const menu = document.getElementById('global-read-export-dropdown');
-        const btn = document.getElementById('btn-global-read-export-menu');
-        if (!menu || !btn) return;
-        const willOpen = menu.classList.contains('hidden');
-        menu.classList.toggle('hidden', !willOpen);
-        btn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
-      });
-
-      document.getElementById('btn-global-read-export-html')?.addEventListener('click', async () => {
-        const noteId = String(document.getElementById('btn-global-read-export-html')?.getAttribute('data-note-id') || '').trim();
-        if (!noteId) return;
-        await opts.exportGlobalNote?.(noteId, 'html');
-      });
-
-      document.getElementById('btn-global-read-export-pdf')?.addEventListener('click', async () => {
-        const noteId = String(document.getElementById('btn-global-read-export-pdf')?.getAttribute('data-note-id') || '').trim();
-        if (!noteId) return;
-        await opts.exportGlobalNoteAsPdf?.(noteId);
-      });
-
-      document.getElementById('btn-global-read-export-docx')?.addEventListener('click', async () => {
-        const noteId = String(document.getElementById('btn-global-read-export-docx')?.getAttribute('data-note-id') || '').trim();
-        if (!noteId) return;
-        await opts.exportGlobalNoteAsDocx?.(noteId);
-      });
-
-      document.getElementById('btn-global-read-export-txt')?.addEventListener('click', async () => {
-        const noteId = String(document.getElementById('btn-global-read-export-txt')?.getAttribute('data-note-id') || '').trim();
-        if (!noteId) return;
-        await opts.exportGlobalNote?.(noteId, 'txt');
-      });
-    }
-
-    return {
-      bindDom
-    };
-  }
-
-  global.TaskMDAGlobalReadActionsUI = {
-    createModule
-  };
-}(window));
-
-/* --- taskmda-global-read-inline-ui.js --- */
-(function initTaskMdaGlobalReadInlineUiModule(global) {
-  // Module role: UI/domain boundary for TaskMdaGlobalReadInlineUiModule.
-  'use strict';
-
-  function createModule(options) {
-    // Injected dependencies: callbacks/state accessors provided by taskmda-team orchestrator.
-    const opts = options || {};
-    let bound = false;
-
-    function bindDom() {
-      // DOM bindings are attached once; module remains idempotent across repeated init calls.
-      if (bound) return;
-      bound = true;
-
-      const globalReadModal = document.getElementById('modal-global-read');
-      if (globalReadModal && globalReadModal.dataset.inlineShortcutsBound !== '1') {
-        globalReadModal.dataset.inlineShortcutsBound = '1';
-        globalReadModal.addEventListener('keydown', async (event) => {
-          if (globalReadModal.classList.contains('hidden')) return;
-          const key = String(event.key || '').toLowerCase();
-          if ((event.ctrlKey || event.metaKey) && key === 's') {
-            event.preventDefault();
-            await opts.saveGlobalReadInlineEdit?.();
-            return;
-          }
-          if (opts.isGlobalReadInlineEditActive?.() && key === 'enter' && event.target?.id === 'global-read-title') {
-            event.preventDefault();
-            await opts.saveGlobalReadInlineEdit?.();
-            return;
-          }
-          if (key === 'escape') {
-            event.preventDefault();
-            event.stopPropagation();
-            if (opts.isGlobalReadInlineEditActive?.()) {
-              opts.cancelGlobalReadInlineEdit?.();
-              return;
-            }
-            opts.closeGlobalReadModal?.();
-          }
-        });
-      }
-
-      document.getElementById('global-read-title')?.addEventListener('click', () => {
-        opts.beginGlobalReadInlineEdit?.('title');
-      });
-      document.getElementById('global-read-content')?.addEventListener('click', () => {
-        opts.beginGlobalReadInlineEdit?.('content');
-      });
-      document.getElementById('global-read-title')?.addEventListener('blur', async () => {
-        if (!opts.isGlobalReadInlineEditActive?.()) return;
-        setTimeout(async () => {
-          const active = document.activeElement;
-          if (opts.isElementInsideGlobalReadInlineEdit?.(active)) return;
-          await opts.saveGlobalReadInlineEdit?.({ silent: true });
-        }, 0);
-      });
-      document.addEventListener('focusout', (event) => {
-        if (!opts.isGlobalReadInlineEditActive?.()) return;
-        const target = event.target;
-        if (!(target instanceof HTMLElement)) return;
-        if (!target.closest('#global-read-inline-editor-wrap')) return;
-        setTimeout(async () => {
-          const active = document.activeElement;
-          if (opts.isElementInsideGlobalReadInlineEdit?.(active)) return;
-          await opts.saveGlobalReadInlineEdit?.({ silent: true });
-        }, 0);
-      }, true);
-    }
-
-    return {
-      bindDom
-    };
-  }
-
-  global.TaskMDAGlobalReadInlineUI = {
-    createModule
-  };
-}(window));
-
 /* --- taskmda-global-notes.js --- */
 (function initTaskMdaGlobalNotesModule(global) {
   // Module role: UI/domain boundary for TaskMdaGlobalNotesModule.
@@ -273,10 +12,50 @@
     const state = opts.state || {};
     const actions = opts.actions || {};
     const helpers = opts.helpers || {};
+    const runWithLoading = typeof actions.runWithLoading === 'function'
+      ? actions.runWithLoading
+      : async (action) => await action();
+    const notesCardBuilder = global.TaskMDAGlobalNotesCardBuilder?.create
+      ? global.TaskMDAGlobalNotesCardBuilder.create({
+          state,
+          actions,
+          helpers
+        })
+      : null;
+    const notesNavigation = global.TaskMDAGlobalNotesNavigation?.create
+      ? global.TaskMDAGlobalNotesNavigation.create({
+          state,
+          actions,
+          helpers
+        })
+      : null;
+    const notesRenderer = global.TaskMDAGlobalNotesRenderer?.create
+      ? global.TaskMDAGlobalNotesRenderer.create({
+          state,
+          actions: {
+            ...actions,
+            buildGlobalHubProjectNoteRef
+          },
+          helpers,
+          buildGlobalNoteCardHtml,
+          updateGlobalNotesBulkDeleteUi
+        })
+      : null;
     let bound = false;
 
     async function setGlobalNotesPage(page) {
       state.setPage?.(Math.max(1, Number(page) || 1));
+      await actions.renderGlobalNotes?.();
+    }
+
+    function isGlobalNotesViewActive() {
+      const section = document.getElementById('global-notes-section');
+      if (!section) return true;
+      return !section.classList.contains('hidden');
+    }
+
+    async function rerenderGlobalNotesViewIfActive() {
+      if (!isGlobalNotesViewActive()) return;
       await actions.renderGlobalNotes?.();
     }
 
@@ -308,7 +87,616 @@
       const checked = document.querySelector('input[name="global-notes-export-format"]:checked');
       const format = String(checked?.value || 'html').trim().toLowerCase() === 'txt' ? 'txt' : 'html';
       closeGlobalNotesBulkExportModal();
-      await actions.exportSelectedGlobalNotesAsZip?.(format);
+      await exportSelectedGlobalNotesAsZip(format);
+    }
+
+    async function generatePdfBlobForNote({ title, contentHtml, theme, tags, dateFormatted }) {
+      const tempDiv = document.createElement('div');
+      tempDiv.style.position = 'fixed';
+      tempDiv.style.left = '0';
+      tempDiv.style.top = '0';
+      tempDiv.style.width = '800px';
+      tempDiv.style.zIndex = '-1';
+      tempDiv.style.fontFamily = "'Segoe UI', Arial, sans-serif";
+      tempDiv.style.padding = '20px';
+      tempDiv.style.color = '#1e293b';
+      tempDiv.style.background = '#fff';
+
+      const styleBlock = document.createElement('style');
+      styleBlock.textContent = `
+        .pdf-title { margin: 0 0 8px; font-size: 24px; font-weight: bold; color: #1e293b; }
+        .pdf-meta { color: #64748b; font-size: 12px; margin-bottom: 12px; }
+        .pdf-tags { margin-bottom: 14px; }
+        .pdf-tag-theme { background: #ecfdf5; border-color: #a7f3d0; color: #047857; }
+        .pdf-tag { display: inline-block; font-size: 10px; border: 1px solid #cbd5e1; border-radius: 999px; padding: 3px 8px; background: #f8fafc; color: #334155; margin-right: 6px; margin-bottom: 4px; }
+        .pdf-content { margin-top: 20px; line-height: 1.6; color: #1e293b; }
+        .pdf-content img { max-width: 100%; height: auto; }
+      `;
+      tempDiv.appendChild(styleBlock);
+
+      const h1 = document.createElement('h1');
+      h1.className = 'pdf-title';
+      h1.textContent = title;
+      tempDiv.appendChild(h1);
+
+      const meta = document.createElement('p');
+      meta.className = 'pdf-meta';
+      meta.textContent = dateFormatted;
+      tempDiv.appendChild(meta);
+
+      if (String(theme || '').trim() || (Array.isArray(tags) && tags.length)) {
+        const tagsDiv = document.createElement('div');
+        tagsDiv.className = 'pdf-tags';
+        const themeText = String(theme || '').trim();
+        if (themeText) {
+          const themeSpan = document.createElement('span');
+          themeSpan.className = 'pdf-tag pdf-tag-theme';
+          themeSpan.textContent = themeText;
+          tagsDiv.appendChild(themeSpan);
+        }
+        tags.forEach((tag) => {
+          const span = document.createElement('span');
+          span.className = 'pdf-tag';
+          span.textContent = `#${tag}`;
+          tagsDiv.appendChild(span);
+        });
+        tempDiv.appendChild(tagsDiv);
+      }
+
+      const contentDiv = document.createElement('div');
+      contentDiv.className = 'pdf-content';
+      contentDiv.innerHTML = contentHtml || '<p>Cette note ne contient aucun contenu.</p>';
+      tempDiv.appendChild(contentDiv);
+
+      document.body.appendChild(tempDiv);
+
+      const pdfOpts = {
+        margin: [10, 10, 10, 10],
+        image: { type: 'jpeg', quality: 0.92 },
+        html2canvas: {
+          scale: 1.5,
+          useCORS: true,
+          logging: false,
+          width: 800
+        },
+        jsPDF: {
+          unit: 'mm',
+          format: 'a4',
+          orientation: 'portrait'
+        }
+      };
+
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        const pdfBlob = await html2pdf().set(pdfOpts).from(tempDiv).outputPdf('blob');
+        return pdfBlob;
+      } catch (error) {
+        console.error('Erreur génération PDF:', error);
+        return null;
+      } finally {
+        setTimeout(() => {
+          if (tempDiv && tempDiv.parentNode) {
+            document.body.removeChild(tempDiv);
+          }
+        }, 1000);
+      }
+    }
+
+    async function exportSelectedGlobalNotesAsZip(format = 'html') {
+      if (!state.getBulkSelectionMode?.()) return;
+      const selectedIds = (state.getSelectedNoteIds?.() || [])
+        .map((id) => String(id || '').trim())
+        .filter(Boolean);
+      if (!selectedIds.length) {
+        helpers.showToast?.('Aucune note sélectionnée');
+        return;
+      }
+      const allNotesRaw = await actions.getAllGlobalNotes?.();
+      const allNotes = Array.isArray(allNotesRaw) ? allNotesRaw : [];
+      const selectedNotes = selectedIds
+        .map((id) => allNotes.find((row) => String(row?.noteId || '').trim() === id))
+        .filter((note) => note && actions.canManageGlobalNote?.(note));
+      if (!selectedNotes.length) {
+        helpers.showToast?.('Aucune note exportable dans la sélection');
+        return;
+      }
+
+      const mode = String(format || 'html').toLowerCase();
+      const files = [];
+
+      if (mode === 'pdf') {
+        helpers.showToast?.('Export PDF multiple en cours...');
+        for (const note of selectedNotes) {
+          const title = String(note.title || '').trim() || 'Note';
+          const safeTitle = helpers.sanitizeFilenameSegment?.(title) || 'note';
+          const baseName = `${String(note.createdAt || Date.now())}_${safeTitle}`;
+          const contentHtml = helpers.sanitizeRichTextHtmlPreserve?.(
+            String(note.contentHtml || '').trim() || helpers.plainTextToRichHtml?.(String(note.content || '').trim()) || ''
+          ) || '';
+          const theme = String(note.theme || '').trim();
+          const tags = Array.isArray(note.tags) ? note.tags.map((t) => String(t || '').trim()).filter(Boolean) : [];
+          const dateFormatted = new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR');
+          const pdfBlob = await generatePdfBlobForNote({ title, contentHtml, theme, tags, dateFormatted });
+          if (pdfBlob) {
+            files.push({
+              name: `${baseName}.pdf`,
+              data: new Uint8Array(await pdfBlob.arrayBuffer()),
+              mtime: Number(note.updatedAt || note.createdAt || Date.now())
+            });
+          }
+        }
+      } else if (mode === 'docx') {
+        helpers.showToast?.('Export DOCX multiple en cours...');
+        for (const note of selectedNotes) {
+          const title = String(note.title || '').trim() || 'Note';
+          const safeTitle = helpers.sanitizeFilenameSegment?.(title) || 'note';
+          const baseName = `${String(note.createdAt || Date.now())}_${safeTitle}`;
+          const contentHtml = helpers.sanitizeRichTextHtmlPreserve?.(
+            String(note.contentHtml || '').trim() || helpers.plainTextToRichHtml?.(String(note.content || '').trim()) || ''
+          ) || '';
+          const theme = String(note.theme || '').trim();
+          const tags = Array.isArray(note.tags) ? note.tags.map((t) => String(t || '').trim()).filter(Boolean) : [];
+          const author = String(note.createdByName || helpers.fallbackDirectoryName?.(note.createdBy || ''));
+          const dateFormatted = new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR');
+          const converted = helpers.convertHtmlToWordML?.(contentHtml) || { wordML: '', images: [], relationships: [] };
+          const { wordML, images, relationships } = converted;
+          const now = Date.now();
+          const docxFiles = [
+            { name: '[Content_Types].xml', data: helpers.generateContentTypesXml?.(images) || '', mtime: now },
+            { name: '_rels/.rels', data: helpers.generateRootRelsXml?.() || '', mtime: now },
+            { name: 'word/document.xml', data: helpers.generateDocumentXml?.({ title, author, dateFormatted, theme, tags }, wordML || ''), mtime: now },
+            { name: 'word/styles.xml', data: helpers.generateStylesXml?.() || '', mtime: now }
+          ];
+          if (images.length > 0) {
+            docxFiles.push({ name: 'word/_rels/document.xml.rels', data: helpers.generateDocumentRelsXml?.(relationships) || '', mtime: now });
+            images.forEach((img) => {
+              docxFiles.push({ name: `word/media/${img.filename}`, data: helpers.base64ToUint8Array?.(img.base64) || new Uint8Array(0), mtime: now });
+            });
+          }
+          const docxZip = helpers.buildZipStoreArchive?.(docxFiles);
+          if (!docxZip) continue;
+          files.push({
+            name: `${baseName}.docx`,
+            data: docxZip,
+            mtime: Number(note.updatedAt || note.createdAt || Date.now())
+          });
+        }
+      } else {
+        selectedNotes.forEach((note) => {
+          const title = String(note.title || '').trim() || 'Note';
+          const safeTitle = helpers.sanitizeFilenameSegment?.(title) || 'note';
+          const baseName = `${String(note.createdAt || Date.now())}_${safeTitle}`;
+          const tags = Array.isArray(note.tags) ? note.tags.map((t) => String(t || '').trim()).filter(Boolean) : [];
+          const theme = String(note.theme || '').trim();
+          const contentHtml = helpers.sanitizeRichTextHtmlPreserve?.(
+            String(note.contentHtml || '').trim() || helpers.plainTextToRichHtml?.(String(note.content || '').trim()) || ''
+          ) || '';
+          if (mode === 'txt') {
+            const plain = helpers.getProjectDescriptionPlainText?.(contentHtml) || '';
+            const payload = `${title}\nAuteur: ${String(note.createdByName || helpers.fallbackDirectoryName?.(note.createdBy || '') || 'Auteur')}\nMise a jour: ${new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR')}\n${theme ? `Thematique: ${theme}\n` : ''}Tags: ${tags.join(', ')}\n\n${plain}\n`;
+            files.push({ name: `${baseName}.txt`, data: payload, mtime: Number(note.updatedAt || note.createdAt || Date.now()) });
+          } else {
+            const escapeHtml = helpers.escapeHtml || ((value) => String(value || ''));
+            const chips = [
+              ...(theme ? [`<span class="chip chip-theme">${escapeHtml(theme)}</span>`] : []),
+              ...tags.map((entry) => `<span class="chip">#${escapeHtml(entry)}</span>`)
+            ].join('');
+            const payload = `<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1e293b}h1{margin:0 0 8px}.meta{color:#64748b;font-size:13px;margin-bottom:12px}.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}.chip{font-size:11px;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;color:#334155}.chip-theme{background:#ecfdf5;border-color:#a7f3d0;color:#047857}</style></head><body><h1>${escapeHtml(title)}</h1><p class="meta">${escapeHtml(new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR'))}</p>${chips ? `<div class="chips">${chips}</div>` : ''}<article>${contentHtml || '<p>Aucun contenu.</p>'}</article></body></html>`;
+            files.push({ name: `${baseName}.html`, data: payload, mtime: Number(note.updatedAt || note.createdAt || Date.now()) });
+          }
+        });
+      }
+
+      const zipBytes = helpers.buildZipStoreArchive?.(files);
+      if (!zipBytes) {
+        helpers.showToast?.('Echec export ZIP');
+        return;
+      }
+      const exportTag = helpers.formatExportDateTag?.() || String(Date.now());
+      helpers.downloadBlobFile?.(new Blob([zipBytes], { type: 'application/zip' }), `notes_selection_${mode}_${exportTag}.zip`, 'application/zip');
+      helpers.showToast?.(`Export ZIP ${mode.toUpperCase()} prêt (${files.length} notes)`);
+    }
+
+    function updateGlobalNotesBulkDeleteUi() {
+      const toggleBtn = document.getElementById('btn-global-notes-bulk-toggle');
+      const deleteBtn = document.getElementById('btn-global-notes-bulk-delete');
+      const selectAllBtn = document.getElementById('btn-global-notes-bulk-select-all');
+      const exportBtn = document.getElementById('btn-global-notes-bulk-export');
+      const selectedCount = Number(state.getSelectedCount?.() || 0);
+      const bulkSelectionMode = !!state.getBulkSelectionMode?.();
+      const selectableInputs = Array.from(document.querySelectorAll('#global-notes-list .taskmda-bulk-checkbox-input[data-note-id]'))
+        .filter((input) => input instanceof HTMLInputElement && !input.disabled);
+      const selectedVisibleCount = selectableInputs.filter((input) => {
+        const noteId = String(input.dataset.noteId || '').trim();
+        return noteId && !!state.isNoteSelected?.(noteId);
+      }).length;
+      const allVisibleSelected = selectableInputs.length > 0 && selectedVisibleCount === selectableInputs.length;
+
+      if (toggleBtn) {
+        toggleBtn.classList.toggle('task-action-btn-warn', bulkSelectionMode);
+        toggleBtn.setAttribute('aria-pressed', bulkSelectionMode ? 'true' : 'false');
+        toggleBtn.setAttribute('aria-label', bulkSelectionMode ? 'Désactiver la sélection multiple des notes' : 'Activer la sélection multiple des notes');
+        const label = toggleBtn.querySelector('.taskmda-action-label');
+        if (label) label.textContent = bulkSelectionMode ? 'Annuler sélection' : 'Sélection multiple';
+      }
+      if (deleteBtn) {
+        deleteBtn.classList.toggle('hidden', !bulkSelectionMode);
+        deleteBtn.disabled = selectedCount === 0;
+        deleteBtn.setAttribute('aria-label', `Supprimer les notes sélectionnées (${selectedCount})`);
+        const label = deleteBtn.querySelector('.taskmda-action-label');
+        if (label) label.textContent = `Supprimer sélection (${selectedCount})`;
+      }
+      if (exportBtn) {
+        exportBtn.classList.toggle('hidden', !bulkSelectionMode);
+        exportBtn.disabled = selectedCount === 0;
+        exportBtn.setAttribute('aria-label', `Exporter les notes sélectionnées en ZIP (${selectedCount})`);
+        const label = exportBtn.querySelector('.taskmda-action-label');
+        if (label) label.textContent = `Export ZIP (${selectedCount})`;
+      }
+      if (selectAllBtn) {
+        selectAllBtn.classList.toggle('hidden', !bulkSelectionMode);
+        const nextLabel = allVisibleSelected ? 'Tout désélectionner' : 'Tout sélectionner';
+        const nextAriaLabel = allVisibleSelected ? 'Tout désélectionner les notes visibles' : 'Tout sélectionner les notes visibles';
+        const nextIcon = allVisibleSelected ? 'remove_done' : 'done_all';
+        selectAllBtn.setAttribute('aria-label', nextAriaLabel);
+        selectAllBtn.setAttribute('data-action-label', nextLabel);
+        selectAllBtn.setAttribute('data-ui-tooltip', nextLabel);
+        selectAllBtn.setAttribute('title', nextLabel);
+        const icon = selectAllBtn.querySelector('.taskmda-action-icon, .material-symbols-outlined');
+        if (icon) icon.textContent = nextIcon;
+        const label = selectAllBtn.querySelector('.taskmda-action-label');
+        if (label) label.textContent = nextLabel;
+        global.TaskMDARefreshIconTooltip?.(selectAllBtn);
+      }
+    }
+
+    function setGlobalNotesBulkSelectionMode(enabled, options = {}) {
+      state.setBulkSelectionMode?.(!!enabled);
+      if (!enabled || options.clearSelection) {
+        state.clearSelectedNotes?.();
+      }
+      updateGlobalNotesBulkDeleteUi();
+    }
+
+    function toggleGlobalNoteBulkSelection(noteId, forceValue = null) {
+      const normalizedId = String(noteId || '').trim();
+      if (!normalizedId || !state.getBulkSelectionMode?.()) return;
+      const isSelected = !!state.isNoteSelected?.(normalizedId);
+      const shouldSelect = typeof forceValue === 'boolean'
+        ? forceValue
+        : !isSelected;
+      if (shouldSelect) state.addSelectedNote?.(normalizedId);
+      else state.removeSelectedNote?.(normalizedId);
+      updateGlobalNotesBulkDeleteUi();
+    }
+
+    function selectAllVisibleGlobalNotesForBulkDelete() {
+      if (!state.getBulkSelectionMode?.()) return;
+      const inputs = Array.from(document.querySelectorAll('#global-notes-list .taskmda-bulk-checkbox-input[data-note-id]'))
+        .filter((input) => input instanceof HTMLInputElement && !input.disabled);
+      if (!inputs.length) {
+        updateGlobalNotesBulkDeleteUi();
+        return;
+      }
+      const allSelected = inputs.every((input) => {
+        const noteId = String(input.dataset.noteId || '').trim();
+        return noteId && !!state.isNoteSelected?.(noteId);
+      });
+      inputs.forEach((input) => {
+        const noteId = String(input.dataset.noteId || '').trim();
+        if (!noteId) return;
+        input.checked = !allSelected;
+        input.closest('.global-note-card')?.classList.toggle('is-bulk-selected', !allSelected);
+        if (allSelected) state.removeSelectedNote?.(noteId);
+        else state.addSelectedNote?.(noteId);
+      });
+      updateGlobalNotesBulkDeleteUi();
+    }
+
+    async function deleteSelectedGlobalNotes() {
+      if (!state.getBulkSelectionMode?.()) return;
+      const selectedIds = state.getSelectedNoteIds?.();
+      const normalizedIds = (Array.isArray(selectedIds) ? selectedIds : [])
+        .map((id) => String(id || '').trim())
+        .filter(Boolean);
+      if (!normalizedIds.length) {
+        helpers.showToast?.('Aucune note sélectionnée');
+        return;
+      }
+      const allNotesRaw = await actions.getAllGlobalNotes?.();
+      const allNotes = Array.isArray(allNotesRaw) ? allNotesRaw : [];
+      const deletableIds = normalizedIds.filter((id) => {
+        const note = allNotes.find((row) => String(row?.noteId || '').trim() === id);
+        return note && actions.canManageGlobalNote?.(note);
+      });
+      if (!deletableIds.length) {
+        helpers.showToast?.('Aucune note supprimable dans la sélection');
+        return;
+      }
+      if (!global.confirm(`Supprimer ${deletableIds.length} note(s) sélectionnée(s) ?`)) return;
+      for (const noteId of deletableIds) {
+        await actions.deleteGlobalNoteById?.(noteId);
+        await actions.removeGlobalNoteFromFeed?.(noteId);
+      }
+      if (actions.isGlobalFeedView?.()) {
+        await actions.renderGlobalFeed?.();
+      }
+      state.clearSelectedNotes?.();
+      await rerenderGlobalNotesViewIfActive();
+      helpers.showToast?.(`${deletableIds.length} note(s) supprimée(s)`);
+    }
+
+    async function toggleGlobalNoteFavorite(noteId = '') {
+      const nid = String(noteId || '').trim();
+      if (!nid) return;
+      const note = await actions.getGlobalNoteById?.(nid);
+      if (!note) return;
+      if (!actions.canManageGlobalNote?.(note)) {
+        helpers.showToast?.('Action non autorisée');
+        return;
+      }
+      const isFavorite = Number(note.favoriteAt || 0) > 0;
+      const next = {
+        ...note,
+        favoriteAt: isFavorite ? null : Date.now(),
+        updatedAt: Date.now()
+      };
+      await actions.saveGlobalNote?.(next);
+      await rerenderGlobalNotesViewIfActive();
+      helpers.showToast?.(isFavorite ? 'Note retirée des favoris' : 'Note ajoutée aux favoris');
+    }
+
+    async function toggleGlobalNoteFeedPublish(noteId = '') {
+      const nid = String(noteId || '').trim();
+      if (!nid) return;
+      const note = await actions.getGlobalNoteById?.(nid);
+      if (!note) return;
+      if (!actions.canManageGlobalNote?.(note)) {
+        helpers.showToast?.('Action non autorisee');
+        return;
+      }
+      const next = {
+        ...note,
+        shareToGlobalFeed: !note.shareToGlobalFeed,
+        updatedAt: Date.now()
+      };
+      await actions.saveGlobalNote?.(next);
+      await actions.syncGlobalNoteFeed?.(next);
+      if (actions.isGlobalFeedView?.()) {
+        await actions.renderGlobalFeed?.();
+      }
+      await rerenderGlobalNotesViewIfActive();
+      helpers.showToast?.(next.shareToGlobalFeed ? 'Note publiee dans le fil' : 'Note retiree du fil');
+    }
+
+    async function exportGlobalNote(noteId = '', format = 'html') {
+      const nid = String(noteId || '').trim();
+      if (!nid) return;
+      const note = await actions.getGlobalNoteById?.(nid);
+      if (!note) {
+        helpers.showToast?.('Note introuvable');
+        return;
+      }
+      const title = String(note.title || '').trim() || 'Note';
+      const safeTitle = helpers.sanitizeFilenameSegment?.(title) || 'note';
+      const tag = helpers.formatExportDateTag?.() || String(Date.now());
+      const contentHtml = helpers.sanitizeRichTextHtmlPreserve?.(
+        String(note.contentHtml || '').trim() || helpers.plainTextToRichHtml?.(String(note.content || '').trim()) || ''
+      ) || '';
+      const theme = String(note.theme || '').trim();
+      if (String(format || '').toLowerCase() === 'txt') {
+        const plain = helpers.getProjectDescriptionPlainText?.(contentHtml) || '';
+        const payload = `${title}\n\n${theme ? `Thematique: ${theme}\n\n` : ''}${plain}\n`;
+        helpers.downloadBlobFile?.(payload, `note_${safeTitle}_${tag}.txt`, 'text/plain;charset=utf-8');
+        helpers.showToast?.('Note exportée (TXT)');
+        return;
+      }
+      const tags = Array.isArray(note.tags) ? note.tags.map((entry) => String(entry || '').trim()).filter(Boolean) : [];
+      const escapeHtml = helpers.escapeHtml || ((value) => String(value || ''));
+      const chips = [
+        ...(theme ? [`<span class="chip chip-theme">${escapeHtml(theme)}</span>`] : []),
+        ...tags.map((entry) => `<span class="chip">#${escapeHtml(entry)}</span>`)
+      ].join('');
+      const html = `<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1e293b}h1{margin:0 0 8px}.meta{color:#64748b;font-size:13px;margin-bottom:12px}.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}.chip{font-size:11px;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;color:#334155}.chip-theme{background:#ecfdf5;border-color:#a7f3d0;color:#047857}</style></head><body><h1>${escapeHtml(title)}</h1><p class="meta">${escapeHtml(new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR'))}</p>${chips ? `<div class="chips">${chips}</div>` : ''}<article>${contentHtml || '<p>Aucun contenu.</p>'}</article></body></html>`;
+      helpers.downloadBlobFile?.(html, `note_${safeTitle}_${tag}.html`, 'text/html;charset=utf-8');
+      helpers.showToast?.('Note exportée (HTML)');
+    }
+
+    async function exportGlobalNoteAsPdf(noteId = '') {
+      const nid = String(noteId || '').trim();
+      if (!nid) return;
+      const note = await actions.getGlobalNoteById?.(nid);
+      if (!note) {
+        helpers.showToast?.('Note introuvable');
+        return;
+      }
+      const title = String(note.title || '').trim() || 'Note';
+      const contentHtml = helpers.sanitizeRichTextHtmlPreserve?.(
+        String(note.contentHtml || '').trim() || helpers.plainTextToRichHtml?.(String(note.content || '').trim()) || ''
+      ) || '';
+      const theme = String(note.theme || '').trim();
+      const tags = Array.isArray(note.tags) ? note.tags.map((t) => String(t || '').trim()).filter(Boolean) : [];
+      const dateFormatted = new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR');
+      const escapeHtml = helpers.escapeHtml || ((value) => String(value || ''));
+      const printHtml = `<!doctype html>
+<html lang="fr"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>
+<style>
+body{font-family:'Segoe UI',Arial,sans-serif;padding:24px;color:#1e293b;max-width:800px;margin:0 auto}
+h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
+.meta{color:#64748b;font-size:12px;margin-bottom:12px}
+.tags{margin-bottom:14px}
+.tag{display:inline-block;font-size:10px;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;color:#334155;margin-right:6px;margin-bottom:4px}
+.tag-theme{background:#ecfdf5;border-color:#a7f3d0;color:#047857}
+.content{margin-top:20px;line-height:1.6;color:#1e293b}
+.content img{max-width:100%;height:auto}
+@media print{body{padding:0}}
+</style></head><body>
+<h1>${escapeHtml(title)}</h1>
+<p class="meta">${escapeHtml(dateFormatted)}</p>
+${(theme || tags.length) ? `<div class="tags">${theme ? `<span class="tag tag-theme">${escapeHtml(theme)}</span>` : ''}${tags.map((tag) => `<span class="tag">#${escapeHtml(tag)}</span>`).join('')}</div>` : ''}
+<div class="content">${contentHtml || '<p>Cette note ne contient aucun contenu.</p>'}</div>
+</body></html>`;
+      let popup = null;
+      try {
+        popup = global.open('', '_blank', 'width=900,height=700');
+      } catch (_) {
+        popup = null;
+      }
+      if (popup && popup.document) {
+        popup.document.open();
+        popup.document.write(printHtml);
+        popup.document.close();
+        setTimeout(() => {
+          try { popup.print(); } catch (_) {}
+        }, 300);
+        helpers.showToast?.('Impression ouverte - choisissez Enregistrer en PDF');
+      } else {
+        helpers.showToast?.('Impossible d\'ouvrir la fenetre d\'impression (popup bloquee ?)');
+      }
+    }
+
+    async function exportGlobalNoteAsDocx(noteId = '') {
+      const nid = String(noteId || '').trim();
+      if (!nid) return;
+      const note = await actions.getGlobalNoteById?.(nid);
+      if (!note) {
+        helpers.showToast?.('Note introuvable');
+        return;
+      }
+      const title = String(note.title || '').trim() || 'Note';
+      const safeTitle = helpers.sanitizeFilenameSegment?.(title) || 'note';
+      const contentHtml = helpers.sanitizeRichTextHtmlPreserve?.(
+        String(note.contentHtml || '').trim() || helpers.plainTextToRichHtml?.(String(note.content || '').trim()) || ''
+      ) || '';
+      const theme = String(note.theme || '').trim();
+      const tags = Array.isArray(note.tags) ? note.tags.map((t) => String(t || '').trim()).filter(Boolean) : [];
+      const author = String(note.createdByName || helpers.fallbackDirectoryName?.(note.createdBy || ''));
+      const dateFormatted = new Date(Number(note.updatedAt || note.createdAt || Date.now())).toLocaleString('fr-FR');
+      const converted = helpers.convertHtmlToWordML?.(contentHtml) || { wordML: '', images: [], relationships: [] };
+      const { wordML, images, relationships } = converted;
+      const now = Date.now();
+      const files = [
+        { name: '[Content_Types].xml', data: helpers.generateContentTypesXml?.(images) || '', mtime: now },
+        { name: '_rels/.rels', data: helpers.generateRootRelsXml?.() || '', mtime: now },
+        { name: 'word/document.xml', data: helpers.generateDocumentXml?.({ title, author, dateFormatted, theme, tags }, wordML || ''), mtime: now },
+        { name: 'word/styles.xml', data: helpers.generateStylesXml?.() || '', mtime: now }
+      ];
+      if (images.length > 0) {
+        files.push({
+          name: 'word/_rels/document.xml.rels',
+          data: helpers.generateDocumentRelsXml?.(relationships) || '',
+          mtime: now
+        });
+        images.forEach((img) => {
+          files.push({
+            name: `word/media/${img.filename}`,
+            data: helpers.base64ToUint8Array?.(img.base64) || new Uint8Array(0),
+            mtime: now
+          });
+        });
+      }
+      const zipBytes = helpers.buildZipStoreArchive?.(files);
+      if (!zipBytes) {
+        helpers.showToast?.('Echec export DOCX');
+        return;
+      }
+      const tag = helpers.formatExportDateTag?.() || String(now);
+      helpers.downloadBlobFile?.(
+        new Blob([zipBytes], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }),
+        `note_${safeTitle}_${tag}.docx`,
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      );
+      helpers.showToast?.('Note exportée (DOCX)');
+    }
+
+    function toggleGlobalNoteExportMenu(noteId, event) {
+      global.TaskMDAGlobalNotesExportMenu?.toggleGlobalNoteExportMenu?.(noteId, event);
+    }
+
+    function closeGlobalNoteExportMenu(noteId) {
+      global.TaskMDAGlobalNotesExportMenu?.closeGlobalNoteExportMenu?.(noteId);
+    }
+
+    function handleGlobalNotesExportMenuDocumentClick(event) {
+      global.TaskMDAGlobalNotesExportMenu?.handleGlobalNotesExportMenuDocumentClick?.(event);
+    }
+
+    function buildGlobalNoteCardHtml(note, options = {}) {
+      return notesCardBuilder?.build?.(note, options) || '';
+    }
+
+    function buildGlobalHubProjectNoteRef(projectId, noteId) {
+      return notesNavigation?.buildGlobalHubProjectNoteRef?.(projectId, noteId)
+        || `project:${encodeURIComponent(String(projectId || '').trim())}:${encodeURIComponent(String(noteId || '').trim())}`;
+    }
+
+    function parseGlobalHubProjectNoteRef(refValue) {
+      return notesNavigation?.parseGlobalHubProjectNoteRef?.(refValue) || null;
+    }
+
+    async function openGlobalHubAggregatedNoteRead(noteRef) {
+      await notesNavigation?.openGlobalHubAggregatedNoteRead?.(noteRef);
+    }
+
+    async function collectGlobalNotesAggregationContext() {
+      return await notesRenderer?.collectGlobalNotesAggregationContext?.()
+        || { me: String(state.getCurrentUserId?.() || '').trim(), notesGlobal: [], aggregatedProjectNotes: [] };
+    }
+
+    async function collectGlobalNotesLinkedDocsContext() {
+      return await notesRenderer?.collectGlobalNotesLinkedDocsContext?.()
+        || { linkedDocsByNoteId: new Map(), linkedDocCountByNoteId: new Map() };
+    }
+
+    function filterAndSortGlobalNotes(notes, options = {}) {
+      return notesRenderer?.filterAndSortGlobalNotes?.(notes, options) || [];
+    }
+
+    function renderGlobalNotesResults(options = {}) {
+      notesRenderer?.renderGlobalNotesResults?.(options);
+    }
+
+    function finalizeGlobalNotesRenderUi() {
+      notesRenderer?.finalizeGlobalNotesRenderUi?.();
+    }
+
+    async function renderGlobalNotes() {
+      const host = document.getElementById('global-notes-list');
+      const countEl = document.getElementById('global-notes-count');
+      const paginationContainer = document.getElementById('global-notes-pagination');
+      if (!host) return;
+      actions.ensureGlobalNotesVerticalThemeLayout?.();
+      const linkedCtx = await collectGlobalNotesLinkedDocsContext();
+      const linkedDocsByNoteId = linkedCtx?.linkedDocsByNoteId instanceof Map ? linkedCtx.linkedDocsByNoteId : new Map();
+      const linkedDocCountByNoteId = linkedCtx?.linkedDocCountByNoteId instanceof Map ? linkedCtx.linkedDocCountByNoteId : new Map();
+      const aggregationCtx = await collectGlobalNotesAggregationContext();
+      const notesGlobal = Array.isArray(aggregationCtx?.notesGlobal) ? aggregationCtx.notesGlobal : [];
+      const aggregatedProjectNotes = Array.isArray(aggregationCtx?.aggregatedProjectNotes) ? aggregationCtx.aggregatedProjectNotes : [];
+      const me = String(aggregationCtx?.me || state.getCurrentUserId?.() || '').trim();
+      const notes = [
+        ...notesGlobal.map((note) => ({ ...note, __origin: 'global' })),
+        ...aggregatedProjectNotes
+      ];
+      actions.renderGlobalNotesThemeTabs?.(notes);
+      const filtered = filterAndSortGlobalNotes(notes, {
+        currentUserId: me,
+        searchQuery: state.getSearchQuery?.() || '',
+        originFilter: state.getOriginFilter?.() || 'all',
+        scopeFilter: state.getScopeFilter?.() || 'all',
+        tabMode: state.getTabMode?.() || 'all',
+        themeFilter: state.getThemeFilter?.() || 'all',
+        sortMode: state.getSortMode?.() || 'recent'
+      });
+      renderGlobalNotesResults({
+        host,
+        countEl,
+        paginationContainer,
+        filtered,
+        linkedDocsByNoteId,
+        linkedDocCountByNoteId,
+        currentUserId: String(state.getCurrentUserId?.() || '')
+      });
+      finalizeGlobalNotesRenderUi();
     }
 
     function bindDom() {
@@ -358,16 +746,15 @@
 
       document.getElementById('btn-global-notes-bulk-toggle')?.addEventListener('click', async () => {
         const nextEnabled = !state.getBulkSelectionMode?.();
-        actions.setGlobalNotesBulkSelectionMode?.(nextEnabled, { clearSelection: !nextEnabled });
-        if (!nextEnabled) actions.clearSelectedGlobalNotesBulk?.();
+        setGlobalNotesBulkSelectionMode(nextEnabled, { clearSelection: !nextEnabled });
         await actions.renderGlobalNotes?.();
       });
 
       document.getElementById('btn-global-notes-bulk-select-all')?.addEventListener('click', () => {
-        actions.selectAllVisibleGlobalNotesForBulkDelete?.();
+        selectAllVisibleGlobalNotesForBulkDelete();
       });
       document.getElementById('btn-global-notes-bulk-delete')?.addEventListener('click', async () => {
-        await actions.deleteSelectedGlobalNotes?.();
+        await deleteSelectedGlobalNotes();
       });
       document.getElementById('btn-global-notes-bulk-export')?.addEventListener('click', () => {
         openGlobalNotesBulkExportModal();
@@ -386,7 +773,9 @@
         await actions.openGlobalNoteEditor?.('');
       });
       document.getElementById('btn-global-note-save')?.addEventListener('click', async () => {
-        await actions.saveGlobalNoteFromEditor?.();
+        await runWithLoading(async () => {
+          await actions.saveGlobalNoteFromEditor?.();
+        });
       });
       document.getElementById('btn-global-note-delete')?.addEventListener('click', async () => {
         await actions.deleteGlobalNote?.();
@@ -414,7 +803,9 @@
           const key = String(event.key || '').toLowerCase();
           if ((event.ctrlKey || event.metaKey) && key === 's') {
             event.preventDefault();
-            void actions.saveGlobalNoteFromEditor?.();
+            void runWithLoading(async () => {
+              await actions.saveGlobalNoteFromEditor?.();
+            });
             return;
           }
           if (key === 'escape') {
@@ -428,18 +819,38 @@
 
     return {
       bindDom,
-      renderGlobalNotes: (...args) => actions.renderGlobalNotes?.(...args),
+      renderGlobalNotes,
       openGlobalNoteEditor: (...args) => actions.openGlobalNoteEditor?.(...args),
       saveGlobalNoteFromEditor: (...args) => actions.saveGlobalNoteFromEditor?.(...args),
       deleteGlobalNote: (...args) => actions.deleteGlobalNote?.(...args),
-      toggleGlobalNoteFeedPublish: (...args) => actions.toggleGlobalNoteFeedPublish?.(...args),
-      toggleGlobalNoteFavorite: (...args) => actions.toggleGlobalNoteFavorite?.(...args),
-      exportGlobalNote: (...args) => actions.exportGlobalNote?.(...args),
+      exportGlobalNote,
       setGlobalNotesPage,
+      updateGlobalNotesBulkDeleteUi,
+      setGlobalNotesBulkSelectionMode,
+      selectAllVisibleGlobalNotesForBulkDelete,
+      deleteSelectedGlobalNotes,
       openGlobalNotesBulkExportModal,
       closeGlobalNotesBulkExportModal,
       confirmGlobalNotesBulkExportFromModal,
-      toggleGlobalNoteBulkSelection: (...args) => actions.toggleGlobalNoteBulkSelection?.(...args)
+      generatePdfBlobForNote,
+      exportSelectedGlobalNotesAsZip,
+      toggleGlobalNoteBulkSelection,
+      toggleGlobalNoteFavorite,
+      toggleGlobalNoteFeedPublish,
+      exportGlobalNoteAsPdf,
+      exportGlobalNoteAsDocx,
+      buildGlobalNoteCardHtml,
+      buildGlobalHubProjectNoteRef,
+      parseGlobalHubProjectNoteRef,
+      openGlobalHubAggregatedNoteRead,
+      collectGlobalNotesAggregationContext,
+      collectGlobalNotesLinkedDocsContext,
+      filterAndSortGlobalNotes,
+      renderGlobalNotesResults,
+      finalizeGlobalNotesRenderUi,
+      toggleGlobalNoteExportMenu,
+      closeGlobalNoteExportMenu,
+      handleGlobalNotesExportMenuDocumentClick
     };
   }
 
@@ -1490,7 +1901,12 @@
           taskSelect.value = '';
           calendarSelect.value = '';
           await actions.updateGlobalFeedMentionCounter?.();
-          await actions.renderGlobalFeed?.();
+          {
+            const patched = await tryPatchGlobalFeedPostEditIncremental(existing);
+            if (!patched) {
+              await actions.renderGlobalFeed?.();
+            }
+          }
           actions.resetGlobalFeedLinkedDocIdsDraft?.();
           if (state.getSharedFolderHandle?.()) {
             actions.writeGlobalFeedPostToSharedFolder?.(existing);
@@ -1528,13 +1944,93 @@
       taskSelect.value = '';
       calendarSelect.value = '';
       await actions.updateGlobalFeedMentionCounter?.();
-      await actions.renderGlobalFeed?.();
+      {
+        const patched = await tryInsertGlobalFeedPostIncremental(post);
+        if (!patched) {
+          await actions.renderGlobalFeed?.();
+        }
+      }
       actions.resetGlobalFeedLinkedDocIdsDraft?.();
       if (state.getSharedFolderHandle?.()) {
         actions.writeGlobalFeedPostToSharedFolder?.(post);
       }
       helpers.showToast?.('Post publie');
       actions.setGlobalFeedComposerCollapsed?.(true);
+    }
+
+    async function tryPatchGlobalFeedPostEditIncremental(post) {
+      const postId = String(post?.postId || '').trim();
+      if (!postId) return false;
+      const list = document.getElementById('global-feed-list');
+      if (!list) return false;
+      const currentCard = document.getElementById(`global-feed-post-${postId}`);
+      if (!currentCard) return false;
+      const scope = await prepareGlobalFeedRenderScope();
+      const posts = Array.isArray(scope?.posts) ? scope.posts : [];
+      const allDocs = Array.isArray(scope?.allDocs) ? scope.allDocs : [];
+      const mentionCatalog = scope?.mentionCatalog || state.getGlobalFeedMentionCatalogCache?.() || null;
+      const refreshedPost = posts.find((entry) => String(entry?.postId || '').trim() === postId);
+      if (!refreshedPost) return false;
+      const cardHtml = await buildGlobalFeedCardsHtml([refreshedPost], allDocs, mentionCatalog);
+      if (!cardHtml) return false;
+      const host = document.createElement('div');
+      host.innerHTML = cardHtml.trim();
+      const nextCard = host.firstElementChild;
+      if (!nextCard) return false;
+      currentCard.replaceWith(nextCard);
+      renderGlobalFeedSummary(posts, mentionCatalog);
+      return true;
+    }
+
+    async function tryInsertGlobalFeedPostIncremental(post) {
+      const postId = String(post?.postId || '').trim();
+      if (!postId) return false;
+      const list = document.getElementById('global-feed-list');
+      if (!list) return false;
+      const scope = await prepareGlobalFeedRenderScope();
+      const posts = Array.isArray(scope?.posts) ? scope.posts : [];
+      const allDocs = Array.isArray(scope?.allDocs) ? scope.allDocs : [];
+      const mentionCatalog = scope?.mentionCatalog || state.getGlobalFeedMentionCatalogCache?.() || null;
+      const newPost = posts.find((entry) => String(entry?.postId || '').trim() === postId);
+      if (!newPost) return false;
+
+      const cardHtml = await buildGlobalFeedCardsHtml([newPost], allDocs, mentionCatalog);
+      if (!cardHtml) return false;
+      const host = document.createElement('div');
+      host.innerHTML = cardHtml.trim();
+      const nextCard = host.firstElementChild;
+      if (!nextCard) return false;
+
+      const existingSame = document.getElementById(`global-feed-post-${postId}`);
+      if (existingSame) {
+        existingSame.replaceWith(nextCard);
+      } else {
+        const firstRenderableCard = list.querySelector('.feed-item');
+        if (!firstRenderableCard) {
+          list.innerHTML = '';
+          list.appendChild(nextCard);
+        } else {
+          const idsInOrder = posts
+            .map((entry) => String(entry?.postId || '').trim())
+            .filter(Boolean);
+          const newIndex = idsInOrder.indexOf(postId);
+          let anchor = null;
+          if (newIndex >= 0) {
+            for (let i = newIndex + 1; i < idsInOrder.length; i += 1) {
+              const candidate = document.getElementById(`global-feed-post-${idsInOrder[i]}`);
+              if (candidate) {
+                anchor = candidate;
+                break;
+              }
+            }
+          }
+          if (anchor) list.insertBefore(nextCard, anchor);
+          else list.appendChild(nextCard);
+        }
+      }
+
+      renderGlobalFeedSummary(posts, mentionCatalog);
+      return true;
     }
 
     async function openGlobalFeedReference(type, refId) {
@@ -1583,6 +2079,96 @@
       await actions.showGlobalWorkspace?.('feed');
       await actions.renderGlobalFeed?.();
       actions.expandGlobalFeedPostCard?.(nextPostId);
+    }
+
+    async function openGlobalFeedPostReadModal(postId = '') {
+      const pid = String(postId || '').trim();
+      if (!pid) return;
+      const notesShared = global.TaskMDANotesShared;
+      const post = await actions.getGlobalPostById?.(pid);
+      if (!post || post.deletedAt) {
+        helpers.showToast?.('Post introuvable');
+        return;
+      }
+      const modal = document.getElementById('modal-global-read');
+      const titleEl = document.getElementById('global-read-title');
+      const metaEl = document.getElementById('global-read-meta');
+      const badgesEl = document.getElementById('global-read-badges');
+      const contentEl = document.getElementById('global-read-content');
+      const linksEl = document.getElementById('global-read-links');
+      if (!modal || !titleEl || !metaEl || !badgesEl || !contentEl || !linksEl) return;
+
+      let mentionCatalog = state.getGlobalFeedMentionCatalogCache?.();
+      if (!mentionCatalog) {
+        mentionCatalog = await actions.buildGlobalMentionCatalog?.();
+        if (mentionCatalog) state.setGlobalFeedMentionCatalogCache?.(mentionCatalog);
+      }
+      const title = String(post.title || '').trim() || 'Information';
+      const author = String(post.authorName || actions.fallbackDirectoryName?.(post.authorUserId || '')).trim() || 'Auteur';
+      const typeMeta = actions.getDashboardNewsTypeMeta?.(post) || { label: 'Information' };
+      const refs = Array.isArray(post.refs) ? post.refs : [];
+      const allDocs = await actions.getAllGlobalDocs?.();
+      const linkedDocs = await resolveLinkedDocsForFeedPost(post, allDocs);
+
+      titleEl.textContent = title;
+      metaEl.textContent = `${author} • ${new Date(Number(post.updatedAt || post.createdAt || Date.now())).toLocaleString('fr-FR')}`;
+      badgesEl.innerHTML = `<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-slate-100 text-slate-700 font-semibold">${helpers.escapeHtml?.(typeMeta.label || 'Information')}</span>`;
+      contentEl.innerHTML = actions.renderGlobalFeedContentHtml?.(post.content || '', mentionCatalog) || '<p>Aucun contenu.</p>';
+      const refsHtml = refs.map((ref) => `
+        <button type="button" class="workspace-action-inline" data-action-kind="open" data-action-label="Ouvrir la reference" data-doc-action="open-reference" data-doc-ref-type="${helpers.escapeHtml?.(String(ref?.type || ''))}" data-doc-ref-id="${encodeURIComponent(String(ref?.id || ''))}">
+          ${helpers.escapeHtml?.(String(ref?.label || 'Reference'))}
+        </button>
+      `).join('');
+      const docsHtml = linkedDocs.map((doc) => {
+        const ref = String(doc?.ref || '').trim();
+        if (!ref) return '';
+        if (notesShared?.renderInlineDocLinks) {
+          return notesShared.renderInlineDocLinks([{
+            name: doc.name,
+            previewPayload: { refPayload: ref },
+            downloadPayload: { refPayload: ref }
+          }], { previewLabel: 'Aperçu', downloadLabel: 'Télécharger' });
+        }
+        return `<div class="inline-flex items-center gap-1 mr-2 mb-1"><span class="inline-flex items-center text-xs text-slate-700">📎 ${helpers.escapeHtml?.(doc.name)}</span></div>`;
+      }).join('');
+      linksEl.innerHTML = `${refsHtml}${docsHtml}`;
+      notesShared?.bindInlineDocLinkActions?.('global-read-links', linkedDocs.map((doc) => {
+        const ref = String(doc?.ref || '').trim();
+        return {
+          previewPayload: ref ? { refPayload: ref } : null,
+          downloadPayload: ref ? { refPayload: ref } : null
+        };
+      }), {
+        onPreview(payload) {
+          const ref = String(payload?.refPayload || '').trim();
+          if (!ref) return;
+          actions.openDocumentPreviewByRef?.(ref);
+        },
+        onDownload(payload) {
+          const ref = String(payload?.refPayload || '').trim();
+          if (!ref) return;
+          actions.downloadDocumentByRef?.(ref);
+        }
+      });
+      if (!linksEl.__taskMdaFeedRefDelegationBound) {
+        linksEl.addEventListener('click', (event) => {
+          const btn = event.target instanceof Element ? event.target.closest('[data-doc-action="open-reference"]') : null;
+          if (!btn) return;
+          event.preventDefault();
+          event.stopPropagation();
+          const type = String(btn.getAttribute('data-doc-ref-type') || '').trim();
+          const id = String(btn.getAttribute('data-doc-ref-id') || '').trim();
+          if (!type || !id) return;
+          openGlobalFeedReference(type, id);
+        });
+        linksEl.__taskMdaFeedRefDelegationBound = true;
+      }
+
+      notesShared?.openModal?.('modal-global-read');
+      if (!notesShared) {
+        modal.classList.remove('hidden');
+        document.body.classList.add('overflow-hidden');
+      }
     }
 
     function refreshGlobalFeedFilterButtons() {
@@ -1990,6 +2576,256 @@
       return cardsHtml.join('');
     }
 
+    async function exportGlobalFeedPost(postId = '', format = 'html') {
+      async function resolveLinkedNoteTheme(post) {
+        const refs = Array.isArray(post?.refs) ? post.refs : [];
+        const globalNoteRef = refs.find((ref) => String(ref?.type || '').trim() === 'global-note' && String(ref?.id || '').trim());
+        if (globalNoteRef) {
+          const globalNote = await actions.getGlobalNoteById?.(String(globalNoteRef.id || '').trim());
+          const theme = String(globalNote?.theme || '').trim();
+          if (theme) return theme;
+        }
+        const projectNoteRef = refs.find((ref) => String(ref?.type || '').trim() === 'project-note' && String(ref?.id || '').trim());
+        if (projectNoteRef) {
+          const parts = String(projectNoteRef.id || '').split(':');
+          const projectId = String(parts[0] || '').trim();
+          const noteId = String(parts[1] || '').trim();
+          if (!projectId || !noteId) return '';
+          const projectState = await actions.getProjectState?.(projectId, { ignoreAccessCheck: true });
+          const note = (Array.isArray(projectState?.notes) ? projectState.notes : [])
+            .find((entry) => String(entry?.noteId || '').trim() === noteId);
+          return String(note?.theme || '').trim();
+        }
+        return '';
+      }
+
+      const pid = String(postId || '').trim();
+      if (!pid) return;
+      const post = await actions.getGlobalPostById?.(pid);
+      if (!post || post.deletedAt) {
+        helpers.showToast?.('Post introuvable');
+        return;
+      }
+      const title = String(post.title || '').trim() || 'Post';
+      const safeTitle = helpers.sanitizeFilenameSegment?.(title) || 'post';
+      const tag = helpers.formatExportDateTag?.() || String(Date.now());
+      const contentHtml = helpers.sanitizeRichTextHtmlPreserve?.(String(post.content || '').trim()) || '';
+      const linkedNoteTheme = await resolveLinkedNoteTheme(post);
+      if (String(format || '').toLowerCase() === 'txt') {
+        const plain = helpers.getProjectDescriptionPlainText?.(contentHtml) || '';
+        const payload = `${title}\n\n${linkedNoteTheme ? `Thematique: ${linkedNoteTheme}\n\n` : ''}${plain}\n`;
+        helpers.downloadBlobFile?.(payload, `post_${safeTitle}_${tag}.txt`, 'text/plain;charset=utf-8');
+        helpers.showToast?.('Post exporte (TXT)');
+        return;
+      }
+      const escapeHtml = helpers.escapeHtml || ((value) => String(value || ''));
+      const html = `<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1e293b}h1{margin:0 0 8px}.meta{color:#64748b;font-size:13px;margin-bottom:14px}.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}.chip{font-size:11px;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;color:#334155}.chip-theme{background:#ecfdf5;border-color:#a7f3d0;color:#047857}</style></head><body><h1>${escapeHtml(title)}</h1><p class="meta">${escapeHtml(String(post.authorName || actions.fallbackDirectoryName?.(post.authorUserId || '')))} | ${escapeHtml(new Date(Number(post.updatedAt || post.createdAt || Date.now())).toLocaleString('fr-FR'))}</p>${linkedNoteTheme ? `<div class="chips"><span class="chip chip-theme">${escapeHtml(linkedNoteTheme)}</span></div>` : ''}<article>${contentHtml || '<p>Aucun contenu.</p>'}</article></body></html>`;
+      helpers.downloadBlobFile?.(html, `post_${safeTitle}_${tag}.html`, 'text/html;charset=utf-8');
+      helpers.showToast?.('Post exporte (HTML)');
+    }
+
+    async function exportGlobalFeedPostAsPdf(postId = '') {
+      const pid = String(postId || '').trim();
+      if (!pid) return;
+      const post = await actions.getGlobalPostById?.(pid);
+      if (!post || post.deletedAt) {
+        helpers.showToast?.('Post introuvable');
+        return;
+      }
+      const title = String(post.title || '').trim() || 'Post';
+      const contentHtml = helpers.sanitizeRichTextHtmlPreserve?.(String(post.content || '').trim()) || '';
+      const author = String(post.authorName || actions.fallbackDirectoryName?.(post.authorUserId || '')).trim() || 'Auteur inconnu';
+      const dateFormatted = new Date(Number(post.updatedAt || post.createdAt || Date.now())).toLocaleString('fr-FR');
+      let linkedNoteTheme = '';
+      try {
+        const refs = Array.isArray(post?.refs) ? post.refs : [];
+        const globalNoteRef = refs.find((ref) => String(ref?.type || '').trim() === 'global-note' && String(ref?.id || '').trim());
+        if (globalNoteRef) {
+          linkedNoteTheme = String((await actions.getGlobalNoteById?.(String(globalNoteRef.id || '').trim()))?.theme || '').trim();
+        }
+        if (!linkedNoteTheme) {
+          const projectNoteRef = refs.find((ref) => String(ref?.type || '').trim() === 'project-note' && String(ref?.id || '').trim());
+          if (projectNoteRef) {
+            const parts = String(projectNoteRef.id || '').split(':');
+            const projectId = String(parts[0] || '').trim();
+            const noteId = String(parts[1] || '').trim();
+            const projectState = await actions.getProjectState?.(projectId, { ignoreAccessCheck: true });
+            const note = (Array.isArray(projectState?.notes) ? projectState.notes : []).find((entry) => String(entry?.noteId || '').trim() === noteId);
+            linkedNoteTheme = String(note?.theme || '').trim();
+          }
+        }
+      } catch (_) {
+        linkedNoteTheme = '';
+      }
+      const escapeHtml = helpers.escapeHtml || ((value) => String(value || ''));
+      const printHtml = `<!doctype html>
+<html lang="fr"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title>
+<style>
+body{font-family:'Segoe UI',Arial,sans-serif;padding:24px;color:#1e293b;max-width:800px;margin:0 auto}
+h1{margin:0 0 8px;font-size:24px;font-weight:bold;color:#1e293b}
+.meta{color:#64748b;font-size:12px;margin-bottom:12px}
+.tags{margin-bottom:14px}
+.tag{display:inline-block;font-size:10px;border:1px solid #cbd5e1;border-radius:999px;padding:3px 8px;background:#f8fafc;color:#334155;margin-right:6px;margin-bottom:4px}
+.tag-theme{background:#ecfdf5;border-color:#a7f3d0;color:#047857}
+.content{margin-top:20px;line-height:1.6;color:#1e293b}
+.content img{max-width:100%;height:auto}
+@media print{body{padding:0}}
+</style></head><body>
+<h1>${escapeHtml(title)}</h1>
+<p class="meta">${escapeHtml(author)} | ${escapeHtml(dateFormatted)}</p>
+${linkedNoteTheme ? `<div class="tags"><span class="tag tag-theme">${escapeHtml(linkedNoteTheme)}</span></div>` : ''}
+<div class="content">${contentHtml || '<p>Ce post ne contient aucun contenu.</p>'}</div>
+</body></html>`;
+      let popup = null;
+      try {
+        popup = global.open('', '_blank', 'width=900,height=700');
+      } catch (_) {
+        popup = null;
+      }
+      if (popup && popup.document) {
+        popup.document.open();
+        popup.document.write(printHtml);
+        popup.document.close();
+        setTimeout(() => {
+          try { popup.print(); } catch (_) {}
+        }, 300);
+        helpers.showToast?.('Impression ouverte - choisissez Enregistrer en PDF');
+      } else {
+        helpers.showToast?.('Impossible d ouvrir la fenetre d impression (popup bloquee ?)');
+      }
+    }
+
+    async function exportGlobalFeedPostAsDocx(postId = '') {
+      const pid = String(postId || '').trim();
+      if (!pid) return;
+      const post = await actions.getGlobalPostById?.(pid);
+      if (!post || post.deletedAt) {
+        helpers.showToast?.('Post introuvable');
+        return;
+      }
+      const title = String(post.title || '').trim() || 'Post';
+      const safeTitle = helpers.sanitizeFilenameSegment?.(title) || 'post';
+      const contentHtml = helpers.sanitizeRichTextHtmlPreserve?.(String(post.content || '').trim()) || '';
+      const author = String(post.authorName || actions.fallbackDirectoryName?.(post.authorUserId || '')).trim() || 'Auteur inconnu';
+      const dateFormatted = new Date(Number(post.updatedAt || post.createdAt || Date.now())).toLocaleString('fr-FR');
+      let linkedNoteTheme = '';
+      try {
+        const refs = Array.isArray(post?.refs) ? post.refs : [];
+        const globalNoteRef = refs.find((ref) => String(ref?.type || '').trim() === 'global-note' && String(ref?.id || '').trim());
+        if (globalNoteRef) {
+          linkedNoteTheme = String((await actions.getGlobalNoteById?.(String(globalNoteRef.id || '').trim()))?.theme || '').trim();
+        }
+        if (!linkedNoteTheme) {
+          const projectNoteRef = refs.find((ref) => String(ref?.type || '').trim() === 'project-note' && String(ref?.id || '').trim());
+          if (projectNoteRef) {
+            const parts = String(projectNoteRef.id || '').split(':');
+            const projectId = String(parts[0] || '').trim();
+            const noteId = String(parts[1] || '').trim();
+            const projectState = await actions.getProjectState?.(projectId, { ignoreAccessCheck: true });
+            const note = (Array.isArray(projectState?.notes) ? projectState.notes : []).find((entry) => String(entry?.noteId || '').trim() === noteId);
+            linkedNoteTheme = String(note?.theme || '').trim();
+          }
+        }
+      } catch (_) {
+        linkedNoteTheme = '';
+      }
+      const converted = helpers.convertHtmlToWordML?.(contentHtml) || { wordML: '', images: [], relationships: [] };
+      const { wordML, images, relationships } = converted;
+      const now = Date.now();
+      const files = [
+        { name: '[Content_Types].xml', data: helpers.generateContentTypesXml?.(images) || '', mtime: now },
+        { name: '_rels/.rels', data: helpers.generateRootRelsXml?.() || '', mtime: now },
+        { name: 'word/document.xml', data: helpers.generateDocumentXml?.({ title, author, dateFormatted, theme: linkedNoteTheme, tags: [] }, wordML || ''), mtime: now },
+        { name: 'word/styles.xml', data: helpers.generateStylesXml?.() || '', mtime: now }
+      ];
+      if (images.length > 0) {
+        files.push({
+          name: 'word/_rels/document.xml.rels',
+          data: helpers.generateDocumentRelsXml?.(relationships) || '',
+          mtime: now
+        });
+        images.forEach((img) => {
+          files.push({
+            name: `word/media/${img.filename}`,
+            data: helpers.base64ToUint8Array?.(img.base64) || new Uint8Array(0),
+            mtime: now
+          });
+        });
+      }
+      const zipBytes = helpers.buildZipStoreArchive?.(files);
+      if (!zipBytes) {
+        helpers.showToast?.('Echec export DOCX');
+        return;
+      }
+      const tag = helpers.formatExportDateTag?.() || String(now);
+      helpers.downloadBlobFile?.(
+        new Blob([zipBytes], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }),
+        `post_${safeTitle}_${tag}.docx`,
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+      );
+      helpers.showToast?.('Post exporte (DOCX)');
+    }
+
+    function toggleGlobalFeedExportMenu(postId, event) {
+      if (event) {
+        event.stopPropagation();
+        event.preventDefault();
+      }
+      const pid = String(postId || '').trim();
+      if (!pid) return;
+      const menu = document.getElementById(`feed-export-menu-${pid}`);
+      const btn = document.getElementById(`feed-export-menu-btn-${pid}`);
+      if (!menu || !btn) return;
+      forEachOpenGlobalFeedExportMenu((otherMenu) => {
+        if (otherMenu.id !== menu.id && !otherMenu.classList.contains('hidden')) {
+          otherMenu.classList.add('hidden');
+          const otherId = otherMenu.id.replace('feed-export-menu-', '');
+          const otherBtn = document.getElementById(`feed-export-menu-btn-${otherId}`);
+          if (otherBtn) otherBtn.setAttribute('aria-expanded', 'false');
+        }
+      });
+      const isHidden = menu.classList.contains('hidden');
+      if (isHidden) {
+        menu.classList.remove('hidden');
+        btn.setAttribute('aria-expanded', 'true');
+      } else {
+        menu.classList.add('hidden');
+        btn.setAttribute('aria-expanded', 'false');
+      }
+    }
+
+    function closeGlobalFeedExportMenu(postId) {
+      const pid = String(postId || '').trim();
+      if (!pid) return;
+      const menu = document.getElementById(`feed-export-menu-${pid}`);
+      const btn = document.getElementById(`feed-export-menu-btn-${pid}`);
+      if (menu) menu.classList.add('hidden');
+      if (btn) btn.setAttribute('aria-expanded', 'false');
+    }
+
+    function handleGlobalFeedExportMenuDocumentClick(event) {
+      const target = event?.target;
+      if (!(target instanceof Element)) return;
+      const isFeedMenuButton = target.closest('[id^="feed-export-menu-btn-"]');
+      const isFeedMenu = target.closest('[id^="feed-export-menu-"]');
+      if (isFeedMenuButton || isFeedMenu) return;
+      forEachOpenGlobalFeedExportMenu((menu) => {
+        if (!menu.classList.contains('hidden')) {
+          menu.classList.add('hidden');
+          const postId = menu.id.replace('feed-export-menu-', '');
+          const btn = document.getElementById(`feed-export-menu-btn-${postId}`);
+          if (btn) btn.setAttribute('aria-expanded', 'false');
+        }
+      });
+    }
+
+    function forEachOpenGlobalFeedExportMenu(visitor) {
+      if (typeof visitor !== 'function') return;
+      document.querySelectorAll('[id^="feed-export-menu-"]:not([id^="feed-export-menu-btn-"])').forEach((menu) => {
+        visitor(menu);
+      });
+    }
+
     function bindDom() {
       // DOM bindings are attached once; module remains idempotent across repeated init calls.
       if (bound) return;
@@ -2027,8 +2863,15 @@
       buildGlobalFeedCardsHtml,
       openGlobalFeedReference,
       openGlobalFeedPost,
+      openGlobalFeedPostReadModal,
       refreshGlobalFeedFilterButtons,
-      renderGlobalFeedSummary
+      renderGlobalFeedSummary,
+      exportGlobalFeedPost,
+      exportGlobalFeedPostAsPdf,
+      exportGlobalFeedPostAsDocx,
+      toggleGlobalFeedExportMenu,
+      closeGlobalFeedExportMenu,
+      handleGlobalFeedExportMenuDocumentClick
     };
   }
 
@@ -2048,9 +2891,12 @@
     // Business operations are injected from the main orchestrator.
     const opts = options || {};
     const actions = opts.actions || {};
+    let bound = false;
 
     function bindDom() {
       // DOM bindings are attached once; module remains idempotent across repeated init calls.
+      if (bound) return;
+      bound = true;
       document.getElementById('btn-global-toggle-emoji-picker')?.addEventListener('click', (event) => {
         event.preventDefault();
         event.stopPropagation();

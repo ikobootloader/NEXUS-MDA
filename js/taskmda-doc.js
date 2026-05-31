@@ -794,8 +794,10 @@
       });
 
       const modal = document.getElementById('modal-doc-preview');
-      if (!modal || modal.dataset.inlineDocPreviewBound === '1') return;
-      modal.dataset.inlineDocPreviewBound = '1';
+      // Guard partage avec taskmda-team.js pour eviter le double-binding sur la meme modale.
+      const DOC_PREVIEW_SHARED_BIND_FLAG = 'inlineDocPreviewBound';
+      if (!modal || modal.dataset[DOC_PREVIEW_SHARED_BIND_FLAG] === '1') return;
+      modal.dataset[DOC_PREVIEW_SHARED_BIND_FLAG] = '1';
       modal.addEventListener('click', (event) => {
         const clickTarget = event.target instanceof Element ? event.target : null;
         if (clickTarget?.closest('a[data-inline-ignore], a[href], button')) return;

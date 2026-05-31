@@ -10317,8 +10317,8 @@ ${clone.outerHTML}
       const previewBtn = document.getElementById('btn-wf-wiki-toggle-preview');
       const previewWrap = document.getElementById('wf-procedure-wiki-preview');
 
-      if (sectionBtn && sectionBtn.dataset.boundWorkflowWikiHelper !== '1') {
-        sectionBtn.dataset.boundWorkflowWikiHelper = '1';
+      if (sectionBtn && sectionBtn.dataset.workflowWikiSectionHelperBound !== '1') {
+        sectionBtn.dataset.workflowWikiSectionHelperBound = '1';
         sectionBtn.addEventListener('click', () => {
           if (state.procedureQuill) {
             const quill = state.procedureQuill;
@@ -10333,8 +10333,8 @@ ${clone.outerHTML}
         });
       }
 
-      if (linkBtn && linkBtn.dataset.boundWorkflowWikiHelper !== '1') {
-        linkBtn.dataset.boundWorkflowWikiHelper = '1';
+      if (linkBtn && linkBtn.dataset.workflowWikiLinkHelperBound !== '1') {
+        linkBtn.dataset.workflowWikiLinkHelperBound = '1';
         linkBtn.addEventListener('click', () => {
           const target = (window.prompt('Titre de la procedure cible (wiki interne)') || '').trim();
           if (!target) return;
@@ -10352,8 +10352,8 @@ ${clone.outerHTML}
         });
       }
 
-      if (previewBtn && previewBtn.dataset.boundWorkflowWikiHelper !== '1') {
-        previewBtn.dataset.boundWorkflowWikiHelper = '1';
+      if (previewBtn && previewBtn.dataset.workflowWikiPreviewHelperBound !== '1') {
+        previewBtn.dataset.workflowWikiPreviewHelperBound = '1';
         previewBtn.addEventListener('click', () => {
           if (!previewWrap) return;
           previewWrap.classList.toggle('hidden');
@@ -10367,8 +10367,8 @@ ${clone.outerHTML}
 
     function bindProcedureFallbackToolbar() {
       refs.detailBody?.querySelectorAll('.project-editor-btn[data-editor-target="wf-procedure-editor"][data-editor-action]')?.forEach((btn) => {
-        if (btn.dataset.boundWorkflowProcedureEditor === '1') return;
-        btn.dataset.boundWorkflowProcedureEditor = '1';
+        if (btn.dataset.workflowProcedureEditorActionBound === '1') return;
+        btn.dataset.workflowProcedureEditorActionBound = '1';
         btn.addEventListener('click', () => {
           const action = String(btn.getAttribute('data-editor-action') || '');
           if (state.procedureQuill) {

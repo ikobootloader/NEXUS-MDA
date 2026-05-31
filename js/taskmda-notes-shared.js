@@ -2,6 +2,10 @@
   'use strict';
 
   function escapeHtml(value) {
+    const coreEscapeHtml = global.TaskMDACoreUtils?.escapeHtml;
+    if (typeof coreEscapeHtml === 'function') {
+      return coreEscapeHtml(value);
+    }
     return String(value == null ? '' : value)
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')

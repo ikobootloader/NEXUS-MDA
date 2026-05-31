@@ -1,13 +1,13 @@
-(function initTaskMdaCoreUtilsModule(global) {
+﻿(function initTaskMdaCoreUtilsModule(global) {
   'use strict';
 
   const TASK_STATUS_ALIAS_MAP = Object.freeze({
     'todo': 'todo',
     'a-faire': 'todo',
-    'à-faire': 'todo',
+    'Ã -faire': 'todo',
     'afaire': 'todo',
     'a faire': 'todo',
-    'à faire': 'todo',
+    'Ã  faire': 'todo',
     'en-cours': 'en-cours',
     'encours': 'en-cours',
     'in-progress': 'en-cours',
@@ -17,11 +17,11 @@
     'suspendu': 'suspendu',
     'paused': 'suspendu',
     'termine': 'termine',
-    'terminé': 'termine',
+    'terminÃ©': 'termine',
     'done': 'termine',
     'completed': 'termine',
     'realise': 'termine',
-    'réalisé': 'termine'
+    'rÃ©alisÃ©': 'termine'
   });
 
   function normalizeTaskStatusValue(rawStatus) {
@@ -126,8 +126,16 @@
 
   function sharingModeLabel(mode) {
     return normalizeSharingMode(mode, 'private') === 'shared'
-      ? 'Visibilité collaborative'
-      : 'Visibilité privée';
+      ? 'VisibilitÃ© collaborative'
+      : 'VisibilitÃ© privÃ©e';
+  }
+
+  function sharingModeBadge(mode) {
+    const normalized = normalizeSharingMode(mode, 'private');
+    if (normalized === 'shared') {
+      return '<span class="text-[10px] px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 font-semibold">Collaborative</span>';
+    }
+    return '<span class="text-[10px] px-2 py-1 rounded-full bg-slate-100 text-slate-700 font-semibold">PrivÃ©e</span>';
   }
 
   function normalizeProjectPriority(value) {
@@ -176,6 +184,20 @@
     if (size < 1024) return `${size} o`;
     if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} Ko`;
     return `${(size / (1024 * 1024)).toFixed(1)} Mo`;
+  }
+
+  function formatDate(dateValue) {
+    if (!dateValue) return 'Non définie';
+    const date = new Date(dateValue);
+    if (Number.isNaN(date.getTime())) return 'Non définie';
+    return date.toLocaleDateString('fr-FR');
+  }
+
+  function formatDateTime(dateValue, emptyLabel = '-') {
+    if (!dateValue) return String(emptyLabel || '-');
+    const date = new Date(dateValue);
+    if (Number.isNaN(date.getTime())) return String(emptyLabel || '-');
+    return date.toLocaleString('fr-FR');
   }
 
   function paginateItems(items, page, pageSize) {
@@ -246,6 +268,25 @@
     const hh = String(d.getHours()).padStart(2, '0');
     const mi = String(d.getMinutes()).padStart(2, '0');
     return `${yyyy}${mm}${dd}_${hh}${mi}`;
+  }
+
+  function matchesQuery(fields, query) {
+    if (!query) return true;
+    const needle = normalizeSearch(query);
+    return (Array.isArray(fields) ? fields : [])
+      .filter((v) => v !== null && v !== undefined)
+      .some((v) => normalizeSearch(v).includes(needle));
+  }
+
+  function sanitizeFilenameSegment(value) {
+    return String(value || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-zA-Z0-9._-]+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^-|-$/g, '')
+      .toLowerCase()
+      .slice(0, 80) || 'note';
   }
 
   function getInitials(name) {
@@ -327,7 +368,7 @@
     return String(value || '')
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '')
-      .replace(/[.,;:/()'"`’\-]/g, ' ')
+      .replace(/[.,;:/()'"`â€™\-]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim()
       .toLowerCase();
@@ -530,7 +571,7 @@
     if (key === 'different') return { label: 'Different', className: 'bg-amber-100 text-amber-900 border-amber-200' };
     if (key === 'incomplete') return { label: 'Incomplet', className: 'bg-slate-100 text-slate-700 border-slate-200' };
     if (key === 'error') return { label: 'Erreur', className: 'bg-red-100 text-red-800 border-red-200' };
-    return { label: 'Audit…', className: 'bg-blue-100 text-blue-800 border-blue-200' };
+    return { label: 'Auditâ€¦', className: 'bg-blue-100 text-blue-800 border-blue-200' };
   }
 
   function computeViaAnnuaireAuditBreakdown(audit) {
@@ -597,6 +638,7 @@
     normalizeSharingMode,
     normalizeProjectReadAccess,
     sharingModeLabel,
+    sharingModeBadge,
     normalizeProjectPriority,
     getProjectPriorityLabel,
     getProjectPriorityChipClass,
@@ -604,6 +646,8 @@
     normalizeWorkflowActionButtonsShape,
     normalizeTaskAutoArchiveSettings,
     formatFileSize,
+    formatDate,
+    formatDateTime,
     paginateItems,
     normalizeCalendarYmd,
     parseYmdLocalToDate,
@@ -612,6 +656,8 @@
     escapeCsvValue,
     toCsv,
     formatExportDateTag,
+    matchesQuery,
+    sanitizeFilenameSegment,
     getInitials,
     stringToColor,
     normalizeActionButtonLabel,
@@ -644,3 +690,5 @@
     isViaAnnuaireDomainMatch
   };
 }(window));
+
+
