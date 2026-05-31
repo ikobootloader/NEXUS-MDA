@@ -24310,30 +24310,56 @@ async function setProjectsPage(page) {
     }
 
     function renderGlobalFeedContentHtml(content, catalog) {
-      const text = String(content || '');
-      const tokens = [];
-      const tokenPrefix = '__MENTION_TOKEN_';
-      let tokenized = text.replace(/@\[(.+?)\]/g, (_full, name) => {
-        const user = catalog?.byDisplayName?.get(normalizeSearch(name));
-        const label = user ? `${user.name} (@${user.handle})` : String(name || '');
-        const html = `<span class="feed-mention">@${escapeHtml(label)}</span>`;
-        const key = `${tokenPrefix}${tokens.length}__`;
-        tokens.push({ key, html });
-        return key;
-      });
-      tokenized = tokenized.replace(/@([a-z0-9][a-z0-9._-]{1,30})/gi, (_full, handle) => {
-        const user = catalog?.byHandle?.get(normalizeMentionHandle(handle));
-        const label = user ? `${user.name} (@${user.handle})` : `@${handle}`;
-        const html = `<span class="feed-mention">${escapeHtml(label)}</span>`;
-        const key = `${tokenPrefix}${tokens.length}__`;
-        tokens.push({ key, html });
-        return key;
-      });
-      let html = sanitizeProjectDescriptionHtml(tokenized, { allowRichTextInlineStyles: true });
-      tokens.forEach((token) => {
-        html = html.replace(token.key, token.html);
-      });
-      return html;
+      const raw = String(content || '');
+      const sanitizedHtml = sanitizeProjectDescriptionHtml(raw, { allowRichTextInlineStyles: true });
+      const host = document.createElement('div');
+      host.innerHTML = sanitizedHtml;
+
+      const replaceMentionsInTextNode = (textNode) => {
+        const text = String(textNode?.textContent || '');
+        if (!text || !text.includes('@')) return;
+        const mentionRegex = /@\[(.+?)\]|@([a-z0-9][a-z0-9._-]{1,30})/gi;
+        let match = null;
+        let cursor = 0;
+        const parts = [];
+
+        while ((match = mentionRegex.exec(text)) !== null) {
+          const start = Number(match.index || 0);
+          const end = start + String(match[0] || '').length;
+          if (start > cursor) {
+            parts.push(document.createTextNode(text.slice(cursor, start)));
+          }
+          const bracketName = String(match[1] || '').trim();
+          const handleRaw = String(match[2] || '').trim();
+          let mentionLabel = '';
+          if (bracketName) {
+            const user = catalog?.byDisplayName?.get(normalizeSearch(bracketName));
+            mentionLabel = user ? `@${user.name} (@${user.handle})` : `@${bracketName}`;
+          } else {
+            const user = catalog?.byHandle?.get(normalizeMentionHandle(handleRaw));
+            mentionLabel = user ? `@${user.name} (@${user.handle})` : `@${handleRaw}`;
+          }
+          const mentionEl = document.createElement('span');
+          mentionEl.className = 'feed-mention';
+          mentionEl.textContent = mentionLabel;
+          parts.push(mentionEl);
+          cursor = end;
+        }
+        if (!parts.length) return;
+        if (cursor < text.length) {
+          parts.push(document.createTextNode(text.slice(cursor)));
+        }
+        textNode.replaceWith(...parts);
+      };
+
+      const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
+      const textNodes = [];
+      let current = null;
+      while ((current = walker.nextNode())) {
+        textNodes.push(current);
+      }
+      textNodes.forEach(replaceMentionsInTextNode);
+      return host.innerHTML;
     }
 
     async function ensureKnownGlobalPostIdsLoaded() {
