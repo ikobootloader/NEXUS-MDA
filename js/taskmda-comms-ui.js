@@ -40,6 +40,10 @@
     };
 
     function bindGlobalNav(buttonId, view) {
+      if (global.TaskMDAAdminUI && typeof global.TaskMDAAdminUI.bindGlobalNavWithOptions === 'function') {
+        global.TaskMDAAdminUI.bindGlobalNavWithOptions(opts, buttonId, view);
+        return;
+      }
       document.getElementById(buttonId)?.addEventListener('click', async (e) => {
         e.preventDefault();
         await opts.showGlobalWorkspace?.(view);

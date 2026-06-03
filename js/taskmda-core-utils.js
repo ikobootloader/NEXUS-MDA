@@ -126,8 +126,8 @@
 
   function sharingModeLabel(mode) {
     return normalizeSharingMode(mode, 'private') === 'shared'
-      ? 'VisibilitÃ© collaborative'
-      : 'VisibilitÃ© privÃ©e';
+      ? 'Visibilité collaborative'
+      : 'Visibilité privée';
   }
 
   function sharingModeBadge(mode) {
@@ -135,7 +135,7 @@
     if (normalized === 'shared') {
       return '<span class="text-[10px] px-2 py-1 rounded-full bg-emerald-100 text-emerald-700 font-semibold">Collaborative</span>';
     }
-    return '<span class="text-[10px] px-2 py-1 rounded-full bg-slate-100 text-slate-700 font-semibold">PrivÃ©e</span>';
+    return '<span class="text-[10px] px-2 py-1 rounded-full bg-slate-100 text-slate-700 font-semibold">Privée</span>';
   }
 
   function normalizeProjectPriority(value) {
@@ -624,7 +624,21 @@
     return matchesViaAnnuaireAnyToken(searchable, paTokens);
   }
 
+  // Fabrique d'accesseurs d'etat partages pour les modules domaine.
+  function createStateAccessors(state) {
+    const safeState = state && typeof state === 'object' ? state : {};
+    const callAccessorOrNull = (name) => (
+      typeof safeState[name] === 'function' ? safeState[name]() : null
+    );
+    return {
+      getCurrentUser: () => callAccessorOrNull('getCurrentUser'),
+      getCurrentProjectId: () => callAccessorOrNull('getCurrentProjectId'),
+      getCurrentProjectState: () => callAccessorOrNull('getCurrentProjectState')
+    };
+  }
+
   global.TaskMDACoreUtils = {
+    createStateAccessors,
     normalizeTaskStatusValue,
     normalizeTaskStatusForCreate,
     normalizeSearch,

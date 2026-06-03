@@ -1,6 +1,15 @@
 (function initTaskMdaAdminUiModule(global) {
   'use strict';
 
+  function bindGlobalNavWithOptions(options, buttonId, view) {
+    const opts = options || {};
+    document.getElementById(buttonId)?.addEventListener('click', async (e) => {
+      e.preventDefault();
+      await opts.showGlobalWorkspace?.(view);
+      opts.closeMobileSidebar?.();
+    });
+  }
+
   function bind(options) {
     const opts = options || {};
     if (global.__taskMdaAdminUiBound) return;
@@ -18,11 +27,7 @@
     };
 
     function bindGlobalNav(buttonId, view) {
-      document.getElementById(buttonId)?.addEventListener('click', async (e) => {
-        e.preventDefault();
-        await opts.showGlobalWorkspace?.(view);
-        opts.closeMobileSidebar?.();
-      });
+      bindGlobalNavWithOptions(opts, buttonId, view);
     }
 
     bindGlobalNav('nav-workflow', 'workflow');
@@ -256,6 +261,7 @@
   }
 
   global.TaskMDAAdminUI = {
-    bind
+    bind,
+    bindGlobalNavWithOptions
   };
 }(window));

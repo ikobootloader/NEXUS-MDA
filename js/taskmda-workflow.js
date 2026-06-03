@@ -81,6 +81,9 @@
   'use strict';
 
   function normalizeText(value) {
+    if (global.TaskMDACoreUtils && typeof global.TaskMDACoreUtils.normalizeSearch === 'function') {
+      return String(global.TaskMDACoreUtils.normalizeSearch(value) || '').trim();
+    }
     return String(value || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
   }
 
@@ -358,6 +361,9 @@
   };
 
   function normalize(value) {
+    if (global.TaskMDACoreUtils && typeof global.TaskMDACoreUtils.normalizeSearch === 'function') {
+      return String(global.TaskMDACoreUtils.normalizeSearch(value) || '').trim();
+    }
     return String(value || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
   }
 

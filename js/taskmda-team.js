@@ -6854,7 +6854,7 @@
       hideHeaderSearchResults();
       const searchInput = document.getElementById('search-input');
       if (searchInput) searchInput.value = '';
-      globalSearchQuery = '';
+      setGlobalSearchQueryState('');
       shellUiRuntime?.closeMobileSidebar?.();
       if (item.action === 'workspace') {
         if (item.view === 'dashboard') {
@@ -11162,7 +11162,7 @@ async function setProjectsPage(page) {
     }
 
     async function setActivityPage(page) {
-      activityPage = Math.max(1, Number(page) || 1);
+      setActivityPageState(page);
       await renderActivity(currentProjectEvents);
     }
 
@@ -13135,17 +13135,7 @@ async function setProjectsPage(page) {
     }
 
     function placeCaretAtEnd(element) {
-      if (!element || typeof element.focus !== 'function') return;
-      element.focus();
-      try {
-        const selection = window.getSelection?.();
-        if (!selection) return;
-        const range = document.createRange();
-        range.selectNodeContents(element);
-        range.collapse(false);
-        selection.removeAllRanges();
-        selection.addRange(range);
-      } catch (_) {}
+      placeCaretAtEndOfElement(element);
     }
 
     function beginProjectNoteReadInlineEdit(target = 'content') {
@@ -13539,7 +13529,7 @@ async function setProjectsPage(page) {
       return normalized || 'sans-thematique';
     }
 
-    function getProjectNoteThemeLabels(note) {
+    function getNoteThemeLabels(note) {
       const tags = Array.isArray(note?.tags)
         ? Array.from(new Set(note.tags.map((tag) => String(tag || '').trim()).filter(Boolean)))
         : [];
@@ -13549,15 +13539,13 @@ async function setProjectsPage(page) {
       return ['Sans thematique'];
     }
 
+    function getProjectNoteThemeLabels(note) {
+      return getNoteThemeLabels(note);
+    }
+
     /** Même règle que `TaskMDAGlobalNotesFiltersUI` : tags prioritaires, sinon `theme`, sinon seau unique. */
     function getGlobalNoteThemeLabels(note) {
-      const tags = Array.isArray(note?.tags)
-        ? Array.from(new Set(note.tags.map((tag) => String(tag || '').trim()).filter(Boolean)))
-        : [];
-      if (tags.length > 0) return tags;
-      const theme = String(note?.theme || '').trim();
-      if (theme) return [theme];
-      return ['Sans thematique'];
+      return getNoteThemeLabels(note);
     }
 
     function buildProjectNotesThemeCatalog(notes = []) {
@@ -15670,7 +15658,21 @@ async function setProjectsPage(page) {
     }
 
     function placeCaretAtEndOfElement(element) {
-      globalNotesReadInlineEditRuntime?.placeCaretAtEndOfElement?.(element);
+      if (globalNotesReadInlineEditRuntime?.placeCaretAtEndOfElement) {
+        globalNotesReadInlineEditRuntime.placeCaretAtEndOfElement(element);
+        return;
+      }
+      if (!element || typeof element.focus !== 'function') return;
+      element.focus();
+      try {
+        const selection = window.getSelection?.();
+        if (!selection) return;
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        range.collapse(false);
+        selection.removeAllRanges();
+        selection.addRange(range);
+      } catch (_) {}
     }
 
     function beginGlobalReadInlineEdit(target = 'content') {
@@ -31521,9 +31523,7 @@ async function setProjectsPage(page) {
 
     headerSearchRuntime = window.TaskMDAHeaderSearch?.createModule
       ? window.TaskMDAHeaderSearch.createModule({
-          setGlobalSearchQuery: (value) => {
-            globalSearchQuery = String(value || '').trim();
-          },
+          setGlobalSearchQuery: setGlobalSearchQueryState,
           onSearchContextChanged: async () => {
             if (workspaceMode === 'global') {
               if (globalWorkspaceView === 'tasks') {
@@ -31565,6 +31565,13 @@ async function setProjectsPage(page) {
         })
       : null;
 
+    function setDocSpreadsheetColumnsState(value) {
+      docSpreadsheetEditorState.xlsxColumns = Math.max(1, Number(value) || 1);
+    }
+    function setDocSpreadsheetSheetNameState(value) {
+      docSpreadsheetEditorState.sheetName = String(value || '').trim();
+    }
+
     docEditorUiRuntime = window.TaskMDADocEditorUI?.createModule
       ? window.TaskMDADocEditorUI.createModule({
           closeDocumentEditorModal,
@@ -31580,12 +31587,8 @@ async function setProjectsPage(page) {
           isMarkdownMode: () => Boolean(currentDocEditorContext?.isMarkdown),
           getSpreadsheetTable: () => docSpreadsheetEditorState.table,
           getSpreadsheetColumns: () => docSpreadsheetEditorState.xlsxColumns,
-          setSpreadsheetColumns: (value) => {
-            docSpreadsheetEditorState.xlsxColumns = Math.max(1, Number(value) || 1);
-          },
-          setSpreadsheetSheetName: (value) => {
-            docSpreadsheetEditorState.sheetName = String(value || '').trim();
-          }
+          setSpreadsheetColumns: setDocSpreadsheetColumnsState,
+          setSpreadsheetSheetName: setDocSpreadsheetSheetNameState
         })
       : null;
 
@@ -31671,6 +31674,10 @@ async function setProjectsPage(page) {
         })
       : null;
 
+    function setActivityPageState(value) {
+      activityPage = Math.max(1, Number(value) || 1);
+    }
+
     tabOverflowUiRuntime = window.TaskMDATabOverflowUI?.createModule
       ? window.TaskMDATabOverflowUI.createModule({
           refreshManagedTabOverflow,
@@ -31701,29 +31708,88 @@ async function setProjectsPage(page) {
         })
       : null;
 
+    function setProjectNotesSearchQueryState(value) {
+      projectNotesSearchQuery = String(value || '').trim();
+    }
+    function setProjectNotesFilterModeState(value) {
+      projectNotesFilterMode = String(value || 'all').trim() || 'all';
+    }
+
     projectNotesFiltersUiRuntime = window.TaskMDAProjectNotesFiltersUI?.createModule
       ? window.TaskMDAProjectNotesFiltersUI.createModule({
-          setProjectNotesSearchQuery: (value) => {
-            projectNotesSearchQuery = String(value || '').trim();
-          },
-          setProjectNotesFilterMode: (value) => {
-            projectNotesFilterMode = String(value || 'all').trim() || 'all';
-          },
+          setProjectNotesSearchQuery: setProjectNotesSearchQueryState,
+          setProjectNotesFilterMode: setProjectNotesFilterModeState,
           setProjectNotesThemeFilter,
           renderProjectNotes,
           getCurrentProjectState: () => currentProjectState
         })
       : null;
 
+    function setGlobalSearchQueryState(value) {
+      globalSearchQuery = String(value || '').trim();
+    }
+    const setGlobalNotesPageState = (value) => {
+      globalNotesPage = Math.max(1, Number(value) || 1);
+    };
+    const setGlobalNotesFocusNoteIdState = (value) => {
+      globalNotesFocusNoteId = String(value || '').trim();
+    };
+    const setProjectNotesFocusNoteIdState = (value) => {
+      projectNotesFocusNoteId = String(value || '').trim();
+    };
+    const setGlobalReadModalNoteIdState = (value) => {
+      globalReadModalNoteId = String(value || '').trim();
+    };
+    const setGlobalFeedFilterModeState = (value) => {
+      globalFeedFilterMode = String(value || '').trim() || 'all';
+    };
+    const setGlobalFeedFocusPostIdState = (value) => {
+      globalFeedFocusPostId = String(value || '').trim();
+    };
+    const setGlobalFeedMentionCatalogCacheState = (value) => {
+      globalFeedMentionCatalogCache = value || null;
+    };
+    const setGlobalFeedSortModeState = (value) => {
+      globalFeedSortMode = String(value || '').trim() === 'asc' ? 'asc' : 'desc';
+    };
+    const setGlobalNotesSearchQueryState = (value) => {
+      globalNotesSearchQuery = String(value || '');
+    };
+    const setGlobalNotesScopeFilterState = (value) => {
+      globalNotesScopeFilter = String(value || 'all');
+    };
+    const setGlobalNotesOriginFilterState = (value) => {
+      globalNotesOriginFilter = String(value || 'all');
+    };
+    const setGlobalNotesSortModeState = (value) => {
+      globalNotesSortMode = String(value || 'recent');
+    };
+    const setGlobalNotesTabModeState = (value) => {
+      globalNotesTabMode = String(value || 'all');
+    };
+    const setGlobalNotesBulkSelectionModeState = (value) => {
+      globalNotesBulkSelectionMode = !!value;
+    };
+    const addGlobalNotesSelectedNoteState = (noteId) => {
+      const normalizedId = String(noteId || '').trim();
+      if (normalizedId) selectedGlobalNoteIdsForBulkDelete.add(normalizedId);
+    };
+    const removeGlobalNotesSelectedNoteState = (noteId) => {
+      const normalizedId = String(noteId || '').trim();
+      if (normalizedId) selectedGlobalNoteIdsForBulkDelete.delete(normalizedId);
+    };
+    const clearGlobalNotesSelectedNotesState = () => {
+      selectedGlobalNoteIdsForBulkDelete.clear();
+    };
+    const setGlobalNotesThemeFilterState = (value) => {
+      globalNotesThemeFilter = String(value || 'all').trim() || 'all';
+    };
+
     globalNotesFiltersUiRuntime = window.TaskMDAGlobalNotesFiltersUI?.createModule
       ? window.TaskMDAGlobalNotesFiltersUI.createModule({
-          setGlobalNotesThemeFilter: (value) => {
-            globalNotesThemeFilter = String(value || 'all').trim() || 'all';
-          },
+          setGlobalNotesThemeFilter: setGlobalNotesThemeFilterState,
           getGlobalNotesThemeFilter: () => globalNotesThemeFilter,
-          setGlobalNotesPage: (value) => {
-            globalNotesPage = Math.max(1, Number(value) || 1);
-          },
+          setGlobalNotesPage: setGlobalNotesPageState,
           renderGlobalNotes,
           normalizeCatalogKey,
           escapeHtml
@@ -31748,9 +31814,7 @@ async function setProjectsPage(page) {
             setGlobalReadModalLastFocusedElement: (value) => {
               globalReadModalLastFocusedElement = value instanceof HTMLElement ? value : null;
             },
-            setGlobalReadModalNoteId: (value) => {
-              globalReadModalNoteId = String(value || '').trim();
-            }
+            setGlobalReadModalNoteId: setGlobalReadModalNoteIdState
           },
           actions: {
             migrateLegacyInlineGlobalNoteAttachmentsOnce,
@@ -31800,7 +31864,7 @@ async function setProjectsPage(page) {
             syncGlobalNoteFeed,
             isGlobalFeedView: () => isGlobalFeedViewActive(),
             renderGlobalFeed,
-            setGlobalNotesFocusNoteId: (value) => { globalNotesFocusNoteId = String(value || '').trim(); },
+            setGlobalNotesFocusNoteId: setGlobalNotesFocusNoteIdState,
             renderGlobalNotes,
             openGlobalNoteReadModal
           },
@@ -31912,9 +31976,7 @@ async function setProjectsPage(page) {
           showToast,
           setProjectView,
           getCurrentProjectId: () => currentProjectId,
-          setActivityPage: (value) => {
-            activityPage = Math.max(1, Number(value) || 1);
-          },
+          setActivityPage: setActivityPageState,
           getProjectEvents,
           setCurrentProjectEvents: (events) => {
             currentProjectEvents = Array.isArray(events) ? events : [];
@@ -32048,9 +32110,7 @@ async function setProjectsPage(page) {
           resetActivityFilters: () => {
             activityFilters = { type: 'all', author: '', period: 'all' };
           },
-          setActivityPage: (value) => {
-            activityPage = Math.max(1, Number(value) || 1);
-          },
+          setActivityPage: setActivityPageState,
           getCurrentProjectEvents: () => currentProjectEvents,
           renderActivity
         })
@@ -32512,7 +32572,7 @@ async function setProjectsPage(page) {
               editingMessageId = null;
               projectDetailMode = 'work';
               activeProjectView = 'list';
-              globalSearchQuery = '';
+              setGlobalSearchQueryState('');
               headerSearchResults = [];
               headerSearchActiveIndex = -1;
               const searchInput = document.getElementById('search-input');
@@ -32526,38 +32586,32 @@ async function setProjectsPage(page) {
     const globalNotesRuntime = window.TaskMDAGlobalNotes?.createModule
       ? window.TaskMDAGlobalNotes.createModule({
           state: {
-            setSearchQuery: (value) => { globalNotesSearchQuery = String(value || ''); },
+            setSearchQuery: setGlobalNotesSearchQueryState,
             getSearchQuery: () => globalNotesSearchQuery,
-            setScopeFilter: (value) => { globalNotesScopeFilter = String(value || 'all'); },
+            setScopeFilter: setGlobalNotesScopeFilterState,
             getScopeFilter: () => globalNotesScopeFilter,
-            setOriginFilter: (value) => { globalNotesOriginFilter = String(value || 'all'); },
+            setOriginFilter: setGlobalNotesOriginFilterState,
             getOriginFilter: () => globalNotesOriginFilter,
-            setSortMode: (value) => { globalNotesSortMode = String(value || 'recent'); },
+            setSortMode: setGlobalNotesSortModeState,
             getSortMode: () => globalNotesSortMode,
-            setTabMode: (value) => { globalNotesTabMode = String(value || 'all'); },
+            setTabMode: setGlobalNotesTabModeState,
             getTabMode: () => globalNotesTabMode,
             getThemeFilter: () => globalNotesThemeFilter,
-            setPage: (value) => { globalNotesPage = Math.max(1, Number(value) || 1); },
+            setPage: setGlobalNotesPageState,
             getPage: () => globalNotesPage,
             getCurrentUserId: () => String(currentUser?.userId || '').trim(),
             getFocusNoteId: () => globalNotesFocusNoteId,
-            setFocusNoteId: (value) => { globalNotesFocusNoteId = String(value || '').trim(); },
+            setFocusNoteId: setGlobalNotesFocusNoteIdState,
             getCurrentProjectState: () => currentProjectState,
-            setProjectNotesFocusNoteId: (value) => { projectNotesFocusNoteId = String(value || '').trim(); },
+            setProjectNotesFocusNoteId: setProjectNotesFocusNoteIdState,
             getBulkSelectionMode: () => globalNotesBulkSelectionMode,
-            setBulkSelectionMode: (value) => { globalNotesBulkSelectionMode = !!value; },
+            setBulkSelectionMode: setGlobalNotesBulkSelectionModeState,
             getSelectedCount: () => selectedGlobalNoteIdsForBulkDelete.size,
             getSelectedNoteIds: () => Array.from(selectedGlobalNoteIdsForBulkDelete),
             isNoteSelected: (noteId) => selectedGlobalNoteIdsForBulkDelete.has(String(noteId || '').trim()),
-            addSelectedNote: (noteId) => {
-              const normalizedId = String(noteId || '').trim();
-              if (normalizedId) selectedGlobalNoteIdsForBulkDelete.add(normalizedId);
-            },
-            removeSelectedNote: (noteId) => {
-              const normalizedId = String(noteId || '').trim();
-              if (normalizedId) selectedGlobalNoteIdsForBulkDelete.delete(normalizedId);
-            },
-            clearSelectedNotes: () => { selectedGlobalNoteIdsForBulkDelete.clear(); }
+            addSelectedNote: addGlobalNotesSelectedNoteState,
+            removeSelectedNote: removeGlobalNotesSelectedNoteState,
+            clearSelectedNotes: clearGlobalNotesSelectedNotesState
           },
           actions: {
             renderGlobalNotes,
@@ -32627,21 +32681,37 @@ async function setProjectsPage(page) {
         })
       : null;
 
+    function setGlobalCalendarSelectedDayState(value) {
+      globalCalendarSelectedDay = value;
+    }
+    function setGlobalCalendarSelectedMonthState(value) {
+      globalCalendarSelectedMonth = value;
+    }
+    function setGlobalCalendarViewModeState(value) {
+      globalCalendarViewMode = value;
+    }
+    function setGlobalCalendarControlsExpandedState(value) {
+      globalCalendarControlsExpanded = !!value;
+    }
+    function setGlobalCalendarEditingItemIdState(value) {
+      editingGlobalCalendarItemId = value || null;
+    }
+
     const globalCalendarRuntime = window.TaskMDAGlobalCalendar?.createModule
       ? window.TaskMDAGlobalCalendar.createModule({
           state: {
-            setSelectedDay: (value) => { globalCalendarSelectedDay = value; },
+            setSelectedDay: setGlobalCalendarSelectedDayState,
             getSelectedDay: () => globalCalendarSelectedDay,
-            setSelectedMonth: (value) => { globalCalendarSelectedMonth = value; },
-            setViewMode: (value) => { globalCalendarViewMode = value; },
+            setSelectedMonth: setGlobalCalendarSelectedMonthState,
+            setViewMode: setGlobalCalendarViewModeState,
             getControlsExpanded: () => globalCalendarControlsExpanded,
-            setControlsExpanded: (value) => { globalCalendarControlsExpanded = !!value; },
+            setControlsExpanded: setGlobalCalendarControlsExpandedState,
             getPinnedThemes: () => globalCalendarPinnedThemes,
             setPinnedThemes: (next) => { globalCalendarPinnedThemes = Array.isArray(next) ? [...next] : []; },
             getPinnedThemeChecks: () => globalCalendarPinnedThemeChecks,
             setPinnedThemeChecks: (next) => { globalCalendarPinnedThemeChecks = Array.isArray(next) ? [...next] : []; },
             getEditingItemId: () => editingGlobalCalendarItemId,
-            setEditingItemId: (value) => { editingGlobalCalendarItemId = value || null; }
+            setEditingItemId: setGlobalCalendarEditingItemIdState
           },
           actions: {
             renderGlobalCalendar,
@@ -32670,17 +32740,27 @@ async function setProjectsPage(page) {
         })
       : null;
 
+    function setDocBindingInlineSavingState(value) {
+      docBindingInlineSaving = !!value;
+    }
+    function setCurrentDocBindingContextState(value) {
+      currentDocBindingContext = value || null;
+    }
+    function setCurrentDocBindingCanEditState(value) {
+      currentDocBindingCanEdit = !!value;
+    }
+
     const globalDocsRuntime = window.TaskMDAGlobalDocs?.createModule
       ? window.TaskMDAGlobalDocs.createModule({
           state: {
             getDocBindingInlineDebounceTimers: () => docBindingInlineDebounceTimers,
             getDocBindingInlineFinalizeTimers: () => docBindingInlineFinalizeTimers,
             getDocBindingInlineSaving: () => docBindingInlineSaving,
-            setDocBindingInlineSaving: (value) => { docBindingInlineSaving = !!value; },
+            setDocBindingInlineSaving: setDocBindingInlineSavingState,
             getCurrentDocBindingContext: () => currentDocBindingContext,
-            setCurrentDocBindingContext: (value) => { currentDocBindingContext = value || null; },
+            setCurrentDocBindingContext: setCurrentDocBindingContextState,
             getCurrentDocBindingCanEdit: () => currentDocBindingCanEdit,
-            setCurrentDocBindingCanEdit: (value) => { currentDocBindingCanEdit = !!value; }
+            setCurrentDocBindingCanEdit: setCurrentDocBindingCanEditState
           },
           actions: {
             runWithLoading,
@@ -32754,18 +32834,12 @@ async function setProjectsPage(page) {
             getCurrentUser: () => currentUser,
             getCurrentUserId: () => currentUser?.userId || '',
             getGlobalFeedMentionCatalogCache: () => globalFeedMentionCatalogCache,
-            setGlobalFeedMentionCatalogCache: (value) => {
-              globalFeedMentionCatalogCache = value || null;
-            },
+            setGlobalFeedMentionCatalogCache: setGlobalFeedMentionCatalogCacheState,
             getGlobalFeedFilterMode: () => globalFeedFilterMode,
-            setGlobalFeedFilterMode: (value) => {
-              globalFeedFilterMode = String(value || '').trim() || 'all';
-            },
+            setGlobalFeedFilterMode: setGlobalFeedFilterModeState,
             getGlobalFeedSortMode: () => globalFeedSortMode,
             getGlobalFeedFocusPostId: () => globalFeedFocusPostId,
-            setGlobalFeedFocusPostId: (value) => {
-              globalFeedFocusPostId = String(value || '').trim();
-            },
+            setGlobalFeedFocusPostId: setGlobalFeedFocusPostIdState,
             getGlobalFeedLinkedDocIdsDraft
           },
           actions: {
@@ -32824,12 +32898,8 @@ async function setProjectsPage(page) {
             renderGlobalNotes,
             openGlobalNoteReadModal,
             openStandaloneCalendarDetails,
-            setGlobalNotesFocusNoteId: (value) => {
-              globalNotesFocusNoteId = String(value || '').trim();
-            },
-            setProjectNotesFocusNoteId: (value) => {
-              projectNotesFocusNoteId = String(value || '').trim();
-            },
+            setGlobalNotesFocusNoteId: setGlobalNotesFocusNoteIdState,
+            setProjectNotesFocusNoteId: setProjectNotesFocusNoteIdState,
             expandGlobalFeedPostCard,
             isTabEnabled,
             getDefaultTab
@@ -32880,18 +32950,21 @@ async function setProjectsPage(page) {
         })
       : null;
 
+    function setProjectReactionPickerMessageIdState(value) {
+      projectReactionPickerMessageId = String(value || '');
+    }
+    function setGlobalReactionPickerMessageIdState(value) {
+      globalReactionPickerMessageId = String(value || '');
+    }
+
     const messageReactionsOutsideRuntime = window.TaskMDAMessageReactionsOutsideUI?.createModule
       ? window.TaskMDAMessageReactionsOutsideUI.createModule({
           getProjectReactionPickerMessageId: () => projectReactionPickerMessageId,
-          setProjectReactionPickerMessageId: (value) => {
-            projectReactionPickerMessageId = String(value || '');
-          },
+          setProjectReactionPickerMessageId: setProjectReactionPickerMessageIdState,
           getCurrentProjectState: () => currentProjectState,
           renderMessages,
           getGlobalReactionPickerMessageId: () => globalReactionPickerMessageId,
-          setGlobalReactionPickerMessageId: (value) => {
-            globalReactionPickerMessageId = String(value || '');
-          },
+          setGlobalReactionPickerMessageId: setGlobalReactionPickerMessageIdState,
           renderGlobalMessages: (options) => {
             void renderGlobalMessages(options);
           }
@@ -33370,10 +33443,10 @@ async function setProjectsPage(page) {
         resolveViewWithLock,
         updateGlobalFeedMentionCounter,
         setFeedSortMode: (value) => {
-          globalFeedSortMode = value;
+          setGlobalFeedSortModeState(value);
         },
         setFeedFilterMode: (value) => {
-          globalFeedFilterMode = value;
+          setGlobalFeedFilterModeState(value);
         },
         renderGlobalDocs,
         trackUxMetric,

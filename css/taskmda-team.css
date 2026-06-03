@@ -13733,6 +13733,32 @@ html.dark .is-overdue-card {
   margin-top: 10px;
 }
 
+#global-notes-list .global-note-card .note-linked-docs-block {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+html.dark #global-notes-list .global-note-card .note-linked-docs-block {
+  background: rgba(15, 23, 42, 0.58);
+  border-color: rgba(100, 116, 139, 0.5);
+}
+
+#project-note-read-links:not(:empty),
+#global-read-links:not(:empty) {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+html.dark #project-note-read-links:not(:empty),
+html.dark #global-read-links:not(:empty) {
+  background: rgba(15, 23, 42, 0.58);
+  border-color: rgba(100, 116, 139, 0.5);
+}
+
 tr.is-bulk-selected > td {
   background: rgba(0, 43, 107, 0.08);
 }

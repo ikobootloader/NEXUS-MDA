@@ -5,17 +5,18 @@
     const opts = options || {};
     const state = opts.state || {};
 
-    function getCurrentProjectId() {
-      return typeof state.getCurrentProjectId === 'function' ? state.getCurrentProjectId() : null;
-    }
-
-    function getCurrentProjectState() {
-      return typeof state.getCurrentProjectState === 'function' ? state.getCurrentProjectState() : null;
-    }
-
-    function getCurrentUser() {
-      return typeof state.getCurrentUser === 'function' ? state.getCurrentUser() : null;
-    }
+    const stateAccessors = (global.TaskMDACoreUtils && typeof global.TaskMDACoreUtils.createStateAccessors === 'function')
+      ? global.TaskMDACoreUtils.createStateAccessors(state)
+      : null;
+    const getCurrentProjectId = stateAccessors
+      ? stateAccessors.getCurrentProjectId
+      : () => (typeof state.getCurrentProjectId === 'function' ? state.getCurrentProjectId() : null);
+    const getCurrentProjectState = stateAccessors
+      ? stateAccessors.getCurrentProjectState
+      : () => (typeof state.getCurrentProjectState === 'function' ? state.getCurrentProjectState() : null);
+    const getCurrentUser = stateAccessors
+      ? stateAccessors.getCurrentUser
+      : () => (typeof state.getCurrentUser === 'function' ? state.getCurrentUser() : null);
 
     function getSelectedUserGroupId() {
       return typeof state.getSelectedUserGroupId === 'function' ? state.getSelectedUserGroupId() : null;

@@ -16,9 +16,9 @@
       return typeof state.getSharedFolderHandle === 'function' ? state.getSharedFolderHandle() : null;
     }
 
-    function getCurrentProjectId() {
-      return typeof state.getCurrentProjectId === 'function' ? state.getCurrentProjectId() : null;
-    }
+    const getCurrentProjectId = (global.TaskMDACoreUtils && typeof global.TaskMDACoreUtils.createStateAccessors === 'function')
+      ? global.TaskMDACoreUtils.createStateAccessors(state).getCurrentProjectId
+      : () => (typeof state.getCurrentProjectId === 'function' ? state.getCurrentProjectId() : null);
 
     function canUseSharedFilesystemDocumentStorage() {
       return Boolean(getSharedFolderHandle() && global.TaskMDADocumentStorage?.isAvailable?.());

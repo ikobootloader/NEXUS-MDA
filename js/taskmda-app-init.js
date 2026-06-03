@@ -9,9 +9,9 @@
       if (typeof state.setCurrentUser === 'function') state.setCurrentUser(value);
     }
 
-    function getCurrentUser() {
-      return typeof state.getCurrentUser === 'function' ? state.getCurrentUser() : null;
-    }
+    const getCurrentUser = (global.TaskMDACoreUtils && typeof global.TaskMDACoreUtils.createStateAccessors === 'function')
+      ? global.TaskMDACoreUtils.createStateAccessors(state).getCurrentUser
+      : () => (typeof state.getCurrentUser === 'function' ? state.getCurrentUser() : null);
 
     function setNotifiedCollaboratorEventIds(value) {
       if (typeof state.setNotifiedCollaboratorEventIds === 'function') {

@@ -64,7 +64,7 @@
 
               ${tags.length ? `<div class="mt-3 flex flex-wrap gap-1">${tags.map((tag) => `<span class="inline-flex text-[10px] px-2 py-1 rounded-full bg-slate-100 text-slate-700 font-semibold">#${escapeHtml(tag)}</span>`).join('')}</div>` : ''}
               ${linkedDocs.length ? `
-                <div class="mt-3">
+                <div class="mt-3 note-linked-docs-block">
                   <p class="text-xs font-semibold text-slate-600 mb-1">Documents lies (${linkedDocs.length})</p>
                   <div class="flex flex-wrap items-center gap-2">
                     ${linkedDocs.slice(0, 4).map((doc) => {
