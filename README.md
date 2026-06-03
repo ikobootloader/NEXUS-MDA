@@ -189,6 +189,7 @@ L'application est structurée en modules spécialisés :
   - Utilise aussi par `taskmda-file-watcher.js` et `taskmda-notes-shared.js` pour `escapeHtml` / `formatFileSize`
   - Centralise aussi `formatDate` pour l orchestrateur principal
   - Centralise aussi `formatDateTime(dateValue, emptyLabel)` pour projet-notes et file-watcher
+  - Ajoute `createStateAccessors(state)` pour mutualiser les accesseurs d etat des modules domaine
 - `taskmda-runtime-contract.js` - Contrat d'orchestration
 - `taskmda-shell.js` - Shell transverse
 - `taskmda-app-init.js` - Initialisation
@@ -254,7 +255,173 @@ projects/
 
 ## 🆕 Nouveautés récentes
 
+### Juin 2026
+
+#### ✅ Correctif encodage badge de visibilité
+
+- `js/taskmda-core-utils.js` corrige le libellé du badge `Privée` et les textes associés de visibilité.
+- Impact utilisateur : le badge de visibilité des cartes de tâche ne présente plus de mojibake.
+
 ### Mai 2026
+
+#### ✅ Refactor accessors d etat mutualises (phase 1)
+
+- Ajout de `createStateAccessors(state)` dans `js/taskmda-core-utils.js`.
+- Delegation des wrappers dupliques `getCurrentUser` / `getCurrentProjectId` / `getCurrentProjectState` dans:
+  - `js/taskmda-project-members-domain.js`
+  - `js/taskmda-task-lifecycle-domain.js`
+  - `js/taskmda-app-init.js`
+  - `js/taskmda-doc.js`
+- Aucun changement fonctionnel attendu: appelants inchanges, fallback local conserve.
+
+#### ✅ Refactor normalisation workflow harmonisee
+
+- `js/taskmda-workflow.js`:
+  - `normalizeText(...)` (graph) et `normalize(...)` (module principal) deleguent vers `TaskMDACoreUtils.normalizeSearch(...)`.
+  - fallback local conserve pour eviter toute regression liee a l ordre de chargement.
+
+#### ✅ Refactor thematiques notes projet/global factorisees
+
+- `js/taskmda-team.js`:
+  - ajout de `getNoteThemeLabels(note)` comme helper local unique.
+  - `getProjectNoteThemeLabels(...)` et `getGlobalNoteThemeLabels(...)` reutilisent ce helper (aucun changement d appelants).
+
+#### ✅ Refactor caret inline notes unifie
+
+- `js/taskmda-team.js`:
+  - `placeCaretAtEnd(...)` reutilise `placeCaretAtEndOfElement(...)`.
+  - `placeCaretAtEndOfElement(...)` delegue au runtime notes inline quand disponible, avec fallback local conserve.
+
+#### ✅ Refactor bindGlobalNav mutualise admin/comms
+
+- `js/taskmda-admin-ui.js`:
+  - expose `bindGlobalNavWithOptions(options, buttonId, view)` pour la navigation globale.
+- `js/taskmda-comms-ui.js`:
+  - reutilise ce helper quand disponible, avec fallback local pour robustesse.
+
+#### ✅ Refactor setActivityPage runtime mutualise
+
+- `js/taskmda-team.js`:
+  - extraction d un setter unique `setActivityPageState(value)`.
+  - reutilisation dans les runtimes navigation projet et filtres activite.
+
+#### ✅ Refactor setGlobalNotesPage runtime mutualise
+
+- `js/taskmda-team.js`:
+  - extraction d un setter unique `setGlobalNotesPageState(value)`.
+  - reutilisation dans les runtimes filtres notes globales (`setGlobalNotesPage`) et notes globales (`setPage`).
+
+#### ✅ Refactor focus notes runtime mutualise
+
+- `js/taskmda-team.js`:
+  - extraction de `setGlobalNotesFocusNoteIdState(value)` et `setProjectNotesFocusNoteIdState(value)`.
+  - reutilisation dans les runtimes notes (`setGlobalNotesFocusNoteId`, `setFocusNoteId`, `setProjectNotesFocusNoteId`).
+
+#### ✅ Refactor feed filter mode runtime mutualise
+
+- `js/taskmda-team.js`:
+  - extraction de `setGlobalFeedFilterModeState(value)` pour normaliser le filtre feed.
+  - reutilisation dans les runtimes feed/comms (`setGlobalFeedFilterMode`, `setFeedFilterMode`).
+
+#### ✅ Refactor feed sort mode runtime normalise
+
+- `js/taskmda-team.js`:
+  - ajout de `setGlobalFeedSortModeState(value)` pour contraindre le tri feed a `asc`/`desc`.
+  - reutilisation dans le runtime comms (`setFeedSortMode`).
+
+#### ✅ Refactor feed focus runtime mutualise
+
+- `js/taskmda-team.js`:
+  - extraction de `setGlobalFeedFocusPostIdState(value)`.
+  - reutilisation dans le runtime `TaskMDAGlobalFeed` (`setGlobalFeedFocusPostId`).
+
+#### ✅ Refactor recherche globale runtime mutualisee
+
+- `js/taskmda-team.js`:
+  - extraction de `setGlobalSearchQueryState(value)`.
+  - reutilisation dans `TaskMDAHeaderSearch` (`setGlobalSearchQuery`) et dans les resets de session/navigation.
+  - correctif de regression applique: setter converti en fonction hoistee pour eviter une erreur d initialisation au chargement.
+
+#### ✅ Refactor filtres notes projet runtime mutualises
+
+- `js/taskmda-team.js`:
+  - extraction de `setProjectNotesSearchQueryState(value)` et `setProjectNotesFilterModeState(value)`.
+  - reutilisation dans `TaskMDAProjectNotesFiltersUI` (`setProjectNotesSearchQuery`, `setProjectNotesFilterMode`).
+
+#### ✅ Refactor setters tableur runtime mutualises
+
+- `js/taskmda-team.js`:
+  - extraction de `setDocSpreadsheetColumnsState(value)` et `setDocSpreadsheetSheetNameState(value)`.
+  - reutilisation dans `TaskMDADocEditorUI` (`setSpreadsheetColumns`, `setSpreadsheetSheetName`).
+
+#### ✅ Refactor focus modal note globale mutualise
+
+- `js/taskmda-team.js`:
+  - extraction de `setGlobalReadModalNoteIdState(value)`.
+  - reutilisation dans `TaskMDAGlobalNotesReadModalContent` (`setGlobalReadModalNoteId`).
+
+#### ✅ Refactor filtre thematique notes globales mutualise
+
+- `js/taskmda-team.js`:
+  - extraction de `setGlobalNotesThemeFilterState(value)`.
+  - reutilisation dans `TaskMDAGlobalNotesFiltersUI` (`setGlobalNotesThemeFilter`).
+
+#### ✅ Refactor etat feed runtime mutualise
+
+- `js/taskmda-team.js`:
+  - extraction de `setGlobalFeedMentionCatalogCacheState(value)`.
+  - reutilisation dans `TaskMDAGlobalFeed` (`setGlobalFeedMentionCatalogCache`).
+  - simplification de `setGlobalFeedFilterMode` en reference directe vers `setGlobalFeedFilterModeState`.
+
+#### ✅ Refactor setters reactions messages mutualises
+
+- `js/taskmda-team.js`:
+  - extraction de `setProjectReactionPickerMessageIdState(value)` et `setGlobalReactionPickerMessageIdState(value)`.
+  - reutilisation dans `TaskMDAMessageReactionsOutsideUI` (`setProjectReactionPickerMessageId`, `setGlobalReactionPickerMessageId`).
+
+#### ✅ Refactor setters calendrier global mutualises
+
+- `js/taskmda-team.js`:
+  - extraction des setters d etat `selectedDay/selectedMonth/viewMode/controlsExpanded/editingItemId`.
+  - reutilisation dans `TaskMDAGlobalCalendar` (state runtime).
+
+#### ✅ Refactor setters docs globales mutualises
+
+- `js/taskmda-team.js`:
+  - extraction de `setDocBindingInlineSavingState(value)`, `setCurrentDocBindingContextState(value)` et `setCurrentDocBindingCanEditState(value)`.
+  - reutilisation dans `TaskMDAGlobalDocs` (state runtime).
+
+#### ✅ UI notes: fond bloc documents lies
+
+- `js/taskmda-global-notes-card-builder.js`:
+  - ajout de la classe `note-linked-docs-block` sur le bloc "Documents lies".
+- `css/taskmda-team.css`:
+  - ajout d un background + bordure + radius pour ce bloc (clair/sombre).
+  - meme habillage applique en lecture modale sur `#project-note-read-links` et `#global-read-links` (uniquement quand non vides).
+
+#### ✅ Refactor setActivityPage unifie complet
+
+- `js/taskmda-team.js`:
+  - `setActivityPage(page)` delegue desormais a `setActivityPageState(page)`.
+  - `setActivityPageState` est defini en fonction hoistee pour garantir un appel robuste.
+
+#### ✅ Refactor filtres notes globales mutualises
+
+- `js/taskmda-team.js`:
+  - extraction des setters dedies `scope/origin/sort/tab` pour les notes globales.
+  - reutilisation dans le runtime `TaskMDAGlobalNotes` pour eviter les affectations inline dupliquees.
+
+#### ✅ Refactor recherche notes globales mutualisee
+
+- `js/taskmda-team.js`:
+  - extraction de `setGlobalNotesSearchQueryState(value)`.
+  - reutilisation dans le runtime `TaskMDAGlobalNotes` (`setSearchQuery`).
+
+#### ✅ Refactor selection multiple notes globales mutualisee
+
+- `js/taskmda-team.js`:
+  - extraction des helpers d etat de selection multiple (mode + add/remove/clear).
+  - reutilisation dans le runtime `TaskMDAGlobalNotes` pour remplacer les lambdas inline.
 
 #### ✅ Revue de code: suppression d un doublon d orchestration
 

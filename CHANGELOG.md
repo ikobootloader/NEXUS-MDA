@@ -1,5 +1,305 @@
 # Changelog - TaskMDA Team
 
+## Mise à jour incrémentale - Juin 2026 (Correctif encodage badge de visibilité)
+
+- Utilitaire cœur (`js/taskmda-core-utils.js`) :
+  - correction des libellés `Visibilité privée`, `Visibilité collaborative` et du badge `Privée`.
+- Effet attendu :
+  - suppression du mojibake sur le badge de visibilité des cartes de tâche utilisant `sharingModeBadge(...)`.
+- Vérification :
+  - contrôle ciblé de la source du badge dans le module cœur.
+
+## Mise a jour incrementale - Juin 2026 (Refactor: setters docs globales mutualises)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de:
+    - `setDocBindingInlineSavingState(value)`
+    - `setCurrentDocBindingContextState(value)`
+    - `setCurrentDocBindingCanEditState(value)`
+  - reutilisation dans `TaskMDAGlobalDocs` (`state.setDocBindingInlineSaving`, `state.setCurrentDocBindingContext`, `state.setCurrentDocBindingCanEdit`).
+- Effet attendu:
+  - reduction de lambdas inline dans le runtime docs globales, sans changement fonctionnel.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Juin 2026 (Refactor: setters calendrier global mutualises)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de:
+    - `setGlobalCalendarSelectedDayState(value)`
+    - `setGlobalCalendarSelectedMonthState(value)`
+    - `setGlobalCalendarViewModeState(value)`
+    - `setGlobalCalendarControlsExpandedState(value)`
+    - `setGlobalCalendarEditingItemIdState(value)`
+  - reutilisation dans `TaskMDAGlobalCalendar` (`state.setSelectedDay/setSelectedMonth/setViewMode/setControlsExpanded/setEditingItemId`).
+- Effet attendu:
+  - reduction de lambdas inline sur l etat calendrier global, sans changement fonctionnel.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Juin 2026 (Refactor: setters reactions messages mutualises)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de:
+    - `setProjectReactionPickerMessageIdState(value)`
+    - `setGlobalReactionPickerMessageIdState(value)`
+  - reutilisation dans `TaskMDAMessageReactionsOutsideUI` (`setProjectReactionPickerMessageId`, `setGlobalReactionPickerMessageId`).
+- Effet attendu:
+  - reduction de lambdas inline sur la gestion d etat des pickers de reactions (projet/global).
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Juin 2026 (Refactor: etat feed runtime mutualise)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de `setGlobalFeedMentionCatalogCacheState(value)`.
+  - reutilisation dans `TaskMDAGlobalFeed` (`setGlobalFeedMentionCatalogCache`).
+  - simplification de `setGlobalFeedFilterMode` en reference directe vers `setGlobalFeedFilterModeState`.
+- Effet attendu:
+  - reduction de lambdas inline dans le runtime feed global, sans changement fonctionnel.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Juin 2026 (Refactor: filtre thematique notes globales mutualise)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de `setGlobalNotesThemeFilterState(value)`.
+  - reutilisation dans `TaskMDAGlobalNotesFiltersUI` (`setGlobalNotesThemeFilter`).
+- Effet attendu:
+  - suppression d une affectation inline dupliquee et centralisation du contrat de normalisation (`all` par defaut).
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Juin 2026 (UI notes: fond bloc documents lies en lecture)
+
+- Notes (lecture modale, projet/global) (`css/taskmda-team.css`):
+  - ajout du meme habillage visuel sur `#project-note-read-links` et `#global-read-links` quand non vides (`:not(:empty)`).
+  - fond + bordure + radius harmonises avec les cartes de notes (clair/sombre).
+
+## Mise a jour incrementale - Juin 2026 (UI notes: fond bloc documents lies)
+
+- Notes globales (`js/taskmda-global-notes-card-builder.js`, `css/taskmda-team.css`):
+  - ajout d un conteneur dedie `note-linked-docs-block` autour de la liste des documents lies dans les cartes de notes.
+  - ajout d un fond + bordure + rayon pour mieux distinguer visuellement ce bloc (theme clair/sombre).
+- Verification:
+  - `node --check js/taskmda-global-notes-card-builder.js` OK
+
+## Correctif - Mai 2026 (Regression TDZ recherche globale)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - correction d une regression `ReferenceError` sur `setGlobalSearchQueryState`.
+  - passage du setter en fonction hoistee pour garantir sa disponibilite avant binding runtime.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: focus modal note globale mutualise)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de `setGlobalReadModalNoteIdState(value)`.
+  - reutilisation dans `TaskMDAGlobalNotesReadModalContent` (`setGlobalReadModalNoteId`).
+- Effet attendu:
+  - suppression d une affectation inline sur le focus de note en lecture modale globale.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: setters tableur runtime mutualises)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de:
+    - `setDocSpreadsheetColumnsState(value)`
+    - `setDocSpreadsheetSheetNameState(value)`
+  - reutilisation dans `TaskMDADocEditorUI` (`setSpreadsheetColumns`, `setSpreadsheetSheetName`).
+- Effet attendu:
+  - simplification du binding runtime de l editeur tableur et centralisation des normalisations d entree.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: filtres notes projet runtime mutualises)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de:
+    - `setProjectNotesSearchQueryState(value)`
+    - `setProjectNotesFilterModeState(value)`
+  - reutilisation dans `TaskMDAProjectNotesFiltersUI` (`setProjectNotesSearchQuery`, `setProjectNotesFilterMode`).
+- Effet attendu:
+  - allègement du binding runtime notes projet et centralisation de la normalisation des filtres.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: recherche globale runtime mutualisee)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de `setGlobalSearchQueryState(value)`.
+  - reutilisation dans `TaskMDAHeaderSearch` (`setGlobalSearchQuery`) et dans les resets de session/navigation.
+- Effet attendu:
+  - centralisation de la normalisation de la recherche globale et suppression d affectations directes dupliquees.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: feed focus runtime mutualise)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de `setGlobalFeedFocusPostIdState(value)`.
+  - reutilisation dans le runtime `TaskMDAGlobalFeed` (`setGlobalFeedFocusPostId`).
+- Effet attendu:
+  - suppression d une affectation inline dupliquee sur le focus du post feed, sans changement fonctionnel.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: selection multiple notes globales mutualisee)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction des helpers d etat:
+    - `setGlobalNotesBulkSelectionModeState(value)`
+    - `addGlobalNotesSelectedNoteState(noteId)`
+    - `removeGlobalNotesSelectedNoteState(noteId)`
+    - `clearGlobalNotesSelectedNotesState()`
+  - reutilisation dans le runtime `TaskMDAGlobalNotes` (`setBulkSelectionMode`, `addSelectedNote`, `removeSelectedNote`, `clearSelectedNotes`).
+- Effet attendu:
+  - suppression de lambdas inline dupliquees dans la gestion de selection multiple notes globales.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: recherche notes globales mutualisee)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de `setGlobalNotesSearchQueryState(value)`.
+  - reutilisation dans le runtime `TaskMDAGlobalNotes` (`setSearchQuery`).
+- Effet attendu:
+  - suppression d une affectation inline dupliquee dans le bloc runtime notes globales.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: filtres notes globales mutualises)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de setters dedies:
+    - `setGlobalNotesScopeFilterState(value)`
+    - `setGlobalNotesOriginFilterState(value)`
+    - `setGlobalNotesSortModeState(value)`
+    - `setGlobalNotesTabModeState(value)`
+  - reutilisation dans le runtime `TaskMDAGlobalNotes` (`setScopeFilter`, `setOriginFilter`, `setSortMode`, `setTabMode`).
+- Effet attendu:
+  - reduction de duplication locale des affectations de filtres notes, sans changement fonctionnel.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: setActivityPage unifie complet)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - `setActivityPage(page)` reutilise maintenant `setActivityPageState(page)` au lieu de recalculer localement.
+  - `setActivityPageState` passe en declaration de fonction pour securiser l appel (hoisting).
+- Effet attendu:
+  - coherence complete du setter de pagination activite et elimination du dernier doublon local associe.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: feed sort mode runtime normalise)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - ajout de `setGlobalFeedSortModeState(value)` pour normaliser strictement le tri feed (`asc`/`desc`).
+  - reutilisation dans le runtime comms (`setFeedSortMode`).
+- Effet attendu:
+  - suppression d une affectation brute et alignement du tri feed sur un contrat explicite.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: feed filter mode runtime mutualise)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de `setGlobalFeedFilterModeState(value)` pour centraliser la normalisation du filtre feed global.
+  - reutilisation dans les points d entree runtime `setGlobalFeedFilterMode` et `setFeedFilterMode`.
+- Effet attendu:
+  - coherence du mode filtre feed (`all` par defaut) et suppression de duplication locale.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: focus notes runtime mutualise)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de `setGlobalNotesFocusNoteIdState(value)` et `setProjectNotesFocusNoteIdState(value)`.
+  - reutilisation dans les runtimes notes concernes (`setGlobalNotesFocusNoteId`, `setFocusNoteId`, `setProjectNotesFocusNoteId`).
+- Effet attendu:
+  - reduction de duplication intra-fichier sur les setters de focus notes, sans impact fonctionnel.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: setGlobalNotesPage runtime mutualise)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de `setGlobalNotesPageState(value)` pour mutualiser la pagination notes globales.
+  - reutilisation dans `TaskMDAGlobalNotesFiltersUI` (`setGlobalNotesPage`) et dans le runtime `TaskMDAGlobalNotes` (`setPage`).
+- Effet attendu:
+  - suppression de duplication locale intra-fichier, sans changement fonctionnel.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: setActivityPage runtime mutualise)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - extraction de `setActivityPageState(value)` pour mutualiser le calcul `activityPage`.
+  - reutilisation dans les runtimes `TaskMDAProjectNavUI` et `TaskMDAProjectActivityFiltersUI`.
+- Effet attendu:
+  - suppression d une duplication locale intra-fichier, sans changement fonctionnel.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: bindGlobalNav mutualise admin/comms)
+
+- UI admin/comms (`js/taskmda-admin-ui.js`, `js/taskmda-comms-ui.js`):
+  - extraction d un helper partage `bindGlobalNavWithOptions(options, buttonId, view)` cote admin.
+  - `taskmda-comms-ui.js` reutilise ce helper quand disponible, avec fallback local conserve.
+- Effet attendu:
+  - reduction de duplication sur la navigation globale sans impact fonctionnel.
+- Verification:
+  - `node --check js/taskmda-admin-ui.js` OK
+  - `node --check js/taskmda-comms-ui.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: caret inline notes unifie)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - `placeCaretAtEnd(...)` delegue desormais vers `placeCaretAtEndOfElement(...)`.
+  - `placeCaretAtEndOfElement(...)` privilegie le runtime `globalNotesReadInlineEditRuntime` et conserve un fallback local identique.
+- Effet attendu:
+  - suppression d une duplication locale de logique caret, sans changement fonctionnel.
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: thematiques notes projet/global factorisees)
+
+- Orchestrateur (`js/taskmda-team.js`):
+  - factorisation locale de la logique commune des labels thematiques de notes via `getNoteThemeLabels(note)`.
+  - `getProjectNoteThemeLabels(...)` et `getGlobalNoteThemeLabels(...)` deleguent desormais a ce helper unique.
+- Effet attendu:
+  - reduction de duplication interne sans impact fonctionnel (appelants inchanges).
+- Verification:
+  - `node --check js/taskmda-team.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: normalisation workflow harmonisee)
+
+- Workflow (`js/taskmda-workflow.js`):
+  - harmonisation de `normalizeText(...)` (module graph) et `normalize(...)` (module principal) vers `TaskMDACoreUtils.normalizeSearch(...)`.
+  - fallback local conserve dans les deux cas pour robustesse en cas d ordre de chargement inattendu.
+- Effet attendu:
+  - reduction de duplication de logique de normalisation et coherence des recherches workflow.
+- Verification:
+  - `node --check js/taskmda-workflow.js` OK
+
+## Mise a jour incrementale - Mai 2026 (Refactor: accessors etat mutualises)
+
+- Core utils (`js/taskmda-core-utils.js`):
+  - ajout de `createStateAccessors(state)` pour mutualiser `getCurrentUser`, `getCurrentProjectId`, `getCurrentProjectState`.
+- Domaines (`js/taskmda-project-members-domain.js`, `js/taskmda-task-lifecycle-domain.js`, `js/taskmda-app-init.js`, `js/taskmda-doc.js`):
+  - remplacement des wrappers locaux dupliques par delegation vers `TaskMDACoreUtils.createStateAccessors(...)` avec fallback local conserve.
+- Effet attendu:
+  - baisse de duplication et maintenance simplifiee, sans modification des appelants.
+- Verification:
+  - `node --check js/taskmda-core-utils.js` OK
+  - `node --check js/taskmda-project-members-domain.js` OK
+  - `node --check js/taskmda-task-lifecycle-domain.js` OK
+  - `node --check js/taskmda-app-init.js` OK
+  - `node --check js/taskmda-doc.js` OK
+
 ## Correctif - Mai 2026 (fil d'info: liens HTML en lecture)
 
 - Fil d'info (`js/taskmda-team.js`):
