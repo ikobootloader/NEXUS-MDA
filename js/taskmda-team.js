@@ -8800,7 +8800,8 @@
                 </button>
                 ${String(project.status || 'en-cours') !== 'termine' ? `
                 <button
-                  class="card-quick-btn"
+                  class="card-quick-btn card-quick-btn-success"
+                  data-action-kind="success"
                   ${canEdit ? '' : 'disabled title="Réservé aux Propriétaires/Managers"'}
                   onclick="event.stopPropagation(); markProjectDoneFromDashboard('${project.projectId}')"
                 >
@@ -9205,7 +9206,8 @@
                 </button>
                 ${String(project.status || 'en-cours') !== 'termine' ? `
                 <button
-                  class="card-quick-btn"
+                  class="card-quick-btn card-quick-btn-success"
+                  data-action-kind="success"
                   ${canEdit ? '' : 'disabled title="Réservé aux Propriétaires/Managers"'}
                   onclick="event.stopPropagation(); markProjectDoneFromDashboard('${project.projectId}')"
                 >
@@ -9529,13 +9531,15 @@
       projectsPerPage: 6,
       tasksPerPage: 8,
       globalTasksPerPage: 10,
-      globalNotesPerPage: 10
+      globalNotesPerPage: 10,
+      globalFeedPerPage: 10
     };
     let projectsPage = 1;
     let tasksPage = 1;
     let archivedTasksPage = 1;
     let globalTasksPage = 1;
     let globalArchivedTasksPage = 1;
+    let globalFeedPage = 1;
     const GLOBAL_MESSAGE_BROADCAST_TARGET = '__all__';
     const GLOBAL_MESSAGE_BROADCAST_USER_ID = '*';
     const GLOBAL_MESSAGE_GROUP_TARGET_PREFIX = '__group__:';
@@ -11154,6 +11158,11 @@ async function setProjectsPage(page) {
     async function setGlobalTasksPage(page) {
       globalTasksPage = Math.max(1, Number(page) || 1);
       await renderGlobalTasks();
+    }
+
+    async function setGlobalFeedPage(page) {
+      setGlobalFeedPageState(page);
+      await renderGlobalFeed();
     }
 
     async function setGlobalArchivedTasksPage(page) {
@@ -24941,6 +24950,7 @@ async function setProjectsPage(page) {
     }
 
     async function tryPatchGlobalFeedPostDeleteIncremental(postId = '') {
+      if (document.getElementById('global-feed-pagination')) return false;
       const pid = String(postId || '').trim();
       if (!pid) return false;
       if (!isGlobalFeedViewActive()) return false;
@@ -25714,6 +25724,7 @@ async function setProjectsPage(page) {
 
     async function renderGlobalFeed() {
       const list = document.getElementById('global-feed-list');
+      const paginationContainer = document.getElementById('global-feed-pagination');
       if (!list) return;
       if (editingGlobalFeedPostId) {
         setGlobalFeedComposerCollapsed(false);
@@ -25723,6 +25734,7 @@ async function setProjectsPage(page) {
       const prepareScope = globalFeedRuntime?.prepareGlobalFeedRenderScope;
       const buildCards = globalFeedRuntime?.buildGlobalFeedCardsHtml;
       if (!prepareScope || !buildCards) {
+        if (paginationContainer) paginationContainer.innerHTML = '';
         list.innerHTML = buildWorkspaceEmptyState({
           icon: 'warning',
           title: 'Module Fil d info indisponible',
@@ -25739,6 +25751,8 @@ async function setProjectsPage(page) {
       const allDocs = Array.isArray(scope?.allDocs) ? scope.allDocs : [];
 
       if (posts.length === 0) {
+        globalFeedPage = 1;
+        if (paginationContainer) paginationContainer.innerHTML = '';
         list.innerHTML = buildWorkspaceEmptyState({
           icon: 'campaign',
           title: 'Aucun élément pour ces critères',
@@ -25749,7 +25763,18 @@ async function setProjectsPage(page) {
         return;
       }
 
-      list.innerHTML = await buildCards(posts, allDocs, mentionCatalog);
+      const pageSize = Math.max(1, Number(paginationConfig.globalFeedPerPage) || 10);
+      let targetPage = globalFeedPage;
+      if (globalFeedFocusPostId) {
+        const focusedIndex = posts.findIndex((post) => String(post?.postId || '').trim() === String(globalFeedFocusPostId || '').trim());
+        if (focusedIndex >= 0) {
+          targetPage = Math.floor(focusedIndex / pageSize) + 1;
+        }
+      }
+      const pagination = paginateItems(posts, targetPage, pageSize);
+      globalFeedPage = pagination.currentPage;
+      list.innerHTML = await buildCards(pagination.pageItems, allDocs, mentionCatalog);
+      renderPagination('global-feed-pagination', pagination, 'setGlobalFeedPage', 'éléments du fil');
       if (globalFeedFocusPostId) {
         const target = document.getElementById(`global-feed-post-${globalFeedFocusPostId}`);
         if (target) {
@@ -25792,6 +25817,7 @@ async function setProjectsPage(page) {
     }
     window.openGlobalFeedReference = openGlobalFeedReference;
     window.openGlobalFeedPost = openGlobalFeedPost;
+    window.setGlobalFeedPage = setGlobalFeedPage;
     window.toggleGlobalFeedComposerFullscreen = toggleGlobalFeedComposerFullscreen;
     window.startEditGlobalFeedPost = startEditGlobalFeedPost;
     window.cancelEditGlobalFeedPost = cancelEditGlobalFeedPost;
@@ -30768,11 +30794,13 @@ async function setProjectsPage(page) {
       const rows = members.map(member => {
         const identity = resolveKnownUserIdentity(member.userId, member.displayName || '');
         const lastTs = latestByUser.get(member.userId) || 0;
-        const isOnline = (now - lastTs) < (2 * 60 * 60 * 1000);
+        const isCurrentUser = String(member.userId || '') === String(currentUser?.userId || '');
+        const isOnline = isCurrentUser || (now - lastTs) < (2 * 60 * 60 * 1000);
         return {
           userId: member.userId,
           name: identity.name || fallbackDirectoryName(member.userId),
           avatarDataUrl: identity.avatarDataUrl || '',
+          isCurrentUser,
           isOnline
         };
       });
@@ -30796,15 +30824,21 @@ async function setProjectsPage(page) {
         const avatar = `<span class="discussion-member-avatar" style="${
           safeAvatarInlineStyle(row.avatarDataUrl, stringToColor(row.userId || row.name || String(idx)))
         }">${escapeHtml(getInitials(row.name))}</span>`;
+        const statusClass = row.isCurrentUser
+          ? 'is-online'
+          : (row.isOnline ? 'is-recent' : 'is-away');
+        const statusLabel = row.isCurrentUser
+          ? 'En ligne'
+          : (row.isOnline ? 'Actif récemment' : 'Absent');
         return `
           <div class="discussion-member-item">
             <div class="discussion-member-avatar-wrap">
               ${avatar}
-              <span class="discussion-member-dot ${row.isOnline ? 'is-online' : 'is-away'}"></span>
+              <span class="discussion-member-dot ${statusClass}"></span>
             </div>
             <div class="discussion-member-meta">
               <p class="discussion-member-name">${escapeHtml(row.name)}</p>
-              <p class="discussion-member-status ${row.isOnline ? 'is-online' : 'is-away'}">${row.isOnline ? 'En ligne' : 'Absent'}</p>
+              <p class="discussion-member-status ${statusClass}">${escapeHtml(statusLabel)}</p>
             </div>
           </div>
         `;
@@ -31742,6 +31776,9 @@ async function setProjectsPage(page) {
     };
     const setGlobalFeedFilterModeState = (value) => {
       globalFeedFilterMode = String(value || '').trim() || 'all';
+    };
+    const setGlobalFeedPageState = (value) => {
+      globalFeedPage = Math.max(1, Number(value) || 1);
     };
     const setGlobalFeedFocusPostIdState = (value) => {
       globalFeedFocusPostId = String(value || '').trim();
@@ -32837,6 +32874,8 @@ async function setProjectsPage(page) {
             setGlobalFeedMentionCatalogCache: setGlobalFeedMentionCatalogCacheState,
             getGlobalFeedFilterMode: () => globalFeedFilterMode,
             setGlobalFeedFilterMode: setGlobalFeedFilterModeState,
+            getGlobalFeedPage: () => globalFeedPage,
+            setGlobalFeedPage: setGlobalFeedPageState,
             getGlobalFeedSortMode: () => globalFeedSortMode,
             getGlobalFeedFocusPostId: () => globalFeedFocusPostId,
             setGlobalFeedFocusPostId: setGlobalFeedFocusPostIdState,
@@ -33442,6 +33481,9 @@ async function setProjectsPage(page) {
         renderGlobalFeed,
         resolveViewWithLock,
         updateGlobalFeedMentionCounter,
+        setGlobalFeedPage: (value) => {
+          setGlobalFeedPageState(value);
+        },
         setFeedSortMode: (value) => {
           setGlobalFeedSortModeState(value);
         },

@@ -109,12 +109,14 @@
     });
 
     document.getElementById('global-feed-search')?.addEventListener('input', () => {
+      opts.setGlobalFeedPage?.(1);
       opts.renderGlobalFeed?.();
     });
 
     document.getElementById('global-feed-sort')?.addEventListener('change', (e) => {
       const next = String(e?.target?.value || 'desc') === 'asc' ? 'asc' : 'desc';
       setFeedSortMode(next);
+      opts.setGlobalFeedPage?.(1);
       opts.renderGlobalFeed?.();
     });
 
@@ -122,6 +124,7 @@
       document.getElementById(buttonId)?.addEventListener('click', () => {
         const next = opts.resolveViewWithLock?.('globalFeed', filterMode, 'all') || filterMode;
         setFeedFilterMode(next);
+        opts.setGlobalFeedPage?.(1);
         opts.renderGlobalFeed?.();
       });
     }

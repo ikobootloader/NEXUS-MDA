@@ -1,5 +1,68 @@
 # Changelog - TaskMDA Team
 
+## Mise à jour incrémentale - Juin 2026 (Harmonisation visuelle des statuts de présence)
+
+- Discussion projet (`js/taskmda-team.js`, `css/taskmda-team.css`) :
+  - `En ligne` conserve la pastille et le libellé verts ;
+  - `Actif récemment` dispose maintenant d'une teinte ambre distincte ;
+  - `Absent` reste grisé.
+- Effet attendu :
+  - meilleure distinction visuelle entre présence active et activité récente.
+- Vérification :
+  - `node --check js/taskmda-team.js` OK
+
+## Mise à jour incrémentale - Juin 2026 (Intitulé discussion projet clarifié)
+
+- Discussion projet (`taskmda-team.html`) :
+  - le titre latéral passe de `Membres actifs` à `Membres du projet`.
+- Effet attendu :
+  - l'intitulé ne suggère plus à tort que toute la liste représente uniquement des membres actuellement actifs.
+- Vérification :
+  - contrôle ciblé du libellé dans l'onglet Discussion.
+
+## Mise à jour incrémentale - Juin 2026 (Libellés de présence discussion projet clarifiés)
+
+- Discussion projet (`js/taskmda-team.js`) :
+  - l'utilisateur courant reste affiché `En ligne` ;
+  - les autres membres récemment actifs sont désormais affichés `Actif récemment` au lieu de `En ligne`.
+- Effet attendu :
+  - le libellé correspond mieux à la logique réelle, basée sur l'activité récente dans la discussion projet.
+- Vérification :
+  - `node --check js/taskmda-team.js` OK
+
+## Mise à jour incrémentale - Juin 2026 (Présence cohérente dans la discussion projet)
+
+- Discussion projet (`js/taskmda-team.js`) :
+  - le membre correspondant à l'utilisateur actuellement connecté est désormais toujours affiché `En ligne` dans la liste des membres actifs.
+- Effet attendu :
+  - suppression du faux statut `Absent` pour l'utilisateur courant lorsqu'il consulte l'onglet Discussion d'un projet.
+- Vérification :
+  - `node --check js/taskmda-team.js` OK
+
+## Mise à jour incrémentale - Juin 2026 (Pagination du Fil d'info transverse)
+
+- Fil d'info (`taskmda-team.html`, `js/taskmda-team.js`, `js/taskmda-comms-ui.js`, `js/taskmda-global.js`) :
+  - ajout d'un conteneur de pagination dédié sous la liste du feed ;
+  - pagination des posts filtrés et triés avant rendu ;
+  - remise à la page 1 sur recherche, tri et changement de filtre ;
+  - rendu complet forcé après insertion, édition ou suppression pour garder une pagination cohérente.
+- Effet attendu :
+  - la rubrique Fil d'info n'affiche plus tout le flux en un seul bloc.
+- Vérification :
+  - `node --check js/taskmda-team.js` OK
+  - `node --check js/taskmda-comms-ui.js` OK
+  - `node --check js/taskmda-global.js` OK
+
+## Mise à jour incrémentale - Juin 2026 (Alignement visuel bouton projet Réalisé)
+
+- Cartes projet (`js/taskmda-team.js`, `css/taskmda-team.css`) :
+  - le bouton `Réalisé` adopte la même sémantique visuelle `success` que le bouton `Réalisé` des cartes tâche ;
+  - ajout de `card-quick-btn-success` et de `data-action-kind="success"` sur l'action projet.
+- Effet attendu :
+  - mêmes couleurs de fond et d'icône entre l'action `Réalisé` des cartes projet et tâche.
+- Vérification :
+  - `node --check js/taskmda-team.js` OK
+
 ## Mise à jour incrémentale - Juin 2026 (Correctif encodage badge de visibilité)
 
 - Utilitaire cœur (`js/taskmda-core-utils.js`) :

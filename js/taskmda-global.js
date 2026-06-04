@@ -1935,6 +1935,7 @@ ${(theme || tags.length) ? `<div class="tags">${theme ? `<span class="tag tag-th
       post.summary = actions.computeGlobalFeedPostAutoSummary?.(post, post.summaryWordCount) || '';
       await actions.putGlobalPost?.(post);
       actions.addKnownGlobalPostId?.(post.postId);
+      state.setGlobalFeedPage?.(1);
       input.value = '';
       const attachInput = document.getElementById('global-feed-attach-doc-files');
       if (attachInput) attachInput.value = '';
@@ -1959,6 +1960,7 @@ ${(theme || tags.length) ? `<div class="tags">${theme ? `<span class="tag tag-th
     }
 
     async function tryPatchGlobalFeedPostEditIncremental(post) {
+      if (document.getElementById('global-feed-pagination')) return false;
       const postId = String(post?.postId || '').trim();
       if (!postId) return false;
       const list = document.getElementById('global-feed-list');
@@ -1983,6 +1985,7 @@ ${(theme || tags.length) ? `<div class="tags">${theme ? `<span class="tag tag-th
     }
 
     async function tryInsertGlobalFeedPostIncremental(post) {
+      if (document.getElementById('global-feed-pagination')) return false;
       const postId = String(post?.postId || '').trim();
       if (!postId) return false;
       const list = document.getElementById('global-feed-list');

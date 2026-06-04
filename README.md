@@ -257,6 +257,33 @@ projects/
 
 ### Juin 2026
 
+#### ✅ Statuts de présence mieux différenciés
+
+- `En ligne` reste en vert.
+- `Actif récemment` est désormais affiché avec une teinte ambre distincte.
+
+#### ✅ Intitulé de la liste discussion projet clarifié
+
+- Le panneau latéral affiche désormais `Membres du projet` au lieu de `Membres actifs`.
+
+#### ✅ Libellés de présence clarifiés dans la discussion projet
+
+- L'utilisateur courant reste marqué `En ligne`.
+- Les autres membres sont affichés `Actif récemment` quand leur statut provient de l'activité du fil.
+
+#### ✅ Présence cohérente dans la discussion projet
+
+- L'utilisateur actuellement connecté apparaît désormais `En ligne` dans la liste des membres actifs du projet.
+
+#### ✅ Alignement visuel du bouton projet `Réalisé`
+
+- Le bouton `Réalisé` des cartes projet reprend désormais la même palette visuelle que celui des cartes tâche.
+
+#### ✅ Pagination du Fil d'info transverse
+
+- Le Fil d'info dispose maintenant d'une pagination dédiée sous la liste.
+- La page revient automatiquement au début lors d'une recherche, d'un tri ou d'un changement de filtre.
+
 #### ✅ Correctif encodage badge de visibilité
 
 - `js/taskmda-core-utils.js` corrige le libellé du badge `Privée` et les textes associés de visibilité.
