@@ -1,5 +1,15 @@
 # Changelog - TaskMDA Team
 
+## Mise à jour incrémentale - Juin 2026 (Dashboard: retours ligne cartes fil d'info)
+
+- Dashboard / Actualités majeures (`js/taskmda-team.js`) :
+  - conservation des retours à la ligne du sous-texte des cartes du fil d'info ;
+  - le fallback texte affiche désormais les lignes métier sur des lignes distinctes au lieu de les concaténer.
+- Effet attendu :
+  - les cartes respectent l'affichage `Nouvelle tâche créée: ...` puis `Projet: Hors projet` avec le retour ligne attendu.
+- Vérification :
+  - `node --check js/taskmda-team.js` OK
+
 ## Mise à jour incrémentale - Juin 2026 (Harmonisation visuelle des statuts de présence)
 
 - Discussion projet (`js/taskmda-team.js`, `css/taskmda-team.css`) :

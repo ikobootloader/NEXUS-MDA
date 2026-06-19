@@ -8392,7 +8392,13 @@
     }
 
     function buildDashboardSubtitleHtml(sourceHtml, fallbackText = '') {
-      const fallback = `<p>${escapeHtml(String(fallbackText || '').trim())}</p>`;
+      const fallbackLines = String(fallbackText || '')
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const fallback = fallbackLines.length
+        ? `<p>${fallbackLines.map((line) => escapeHtml(line)).join('<br>')}</p>`
+        : '';
       try {
         const root = document.createElement('div');
         root.innerHTML = String(sourceHtml || '');
@@ -8548,7 +8554,7 @@
           || normalizeDashboardNewsCardTitle(headline)
           || 'Mise à jour';
         
-        let subtitleSrc = subtitleRaws.join(' ').trim();
+        let subtitleSrc = subtitleRaws.join('\n').trim();
         if (!subtitleSrc) {
           subtitleSrc = (post.refs || []).map((ref) => ref?.label).filter(Boolean).slice(0, 2).join(' • ');
         }
